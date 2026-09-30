@@ -1,0 +1,177 @@
+{
+  "round_id": "r02",
+  "parent_round_id": "r00",
+  "prompt_version": "v2.6_r02",
+  "sop_tab_name": "Prompt_v2.6_r02",
+  "mutated_layer": "layer2",
+  "hypothesis": "Layer 2 attention re-budget (parent r00; r01 Layer 1 rejected). Dev-miss rules already exist in r00, misses coincide with repeated C4 grooming/phone rows about one partner while another partner's short sink/contact actions go unreported. Changes: C4 dedup (1 grooming row per person per clip, 1 phone row per continuous episode, then resume scanning others); A3 every sink visit by any partner checked independently; A1 per-person independent contamination tracking; B3 trace source container of any liquid applied to ice maker parts instead of relying on bottle colour.",
+  "target_dev_misses": [
+    "R02",
+    "R03",
+    "R04",
+    "R05",
+    "R20"
+  ],
+  "char_len_system_instruction": 21576,
+  "char_len_layer1": 4264,
+  "char_len_layer2_check_instructions": 16367,
+  "created_at": "2026-09-29T08:29:29.954216+00:00",
+  "runs": [
+    {
+      "run_id": "r02_run1",
+      "judge_model": "gemini-3.1-pro-preview",
+      "all_recall": 0.4342105263157895,
+      "all_weighted_hits": 8.25,
+      "all_total": 19,
+      "dev_recall": 0.16666666666666666,
+      "dev_weighted_hits": 1.0,
+      "dev_total": 6,
+      "holdout_recall": 0.5576923076923077,
+      "holdout_weighted_hits": 7.25,
+      "holdout_total": 13,
+      "mean_per_clip": 7.625,
+      "total_findings": 122,
+      "guardrails": {
+        "passed": false,
+        "density_ok": true,
+        "mean_per_clip": 7.625,
+        "max_allowed_density": 8.0,
+        "regressed_stable_items": [
+          "R14"
+        ],
+        "stable_items_checked": [
+          "R08",
+          "R09",
+          "R12",
+          "R13",
+          "R14",
+          "R19"
+        ]
+      },
+      "row_scores": {
+        "R02": 0.0,
+        "R03": 0.0,
+        "R04": 0.0,
+        "R05": 0.0,
+        "R06": 1.0,
+        "R07": 0.0,
+        "R08": 1.0,
+        "R09": 1.0,
+        "R10": 0.5,
+        "R11": 0.5,
+        "R12": 1.0,
+        "R13": 1.0,
+        "R14": 0.5,
+        "R15": 0.0,
+        "R16": 0.0,
+        "R17": 0.0,
+        "R18": 0.75,
+        "R19": 1.0,
+        "R20": 0.0
+      },
+      "dev_misses": [
+        "R02",
+        "R03",
+        "R04",
+        "R05",
+        "R20"
+      ],
+      "holdout_misses": [
+        "R07",
+        "R10",
+        "R11",
+        "R14",
+        "R15",
+        "R16",
+        "R17",
+        "R18"
+      ]
+    },
+    {
+      "run_id": "r02_run2",
+      "judge_model": "gemini-3.1-pro-preview",
+      "all_recall": 0.42105263157894735,
+      "all_weighted_hits": 8.0,
+      "all_total": 19,
+      "dev_recall": 0.0,
+      "dev_weighted_hits": 0.0,
+      "dev_total": 6,
+      "holdout_recall": 0.6153846153846154,
+      "holdout_weighted_hits": 8.0,
+      "holdout_total": 13,
+      "mean_per_clip": 6.625,
+      "total_findings": 106,
+      "guardrails": {
+        "passed": true,
+        "density_ok": true,
+        "mean_per_clip": 6.625,
+        "max_allowed_density": 8.0,
+        "regressed_stable_items": [],
+        "stable_items_checked": [
+          "R08",
+          "R09",
+          "R12",
+          "R13",
+          "R14",
+          "R19"
+        ]
+      },
+      "row_scores": {
+        "R02": 0.0,
+        "R03": 0.0,
+        "R04": 0.0,
+        "R05": 0.0,
+        "R06": 0.0,
+        "R07": 0.0,
+        "R08": 1.0,
+        "R09": 1.0,
+        "R10": 0.0,
+        "R11": 1.0,
+        "R12": 1.0,
+        "R13": 1.0,
+        "R14": 1.0,
+        "R15": 1.0,
+        "R16": 0.0,
+        "R17": 0.0,
+        "R18": 0.0,
+        "R19": 1.0,
+        "R20": 0.0
+      },
+      "dev_misses": [
+        "R02",
+        "R03",
+        "R04",
+        "R05",
+        "R06",
+        "R20"
+      ],
+      "holdout_misses": [
+        "R07",
+        "R10",
+        "R16",
+        "R17",
+        "R18"
+      ]
+    }
+  ],
+  "num_runs": 2,
+  "status": "EVALUATED",
+  "aggregates": {
+    "num_runs": 2,
+    "primary_run_id": "r02_run1",
+    "primary_all_recall": 0.4342,
+    "primary_all_weighted_hits": 8.25,
+    "primary_dev_recall": 0.1667,
+    "primary_holdout_recall": 0.5577,
+    "primary_mean_per_clip": 7.625,
+    "primary_guardrails_passed": false,
+    "mean_all_recall": 0.4276,
+    "mean_all_weighted_hits": 8.125,
+    "mean_dev_recall": 0.0833,
+    "mean_dev_weighted_hits": 0.5,
+    "mean_holdout_recall": 0.5865,
+    "mean_holdout_weighted_hits": 7.625,
+    "mean_per_clip": 7.125,
+    "all_runs_pass_guardrails": false
+  }
+}

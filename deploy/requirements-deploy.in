@@ -1,0 +1,8 @@
+# Python deps of deploy/deploy_reasoning_engine.py, which main.tf runs via local-exec inside the
+# pipeline's terraform step (deploy/ci_terraform.sh). That step holds the deployer's credentials, so
+# it installs only the hashed lock requirements-deploy.txt (pip --require-hashes).
+# Edit this file, never requirements-deploy.txt, then regenerate the lock from this directory's parent
+# (tests/test_ci_pipeline.py fails if the two disagree):
+#   uv pip compile deploy/requirements-deploy.in --python-version 3.12 --python-platform x86_64-manylinux_2_28 --generate-hashes -o deploy/requirements-deploy.txt
+google-auth==2.58.1
+requests==2.34.2

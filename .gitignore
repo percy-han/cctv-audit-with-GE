@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.venv/
+.venvs/
+.pytest_cache/
+.ruff_cache/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.log
+dummy.mp4
+.ci/
+
+# NOTE: <env>.tfvars / <env>.gcs.tfbackend are NOT ignored on purpose. They hold no secrets, the
+# push trigger reads them from the repository, and .gcloudignore includes this file, so ignoring
+# them would also drop them from `gcloud builds submit` uploads.
+
+# Private evaluation data (customer labels, Drive IDs, run outputs)
+eval/data/*
+!eval/data/README.md
+eval/results/
+eval/rounds/*/runs/
+eval/rounds/ledger.json
+eval/rounds/ledger.md
+eval/rounds/active_candidate.json

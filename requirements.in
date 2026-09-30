@@ -1,0 +1,16 @@
+# Top-level runtime dependencies of the worker image. Edit this file, never requirements.txt.
+#
+# requirements.txt is the lock the Dockerfile installs: every package, transitive ones included,
+# pinned to one version with its sha256 hashes (pip --require-hashes). The same source tree
+# therefore always installs the same packages, whenever and wherever the image is rebuilt.
+# After editing this file, regenerate the lock (tests/test_ci_pipeline.py fails if they disagree):
+#   uv pip compile requirements.in --python-version 3.12 --python-platform x86_64-manylinux_2_28 --generate-hashes -o requirements.txt
+google-genai>=1.36.0
+google-adk>=1.0.0
+google-auth>=2.38.0
+google-api-python-client>=2.149.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+httpx>=0.27.2
+pyyaml>=6.0.2

@@ -1,0 +1,80 @@
+# Deploy pipeline for the CCTV audit stack:
+#   1. resolve-image  image for this exact source tree already built? (tag = sha256 of what the Dockerfile copies)
+#   2. build-image    if not: docker build + push under that tag
+#   3. terraform      read the tag's digest back from Artifact Registry -> init (state in GCS) -> plan
+#                     -> apply with that digest -> a fresh plan must be empty
+# Runs as the deployer SA created by bootstrap/: no laptop, no personal token, nothing expires.
+#
+# Push-to-deploy: bootstrap/ creates a trigger that runs this file on every push to the deploy branch
+# (needs a one-time Cloud Build repository connection, see bootstrap/main.tf var.trigger_repository).
+#
+# Manual run, from this directory (caller needs roles/cloudbuild.builds.editor and actAs on the
+# deployer SA; project owners have both). The exact command is bootstrap output manual_deploy_command:
+#   gcloud builds submit --project=<project> --region=<region> --config=cloudbuild.yaml \
+#     --gcs-source-staging-dir=gs://<project>-tfstate/source \
+#     --service-account=projects/<project>/serviceAccounts/<deployer SA email> \
+#     --substitutions=_ENV=<env>,_REGION=<region>,_REPO=<repo>,_IMAGE=<image>,_DEPLOYER_SA_ID=<deployer SA id>
+# The substitution defaults below are placeholders only.
+# Every other stack (another project, or another name_prefix in the same project) must pass its
+# own values, which bootstrap/ does for both the trigger and manual_deploy_command. A build that
+# forgets them fails at check-identity (it runs as the stack's deployer, not the default one).
+# Preview only (builds the image if needed, changes nothing): add --substitutions=_APPLY=false
+#
+# Step images are pinned by digest, like the Dockerfile base, so the pipeline itself cannot change
+# under a rebuild. Bump them on purpose:
+#   python:3.12-slim                    multi-arch index as of 2026-09-26 (same digest as the Dockerfile)
+#   gcr.io/cloud-builders/docker        tag latest = 20.10.24 as of 2026-09-24. Deliberately the Docker
+#                                       20.10 client: it is the builder Cloud Build documents as supported,
+#                                       and the Docker daemon on Cloud Build workers speaks API 1.41, which
+#                                       newer clients (tag 29) do not accept (YAQS eng 3161006869414150144).
+
+substitutions:
+  _ENV: ""             # selects <env>.tfvars and <env>.gcs.tfbackend; empty = $PROJECT_ID
+  _IAC_DIR: "."        # the push trigger sets bootstrap var.iac_dir (it checks out the repo root)
+  _REGION: ""           # required, e.g. asia-southeast1
+  _REPO: ""             # required: bootstrap/ artifact_repository_id (default <name_prefix>-images)
+  _IMAGE: cctv-audit-worker
+  _DEPLOYER_SA_ID: ""   # required: bootstrap/ deployer_account_id (default <name_prefix>-deployer)
+  _APPLY: "true"
+  _TF_VERSION: 1.9.5
+  _TF_SHA256: 9cf727b4d6bd2d4d2908f08bd282f9e4809d6c3071c3b8ebe53558bee6dc913b # terraform_1.9.5_linux_amd64.zip
+
+options:
+  logging: CLOUD_LOGGING_ONLY # required for builds that run as a user-specified service account
+
+timeout: 3600s # a ReasoningEngine update alone can take 5-15 minutes
+
+steps:
+  - id: resolve-image
+    name: python@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
+    dir: ${_IAC_DIR}
+    entrypoint: python3
+    args:
+      - deploy/ci_pipeline.py
+      - resolve
+      - --image-repo=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}
+      - --out-dir=/workspace/.ci
+
+  - id: build-image
+    name: gcr.io/cloud-builders/docker@sha256:bbb3d633c5c2813b2ce5245852979e1d637768f4acfc504d8ece288f91e9b60f
+    dir: ${_IAC_DIR}
+    entrypoint: bash
+    args: [deploy/ci_build_image.sh]
+    env:
+      - IMAGE_REPO=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}
+      - OUT_DIR=/workspace/.ci
+
+  - id: terraform
+    name: python@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
+    dir: ${_IAC_DIR}
+    entrypoint: bash
+    args: [deploy/ci_terraform.sh]
+    env:
+      - PROJECT_ID=${PROJECT_ID}
+      - ENV_NAME=${_ENV}
+      - EXPECTED_SA=${_DEPLOYER_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com
+      - IMAGE_REPO=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}
+      - APPLY=${_APPLY}
+      - TF_VERSION=${_TF_VERSION}
+      - TF_SHA256=${_TF_SHA256}
+      - OUT_DIR=/workspace/.ci

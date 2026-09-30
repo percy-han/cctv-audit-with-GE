@@ -1,0 +1,4 @@
+# Template: cp example.gcs.tfbackend <env>.gcs.tfbackend and replace every <...>.
+# Same bucket as ../<env>.gcs.tfbackend; own prefix per stack.
+bucket = "<project-id>-tfstate"
+prefix = "<prefix>/bootstrap"

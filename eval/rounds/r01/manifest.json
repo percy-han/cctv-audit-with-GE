@@ -1,0 +1,112 @@
+{
+  "round_id": "r01",
+  "parent_round_id": "r00",
+  "prompt_version": "v2.6_r01",
+  "sop_tab_name": "Prompt_v2.6_r01",
+  "mutated_layer": "layer1",
+  "hypothesis": "Layer 1 generic kernel upgrade targeting 4 root-cause failure mechanisms observed in r00 dev misses: (1) Tool/container/reagent state persistence across timestamps & clips (T1 preparation -> T2 contact) for R20; (2) Clip-start (00:00-00:30) already-in-progress procedure tail audit (mandatory closing step before leaving station) for R02; (3) Mandatory [T-30s, T] second-by-second dual-hand trajectory traceback before gloving/equipment contact for R03 (and holdout R10); (4) Per-action timestamp node enumeration & >20s separate Finding row splitting + anti-masking during concurrent phone use for R04/R05 (and holdout R11a/R17/R18a).",
+  "target_dev_misses": [
+    "R02",
+    "R03",
+    "R04",
+    "R05",
+    "R20"
+  ],
+  "char_len_system_instruction": 22371,
+  "char_len_layer1": 5727,
+  "char_len_layer2_check_instructions": 15699,
+  "created_at": "2026-09-29T04:35:39.728941+00:00",
+  "runs": [
+    {
+      "run_id": "r01_run1",
+      "judge_model": "gemini-3.1-pro-preview",
+      "all_recall": 0.35526315789473684,
+      "all_weighted_hits": 6.75,
+      "all_total": 19,
+      "dev_recall": 0.0,
+      "dev_weighted_hits": 0.0,
+      "dev_total": 6,
+      "holdout_recall": 0.5192307692307693,
+      "holdout_weighted_hits": 6.75,
+      "holdout_total": 13,
+      "mean_per_clip": 6.75,
+      "total_findings": 108,
+      "guardrails": {
+        "passed": false,
+        "density_ok": true,
+        "mean_per_clip": 6.75,
+        "max_allowed_density": 8.0,
+        "regressed_stable_items": [
+          "R14"
+        ],
+        "stable_items_checked": [
+          "R08",
+          "R09",
+          "R12",
+          "R13",
+          "R14",
+          "R19"
+        ]
+      },
+      "row_scores": {
+        "R02": 0.0,
+        "R03": 0.0,
+        "R04": 0.0,
+        "R05": 0.0,
+        "R06": 0.0,
+        "R07": 0.0,
+        "R08": 1.0,
+        "R09": 1.0,
+        "R10": 0.0,
+        "R11": 0.5,
+        "R12": 1.0,
+        "R13": 1.0,
+        "R14": 0.5,
+        "R15": 0.0,
+        "R16": 0.0,
+        "R17": 0.0,
+        "R18": 0.75,
+        "R19": 1.0,
+        "R20": 0.0
+      },
+      "dev_misses": [
+        "R02",
+        "R03",
+        "R04",
+        "R05",
+        "R06",
+        "R20"
+      ],
+      "holdout_misses": [
+        "R07",
+        "R10",
+        "R11",
+        "R14",
+        "R15",
+        "R16",
+        "R17",
+        "R18"
+      ]
+    }
+  ],
+  "num_runs": 1,
+  "status": "EVALUATED",
+  "aggregates": {
+    "num_runs": 1,
+    "primary_run_id": "r01_run1",
+    "primary_all_recall": 0.3553,
+    "primary_all_weighted_hits": 6.75,
+    "primary_dev_recall": 0.0,
+    "primary_holdout_recall": 0.5192,
+    "primary_mean_per_clip": 6.75,
+    "primary_guardrails_passed": false,
+    "mean_all_recall": 0.3553,
+    "mean_all_weighted_hits": 6.75,
+    "mean_dev_recall": 0.0,
+    "mean_dev_weighted_hits": 0.0,
+    "mean_holdout_recall": 0.5192,
+    "mean_holdout_weighted_hits": 6.75,
+    "mean_per_clip": 6.75,
+    "all_runs_pass_guardrails": false
+  }
+}

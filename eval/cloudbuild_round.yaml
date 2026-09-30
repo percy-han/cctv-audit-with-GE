@@ -1,0 +1,77 @@
+# Serverless GCP Cloud Build pipeline for Step 2 Prompt-Tuning Rounds (`r01..r10`).
+# Runs as the stack's worker SA and writes to the stack's staging bucket; nothing in this file names
+# a project, region, bucket, Sheet or user -- every stack passes its own (main.tf outputs /
+# <env>.tfvars). Usage from the repository root (P=project, R=region):
+#   WORKER_SA=<main.tf output worker_service_account_email>
+#   BUCKET=<main.tf output staging_bucket_name>
+#   IMG=$(gcloud run services describe <name_prefix>-worker --project=$P --region=$R \
+#     --format='value(spec.template.spec.containers[0].image)')
+#   gcloud builds submit --project=$P --region=$R \
+#     --config=eval/cloudbuild_round.yaml \
+#     --service-account=projects/$P/serviceAccounts/$WORKER_SA \
+#     --gcs-log-dir=gs://$BUCKET/eval/cloudbuild-logs \
+#     --gcs-source-staging-dir=gs://$BUCKET/eval/source \
+#     --substitutions=_ROUND_ID=r01,_RUN_ID=r01_run1,_IMAGE=$IMG,_REGION=$R,_WORKER_SA=$WORKER_SA,\
+#   _STAGING_BUCKET=$BUCKET,_MASTER_PROMPT_SHEET_ID=<sheet id>,_WORKSPACE_IMPERSONATE_USER=<bot user> .
+# _IMAGE must be the digest the live Cloud Run worker runs (runtime deps + ffmpeg); the round code
+# itself comes from the uploaded source tree (/workspace).
+# --service-account / --gcs-log-dir are flags, not `serviceAccount:` / `logsBucket:` fields, so this
+# file stays stack-neutral. The step refuses to run unless it really runs as _WORKER_SA (the logs go
+# to the staging bucket because the worker SA has no roles/logging.logWriter).
+
+# 16 agentic clips (largest folder = 6 sequential clips with carryover) + 3-pass judge; 1 h was too tight.
+timeout: '7200s'
+
+substitutions:
+  _GEMINI_TIMEOUT_MS: '900000'
+  _REGION: ''
+  _IMAGE: ''
+  _ROUND_ID: 'r01'
+  _RUN_ID: ''
+  _FOLDER_CONCURRENCY: '4'  # all 4 folders in parallel; wall time = slowest folder
+  _WORKER_SA: ''                  # <name_prefix>-worker@<project>.iam.gserviceaccount.com
+  _STAGING_BUCKET: ''             # main.tf output staging_bucket_name
+  _MASTER_PROMPT_SHEET_ID: ''     # <env>.tfvars master_prompt_sheet_id
+  _WORKSPACE_IMPERSONATE_USER: '' # <env>.tfvars workspace_impersonate_user ('' = the SA itself)
+
+options:
+  machineType: 'E2_HIGHCPU_8'
+
+steps:
+  - id: 'run-and-score-round'
+    name: '${_IMAGE}'
+    entrypoint: 'bash'
+    env:
+      # Names read by cctv_audit/config.py. Its module-level `config` singleton is built at import
+      # time (gcp.get_genai_client uses it), so these must be set in the environment, not later.
+      - 'GCP_PROJECT=${PROJECT_ID}'
+      - 'STAGING_BUCKET=${_STAGING_BUCKET}'
+      - 'MASTER_PROMPT_SHEET_ID=${_MASTER_PROMPT_SHEET_ID}'
+      - 'GCP_PROJECT_ID=${PROJECT_ID}'
+      - 'GCP_REGION=${_REGION}'
+      - 'GCP_LOCATION=${_REGION}'
+      - 'VERTEX_LOCATION=global'
+      - 'VIDEO_MEDIA_PROCESSING=agentic'
+      - 'GCS_STAGING_BUCKET=${_STAGING_BUCKET}'
+      # Eval-only: a hung Gemini call used to block a clip for the full 30 min production default
+      # before the runner's per-clip retry kicked in (r01 lost ~2 h to 4 hangs). Normal calls take a few minutes.
+      - 'GEMINI_TIMEOUT_MS=${_GEMINI_TIMEOUT_MS}'
+      - 'SOP_SHEET_ID=${_MASTER_PROMPT_SHEET_ID}'
+      - 'WORKSPACE_IMPERSONATE_USER=${_WORKSPACE_IMPERSONATE_USER}'
+      - 'WORKSPACE_DWD_SERVICE_ACCOUNT=${_WORKER_SA}'
+      - 'PYTHONPATH=/workspace'
+    args:
+      - '-ce'
+      - |
+        for v in _IMAGE="${_IMAGE}" _REGION="${_REGION}" _WORKER_SA="${_WORKER_SA}" \
+                 _STAGING_BUCKET="${_STAGING_BUCKET}" _MASTER_PROMPT_SHEET_ID="${_MASTER_PROMPT_SHEET_ID}"; do
+          [[ -n "$${v#*=}" ]] || { echo "substitution $${v%%=*} is required (see header)" >&2; exit 1; }
+        done
+        python3 /workspace/deploy/ci_pipeline.py check-identity --expected "${_WORKER_SA}"
+        pip install -q "google-cloud-aiplatform[evaluation]==2.2.0" "google-cloud-storage==3.15.0"
+        python3 -c "import agentplatform, google.cloud.storage"
+        RUN_ARGS=(--round "${_ROUND_ID}" --folder-concurrency "${_FOLDER_CONCURRENCY}" --sync-sop-tab)
+        if [[ -n "${_RUN_ID}" ]]; then
+          RUN_ARGS+=(--run-id "${_RUN_ID}")
+        fi
+        python3 /workspace/eval/run_gcp_round.py "$${RUN_ARGS[@]}"

@@ -1,0 +1,6 @@
+# Template: cp example.gcs.tfbackend <env>.gcs.tfbackend and replace every <...>.
+#   terraform init -backend-config=<env>.gcs.tfbackend
+# One state bucket per project (bootstrap/create_state_bucket.sh) can hold many stacks; the prefix
+# must be unique per stack, so use the stack's name_prefix. bootstrap/ uses <prefix>/bootstrap.
+bucket = "<project-id>-tfstate"
+prefix = "<prefix>/main"
