@@ -715,7 +715,7 @@ def test_terraform_matches_code_for_workspace_identity():
     tf = (ROOT / "main.tf").read_text(encoding="utf-8")
     boot = (ROOT / "bootstrap" / "main.tf").read_text(encoding="utf-8")
     scopes = re.search(r'workspace_dwd_scopes\s*=\s*"([^"]+)"', tf)
-    assert scopes is not None and scopes.group(1).split(",") == list(gcp._WORKSPACE_SCOPES)
+    assert scopes is not None and scopes.group(1).split(",") == list(gcp._WORKSPACE_SCOPES + gcp._CHAT_MENTION_SCOPES)
     assert 'name  = "WORKSPACE_DWD_SERVICE_ACCOUNT"' in tf
     assert 'name  = "WORKSPACE_IMPERSONATE_USER"' in tf
     assert '--workspace-impersonate-user "${var.workspace_impersonate_user}"' in tf
@@ -734,3 +734,139 @@ def test_terraform_matches_code_for_workspace_identity():
     assert '"iamcredentials.googleapis.com"' in tf
     assert re.search(r'name\s*=\s*"ENABLE_BACKGROUND_WATCHDOG"\s*\n\s*value\s*=\s*"false"', tf)
     assert "GOOGLE_WORKSPACE_OAUTH_JSON" not in tf + boot  # no stored user token anywhere in IaC
+
+
+def test_resolve_chat_user_id_and_completion_notification_mention(monkeypatch):
+    r"""When DWD is configured, `resolve_chat_user_id` resolves the initiating supervisor's email
+    to their 21-digit OIDC `sub` (cached per process) and `send_completion_notification` formats
+    `<users/{sub}> (\`{email}\`)`; on any failure or without DWD it falls back to `\`{email}\``."""
+    import io
+    import json
+    import urllib.request
+    from unittest import mock
+
+    from cctv_audit import gcp as gcp_mod
+    from cctv_audit.workspace_reporter import WorkspaceReporter
+
+    gcp_mod._chat_user_id_cache.clear()
+    monkeypatch.setenv("WORKSPACE_IMPERSONATE_USER", BOT)
+    monkeypatch.setenv("WORKSPACE_DWD_SERVICE_ACCOUNT", SA)
+
+    impersonated_calls = []
+
+    class _FakeImpersonated:
+        def __init__(self, *, source_credentials, target_principal, target_scopes, subject):
+            impersonated_calls.append((target_principal, tuple(target_scopes), subject))
+            self.token = "tok-sub"
+
+        def refresh(self, _req):
+            pass
+
+    urlopen_calls = []
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def read(self):
+            return json.dumps({"sub": "104120710022716991580", "name": "test-1 user"}).encode("utf-8")
+
+    def _fake_urlopen(req, timeout=8.0):
+        urlopen_calls.append((req.full_url, req.headers.get("Authorization")))
+        return _FakeResp()
+
+    with (
+        mock.patch("google.auth.default", return_value=(mock.MagicMock(), "proj")),
+        mock.patch("google.auth.impersonated_credentials.Credentials", _FakeImpersonated),
+        mock.patch.object(urllib.request, "urlopen", side_effect=_fake_urlopen),
+    ):
+        uid1 = gcp_mod.resolve_chat_user_id("Test-1@example.com ")
+        uid2 = gcp_mod.resolve_chat_user_id("test-1@example.com")
+        assert uid1 == "104120710022716991580"
+        assert uid2 == "104120710022716991580"
+        assert len(impersonated_calls) == 1  # second call hit cache
+        assert impersonated_calls[0] == (
+            SA,
+            ("https://www.googleapis.com/auth/userinfo.profile",),
+            "test-1@example.com",
+        )
+        assert len(urlopen_calls) == 1
+
+        # Service account or invalid email returns "" without network calls
+        assert gcp_mod.resolve_chat_user_id("worker@proj.iam.gserviceaccount.com") == ""
+        assert gcp_mod.resolve_chat_user_id("") == ""
+        assert len(urlopen_calls) == 1
+
+    # Webhook payload includes <users/104120710022716991580> (`test-1@example.com`)
+    posted = []
+
+    class _FakeAsyncClient:
+        def __init__(self, **_kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def post(self, url, json):
+            posted.append((url, json))
+            r = mock.MagicMock()
+            r.raise_for_status = lambda: None
+            return r
+
+    reporter = WorkspaceReporter(gateway=None, webhook_url="https://chat.googleapis.com/v1/spaces/X/messages?key=k&token=t")
+    with mock.patch("httpx.AsyncClient", _FakeAsyncClient):
+        ok = asyncio.run(
+            reporter.send_completion_notification(
+                user_email="test-1@example.com",
+                audit_id="42e5d3",
+                sheet_url="https://docs.google.com/spreadsheets/d/S/edit",
+                violations_count=29,
+                total_tokens=2022031,
+            )
+        )
+        assert ok is True
+        assert "<users/104120710022716991580> (`test-1@example.com`)" in posted[-1][1]["text"]
+
+        # When DWD is absent or fails for an unknown user, falls back gracefully to plain email
+        monkeypatch.delenv("WORKSPACE_DWD_SERVICE_ACCOUNT", raising=False)
+        ok2 = asyncio.run(
+            reporter.send_completion_notification(
+                user_email="other@example.com",
+                audit_id="999999",
+                sheet_url="https://docs.google.com/spreadsheets/d/S/edit",
+                violations_count=0,
+                total_tokens=100,
+            )
+        )
+        assert ok2 is True
+        assert "• **发起督导**：`other@example.com`" in posted[-1][1]["text"]
+        assert "<users/" not in posted[-1][1]["text"]
+
+        # When ENABLE_GOOGLE_CHAT_NOTIFICATION=false, send_completion_notification skips posting
+        # even when webhook_url is configured.
+        monkeypatch.setenv("ENABLE_GOOGLE_CHAT_NOTIFICATION", "false")
+        from cctv_audit.config import AuditConfig, config as app_cfg
+        assert AuditConfig().enable_google_chat_notification is False
+        with mock.patch.object(app_cfg, "enable_google_chat_notification", False):
+            ok3 = asyncio.run(
+                reporter.send_completion_notification(
+                    user_email="other@example.com",
+                    audit_id="999998",
+                    sheet_url="https://docs.google.com/spreadsheets/d/S/edit",
+                    violations_count=0,
+                    total_tokens=100,
+                )
+            )
+            assert ok3 is False
+            assert len(posted) == 2
+
+        monkeypatch.setenv("ENABLE_GOOGLE_CHAT_NOTIFICATION", "true")
+        assert AuditConfig().enable_google_chat_notification is True
+
+    gcp_mod._chat_user_id_cache.clear()

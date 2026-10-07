@@ -29,7 +29,7 @@ from .agentic_auditor import (
     deduplicate_overlapping_findings,
 )
 from .config import config
-from .gcp import WorkspaceConfigError
+from .gcp import WorkspaceConfigError, gemini_timeout_ms_for_slice
 from .jobs import AuditJob, JobState, SegmentCheckpoint, UserScopedJobStore
 from .prompt_manager import PromptManager, PromptModelConfig
 from .video_ingestor import (
@@ -47,16 +47,17 @@ logger = logging.getLogger("cctv_audit.service")
 HEARTBEAT_INTERVAL_SEC: float = 30.0
 STALE_WORKER_HEARTBEAT_SEC: float = 180.0
 MAX_AUTO_RESUMES: int = 3
-SLICE_STALL_TIMEOUT_SEC: float = 1920.0
+SLICE_STALL_TIMEOUT_SEC: float = 1920.0  # source download + FFmpeg slicing only (not Gemini calls)
 CLEANUP_TIMEOUT_SEC: float = 30.0
 
 
-def _slice_stall_timeout_sec() -> float:
-    """In-container watchdog timeout for `analyze_segment`: must be at least `config.gemini_timeout_ms`
+def _slice_stall_timeout_sec(slice_duration_sec: float = 0.0) -> float:
+    """In-container watchdog timeout for `analyze_segment`: the slice's Gemini timeout
+    (`gcp.gemini_timeout_ms_for_slice`: 2.5 x slice length, at least `config.gemini_timeout_ms`)
     plus 120s headroom (for 20s evidence clip cutting) so the container watchdog never kills an
-    in-flight agentic Gemini call before the SDK HTTP timeout (`gemini_timeout_ms`, default 1800s).
+    in-flight Gemini call before the SDK HTTP timeout (5-min slice: 750s -> 870s; 10-min: 1620s).
     """
-    return max(600.0, float(config.gemini_timeout_ms) / 1000.0 + 120.0)
+    return max(600.0, gemini_timeout_ms_for_slice(slice_duration_sec) / 1000.0 + 120.0)
 
 
 class AuditService:
@@ -518,7 +519,7 @@ class AuditService:
                                 prior_carryover_summary=carryover,
                                 evidence_dir=evidence_dir,
                             ),
-                            timeout_sec=_slice_stall_timeout_sec(),
+                            timeout_sec=_slice_stall_timeout_sec(seg.end_offset_sec - seg.start_offset_sec),
                             label=f"Job {job.job_id} slice {ckpt_key}",
                         )
                     finally:

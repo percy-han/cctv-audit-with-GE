@@ -123,13 +123,26 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 
 2. Workspace 管理控制台 → 安全 → 访问权限和数据控制 → API 控制 → **管理全网域委派** → 添加：
    - 客户端 ID：上一步的数字
-   - OAuth 范围：`https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/spreadsheets`
+   - OAuth 范围：`https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/userinfo.profile`
+   （其中 `userinfo.profile` 仅在开启 Google Chat 完成通知时，用于把发起人邮箱解析为 Google Chat 所需的数字用户 ID 实现 `@发起人`；若未授权该范围，核心稽核不受影响，仅通知回退为显示纯邮箱文本。）
 
-一般几分钟内生效。没加或范围不对时，GE 里预检会直接提示写入探测失败。
+一般几分钟内生效。没加 `drive` / `spreadsheets` 或范围不对时，GE 里预检会直接提示写入探测失败。
 
 ### 第 7 步：共享视频文件夹
 
 把要稽核的 Drive 文件夹共享给机器人账号，权限选**编辑者**（报告和证据片段要写回这个文件夹）。
+
+### （可选）开启 Google Chat 完成通知（自动 `@发起人`）
+
+默认关闭（`enable_google_chat_notification = false`）。如果希望后台稽核完成后自动往指定的 Google Chat 聊天室发卡片并 `@` 发起任务的督导：
+
+1. 在目标 Google Chat 聊天室里创建一个 Incoming Webhook（聊天室名称旁下拉菜单 → 应用和集成 → Webhook）。
+2. 在 `<env>.tfvars`（或本地不提交 Git 的 `*.auto.tfvars`）中设置：
+   ```hcl
+   enable_google_chat_notification = true
+   google_chat_webhook_url         = "https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=..."
+   ```
+3. 重新执行第 5 步部署命令即可生效；随时把 `enable_google_chat_notification` 改回 `false` 即可关闭通知。
 
 ### （可选）推送即部署
 
@@ -140,7 +153,7 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 1. 打开 GE 应用（控制台 → Gemini Enterprise → 应用 `<p>-ge`），给用户分配许可。
 2. 在 GE 里选择稽核 Agent，发送 Drive 文件夹链接。
 3. Agent 先做预检（权限、视频数量/时长、切片计划、生效规则和模型版本），回复"确认开始"后任务在后台运行，可以关掉页面。
-4. 随时问"好了么"查进度；完成后回复报告 Sheet 链接。
+4. 随时问"好了么"查进度；完成后回复报告 Sheet 链接（若开启了 Google Chat 通知，也会在聊天室自动 `@` 发起人并附上报告链接）。
 
 ## 6. 运行测试
 

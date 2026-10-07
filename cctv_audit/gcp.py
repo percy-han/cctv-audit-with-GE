@@ -5,13 +5,14 @@ Preserves the hard-won production fixes from `percy-han/cctv-audit/cctv_audit/gc
 2. Strips `quota_project` (`credentials_without_quota_project()`) to prevent false
    `403 serviceusage.services.use` errors when accessing same-project GCS/Sheets.
 3. Uses the deployment's own project and model location (`GCP_PROJECT`, `VERTEX_MODEL_LOCATION`;
-   no code defaults) and an explicit HTTPX timeout in milliseconds (`timeout=1800000`, Axiom 3).
+   no code defaults) and an explicit HTTPX timeout in milliseconds (`config.gemini_timeout_ms`, default 750000 = 12.5 min, Axiom 3).
 4. Wraps Gemini API calls in exponential backoff using tenacity.
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 import logging
 import os
 import threading
@@ -85,6 +86,18 @@ def _is_transient_error(exc: BaseException) -> bool:
     )
 
 
+# Per-call Gemini timeout scales with the slice length: 2.5 s per second of video (the user's rule:
+# 5-min clip -> 12.5 min), never below `config.gemini_timeout_ms`. A 10-min clip therefore gets
+# 25 min instead of a fixed 12.5 min it might never finish in (code_review_log.md Round 60).
+GEMINI_TIMEOUT_SEC_PER_VIDEO_SEC: float = 2.5
+
+
+def gemini_timeout_ms_for_slice(slice_duration_sec: float) -> int:
+    """Timeout (ms) for one Gemini call on a slice of `slice_duration_sec` seconds."""
+    scaled_ms = int(math.ceil(max(0.0, float(slice_duration_sec)) * GEMINI_TIMEOUT_SEC_PER_VIDEO_SEC * 1000.0))
+    return max(int(config.gemini_timeout_ms), scaled_ms)
+
+
 async def generate_content_with_retry(
     *,
     model: str,
@@ -94,9 +107,23 @@ async def generate_content_with_retry(
     base_delay_sec: float = 2.0,
     max_delay_sec: float = 30.0,
     client: Optional[genai.Client] = None,
+    timeout_ms: Optional[int] = None,
 ) -> Any:
-    """Calls `client.aio.models.generate_content` with tenacity exponential backoff."""
+    """Calls `client.aio.models.generate_content` with tenacity exponential backoff.
+
+    `timeout_ms` (default `config.gemini_timeout_ms`, the client-level timeout) bounds each attempt:
+    a different value is sent as a per-request `http_options.timeout`, which the SDK patches over the
+    client's options, and the `asyncio.wait_for` guard follows it.
+    """
     active_client = client or await get_genai_client()
+    effective_timeout_ms = int(timeout_ms) if timeout_ms else int(config.gemini_timeout_ms)
+    if effective_timeout_ms != int(config.gemini_timeout_ms):
+        base_opts = gen_config.http_options or types.HttpOptions()
+        if isinstance(base_opts, dict):
+            base_opts = types.HttpOptions.model_validate(base_opts)
+        gen_config = gen_config.model_copy(
+            update={"http_options": base_opts.model_copy(update={"timeout": effective_timeout_ms})}
+        )
 
     @tenacity.retry(
         stop=tenacity.stop_after_attempt(max_attempts),
@@ -112,7 +139,7 @@ async def generate_content_with_retry(
                 contents=contents,
                 config=gen_config,
             ),
-            timeout=(config.gemini_timeout_ms / 1000.0) + 15.0,
+            timeout=(effective_timeout_ms / 1000.0) + 15.0,
         )
 
     return await _do_call()
@@ -146,6 +173,12 @@ _WORKSPACE_SCOPES = (
     "https://www.googleapis.com/auth/spreadsheets",
 )
 _IAM_SIGNER_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
+# Separate optional DWD scope used only by `resolve_chat_user_id` to map a supervisor's email
+# to their 21-digit Google user `sub` ID for Google Chat `<users/{id}>` @-mentions. Kept out of
+# `_WORKSPACE_SCOPES` so Drive/Sheets access still works even if a Workspace admin has not
+# authorised `userinfo.profile` yet.
+_CHAT_MENTION_SCOPES = ("https://www.googleapis.com/auth/userinfo.profile",)
+_OIDC_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 
 
 class WorkspaceConfigError(RuntimeError):
@@ -256,6 +289,63 @@ def workspace_credentials() -> Any:
             except google.auth.exceptions.RefreshError as exc:
                 raise WorkspaceAuthError(_explain_refresh_error(exc, *identity)) from exc
         return creds
+
+
+_chat_user_id_lock = threading.Lock()
+_chat_user_id_cache: dict[str, str] = {}
+
+
+def resolve_chat_user_id(user_email: str) -> str:
+    """Resolves a Workspace user email (e.g. `test-1@domain.com`) to its numeric Google user ID (`sub`)
+    for Google Chat incoming webhook `<users/{sub}>` @-mentions.
+
+    Uses keyless DWD (`WORKSPACE_DWD_SERVICE_ACCOUNT` signing a JWT with `sub=user_email` and scope
+    `https://www.googleapis.com/auth/userinfo.profile`) and queries OIDC userinfo. Best-effort and
+    cached per process: returns `""` on any error or when DWD is not configured, so notifications
+    always fall back to displaying the plain email without failing the job.
+    """
+    email = (user_email or "").strip().lower()
+    if not email or "@" not in email or email.endswith(".gserviceaccount.com"):
+        return ""
+    with _chat_user_id_lock:
+        cached = _chat_user_id_cache.get(email)
+    if cached is not None:
+        return cached
+
+    _, dwd_sa = workspace_identity()
+    if not dwd_sa:
+        return ""
+    try:
+        import json
+        import urllib.request
+        from google.auth import impersonated_credentials
+        from google.auth.transport.requests import Request as AuthRequest
+
+        source, _ = google.auth.default(scopes=list(_IAM_SIGNER_SCOPES))
+        strip = getattr(source, "with_quota_project", None)
+        if callable(strip):
+            source = strip(None)
+        creds = impersonated_credentials.Credentials(
+            source_credentials=source,
+            target_principal=dwd_sa,
+            target_scopes=list(_CHAT_MENTION_SCOPES),
+            subject=email,
+        )
+        creds.refresh(AuthRequest())
+        req = urllib.request.Request(
+            _OIDC_USERINFO_URL,
+            headers={"Authorization": f"Bearer {creds.token}"},
+        )
+        with urllib.request.urlopen(req, timeout=8.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        sub = str(data.get("sub") or "").strip()
+        if sub.isdigit():
+            with _chat_user_id_lock:
+                _chat_user_id_cache[email] = sub
+            return sub
+    except Exception as exc:
+        logger.warning("Could not resolve Google Chat user ID for %s: %s", email, exc)
+    return ""
 
 
 def workspace_principal() -> str:

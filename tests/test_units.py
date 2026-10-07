@@ -28,6 +28,7 @@ from cctv_audit.agentic_auditor import (
     WindowResult,
 )
 from cctv_audit.audit_service import AuditService
+import cctv_audit.audit_service as audit_service_module
 from cctv_audit.jobs import LOCAL_PLACEHOLDER_BUCKET, JobState, UserScopedJobStore
 from cctv_audit.prompt_manager import PromptManager, SopRuleItem
 from cctv_audit.turn import TurnAction, TurnDecision, verify_url_verbatim
@@ -800,7 +801,19 @@ def test_agentic_media_processing_is_set_on_the_video_part() -> None:
         os.environ.pop("GEMINI_TIMEOUT_MS", None)
         cfg = AuditConfig()
         assert cfg.video_media_processing == "agentic"
-        assert cfg.gemini_timeout_ms == 1_800_000
+        assert cfg.gemini_timeout_ms == 750_000
+        # Per-call timeout = 2.5 x slice length, never below the config floor; the in-container
+        # watchdog follows it (+120 s headroom).
+        from cctv_audit import gcp as gcp_module
+        with mock.patch.object(gcp_module.config, "gemini_timeout_ms", cfg.gemini_timeout_ms):
+            assert gcp_module.gemini_timeout_ms_for_slice(300.0) == 750_000
+            assert gcp_module.gemini_timeout_ms_for_slice(302.0) == 755_000
+            assert gcp_module.gemini_timeout_ms_for_slice(120.0) == 750_000  # floor
+            assert gcp_module.gemini_timeout_ms_for_slice(600.0) == 1_500_000
+            assert gcp_module.gemini_timeout_ms_for_slice(0.0) == 750_000
+            assert audit_service_module._slice_stall_timeout_sec() == 870.0
+            assert audit_service_module._slice_stall_timeout_sec(300.0) == 870.0
+            assert audit_service_module._slice_stall_timeout_sec(600.0) == 1620.0
     with mock.patch.dict(os.environ, {"VIDEO_MEDIA_PROCESSING": " Static "}):
         assert AuditConfig().video_media_processing == "static"
     with mock.patch.dict(os.environ, {"VIDEO_MEDIA_PROCESSING": " Agentic "}):
@@ -1711,7 +1724,7 @@ def test_tc013_cpuprobe_and_in_container_slice_watchdog() -> None:
         from cctv_audit.jobs import AuditJob
 
         svc = AuditService()
-        assert AuditService._slice_stall_timeout_sec() >= 1920.0
+        assert AuditService._slice_stall_timeout_sec() == config.gemini_timeout_ms / 1000.0 + 120.0
         stale_probing = AuditJob(
             job_id="02b29d",
             user_id="supervisor@example.com",
@@ -2247,3 +2260,42 @@ if __name__ == "__main__":
 
 
 
+
+
+def test_tc018_generate_content_with_retry_per_call_timeout():
+    """A non-default `timeout_ms` reaches the SDK as a per-request `http_options.timeout` (the
+    caller's config object is not mutated); the default leaves the request config untouched."""
+    import os
+    from unittest import mock
+    from google.genai import types as gtypes
+    from cctv_audit import gcp as gcp_module
+
+    seen = []
+
+    class _Models:
+        async def generate_content(self, *, model, contents, config):
+            seen.append(config)
+            return "ok"
+
+    class _Aio:
+        models = _Models()
+
+    class _Client:
+        aio = _Aio()
+
+    base_cfg = gtypes.GenerateContentConfig(temperature=0.0)
+    with mock.patch.object(gcp_module.config, "gemini_timeout_ms", 750_000):
+        out = asyncio.run(gcp_module.generate_content_with_retry(
+            model="m", contents=["x"], gen_config=base_cfg, client=_Client(), timeout_ms=1_500_000))
+        assert out == "ok"
+        assert seen[-1].http_options.timeout == 1_500_000
+        assert seen[-1].temperature == 0.0
+        assert base_cfg.http_options is None  # caller's object untouched
+
+        asyncio.run(gcp_module.generate_content_with_retry(
+            model="m", contents=["x"], gen_config=base_cfg, client=_Client()))
+        assert seen[-1] is base_cfg  # default: client-level timeout, request unchanged
+
+        asyncio.run(gcp_module.generate_content_with_retry(
+            model="m", contents=["x"], gen_config=base_cfg, client=_Client(), timeout_ms=750_000))
+        assert seen[-1] is base_cfg

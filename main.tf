@@ -195,10 +195,28 @@ variable "workspace_impersonate_user" {
   }
 }
 
+variable "enable_google_chat_notification" {
+  description = "Deployment-time switch to enable or disable sending job completion notifications (with @-mention of the initiating supervisor) to the Google Chat space."
+  type        = bool
+  default     = false
+}
+
+variable "google_chat_webhook_url" {
+  description = "Google Chat incoming webhook URL (`https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=...`) used when `enable_google_chat_notification = true`."
+  type        = string
+  default     = ""
+  sensitive   = true
+
+  validation {
+    condition     = var.google_chat_webhook_url == "" || can(regex("^https://chat\\.googleapis\\.com/", var.google_chat_webhook_url))
+    error_message = "google_chat_webhook_url must be empty or a https://chat.googleapis.com/... incoming webhook URL."
+  }
+}
+
 locals {
   # Scopes the Workspace super admin authorises for the runtime SA's OAuth client ID
-  # (must stay identical to cctv_audit/gcp.py::_WORKSPACE_SCOPES).
-  workspace_dwd_scopes = "https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/spreadsheets"
+  # (must stay identical to cctv_audit/gcp.py::_WORKSPACE_SCOPES + _CHAT_MENTION_SCOPES).
+  workspace_dwd_scopes = "https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/userinfo.profile"
 
   # Every per-stack name, derived from var.name_prefix (overrides only where old names are adopted).
   # The worker SA and the image repository are created by bootstrap/ with the same derivation.
@@ -441,6 +459,17 @@ resource "google_cloud_run_v2_service" "cctv_audit_worker" {
           value = env.value
         }
       }
+      env {
+        name  = "ENABLE_GOOGLE_CHAT_NOTIFICATION"
+        value = tostring(var.enable_google_chat_notification)
+      }
+      dynamic "env" {
+        for_each = var.enable_google_chat_notification && var.google_chat_webhook_url != "" ? [var.google_chat_webhook_url] : []
+        content {
+          name  = "GOOGLE_CHAT_WEBHOOK_URL"
+          value = env.value
+        }
+      }
     }
   }
 
@@ -504,6 +533,7 @@ resource "terraform_data" "vertex_reasoning_engine" {
         --vertex-model-location "${var.vertex_model_location}" \
         --workspace-dwd-service-account "${data.google_service_account.audit_worker_sa.email}" \
         --workspace-impersonate-user "${var.workspace_impersonate_user}" \
+        --google-chat-webhook-url "${var.enable_google_chat_notification ? var.google_chat_webhook_url : ""}" \
         --wait-and-bind-ge \
         --ge-engine-id "${local.ge_engine_id}" ${local.extra_ge_engine_flags} \
         --ge-app-display-name "${local.ge_app_display_name}" \

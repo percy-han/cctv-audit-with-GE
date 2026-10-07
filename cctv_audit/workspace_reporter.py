@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import List, Optional, Protocol
 
@@ -24,6 +25,7 @@ from pydantic import BaseModel, Field
 
 from .agentic_auditor import Finding, Status, TokenLedgerRow
 from .config import config
+from .gcp import resolve_chat_user_id
 
 logger = logging.getLogger("cctv_audit.workspace_reporter")
 
@@ -85,11 +87,13 @@ class WorkspaceReporter:
         self,
         gateway: Optional[WorkspaceDriveSheetsGatewayProtocol] = None,
         webhook_url: Optional[str] = None,
+        enable_notification: Optional[bool] = None,
     ) -> None:
         self._gateway = gateway
         self._webhook_url = (
             webhook_url if webhook_url is not None else config.google_chat_webhook_url
         )
+        self._enable_notification = enable_notification
 
     def build_tab1_rows(
         self,
@@ -217,18 +221,34 @@ class WorkspaceReporter:
         total_tokens: int,
     ) -> bool:
         """Sends Google Chat Webhook completion alert with direct link to the in-folder Google Sheet."""
-        if not self._webhook_url:
+        enabled = (
+            self._enable_notification
+            if self._enable_notification is not None
+            else (
+                config.enable_google_chat_notification
+                if "ENABLE_GOOGLE_CHAT_NOTIFICATION" in os.environ
+                else bool(self._webhook_url)
+            )
+        )
+        if not enabled or not self._webhook_url:
             logger.info(
-                "No Google Chat webhook configured; skipping push for job %s (user=%s)",
+                "Google Chat notification disabled or webhook unconfigured (enabled=%s); skipping push for job %s (user=%s)",
+                enabled,
                 audit_id,
                 user_email,
             )
             return False
 
+        chat_user_id = await asyncio.to_thread(resolve_chat_user_id, user_email)
+        initiator_line = (
+            f"<users/{chat_user_id}> (`{user_email}`)"
+            if chat_user_id
+            else f"`{user_email}`"
+        )
         payload = {
             "text": (
                 f"🔔 *【霸王茶姬门店 CCTV AI 稽核完成通知】*\n"
-                f"• **发起督导**：`{user_email}`\n"
+                f"• **发起督导**：{initiator_line}\n"
                 f"• **稽核单号**：`{audit_id}`\n"
                 f"• **待人工 3 秒复核事件数**：`{violations_count}` 项（全部含 5~10s 永久视频切片）\n"
                 f"• **总计 Token 消耗**：`{total_tokens:,}` Tokens\n"

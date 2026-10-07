@@ -20,4 +20,6 @@ workspace_impersonate_user = "<bot-user@customer-domain>" # "" = the worker SA i
 # ge_tenant_label       = "<brand>"            # used in agent descriptions / default display names
 # ge_agent_display_name = "<agent name>"       # default: "<brand> 门店监控 AI 稽核专家 [<name_prefix>]"; keep it unique per stack
 # ge_example_folder_url = "https://drive.google.com/drive/folders/<id>"
-# extra_ge_engine_ids   = []                   # only Gemini Enterprise apps this stack owns
+# extra_ge_engine_ids      = []                   # only Gemini Enterprise apps this stack owns
+# enable_google_chat_notification = false
+# google_chat_webhook_url         = "https://chat.googleapis.com/v1/spaces/<space>/messages?key=...&token=..."

@@ -29,7 +29,7 @@ from google.genai import types
 from pydantic import BaseModel, Field, field_validator
 
 from .config import config
-from .gcp import generate_content_with_retry
+from .gcp import gemini_timeout_ms_for_slice, generate_content_with_retry
 from .prompt_manager import PromptModelConfig
 from .video_ingestor import VideoSliceSegment
 
@@ -606,6 +606,9 @@ class AgenticAuditor:
                 model=prompt_cfg.active_model_version,
                 contents=[video_part, user_prompt],
                 gen_config=gen_config,
+                timeout_ms=gemini_timeout_ms_for_slice(
+                    segment.end_offset_sec - segment.start_offset_sec
+                ),
             )
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)

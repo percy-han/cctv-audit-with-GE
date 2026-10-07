@@ -88,9 +88,14 @@ class AuditConfig(BaseModel):
     # SDD 1.1 & 1.2: Dual-layer concurrency semaphores
     ffmpeg_concurrency: int = Field(default=2, ge=1, le=8)
     gemini_concurrency: int = Field(default=5, ge=1, le=20)
-    # SDD 1.2: Explicit HTTPX timeout in milliseconds (1,800,000 ms = 30 minutes for agentic video slices)
+    # SDD 1.2: Explicit HTTPX timeout in milliseconds for one Gemini call on one video slice.
+    # 750,000 ms = 12.5 min (2026-10-06, user decision): the customer's CCTV exports are at most
+    # 5 min long (a few 10-min ones), and healthy agentic calls on such slices took 106-598 s in
+    # production. The previous 30 min let one hung call stall a job for 32 min before the in-container
+    # watchdog (`audit_service._slice_stall_timeout_sec`, this value + 120 s) cut it and the
+    # sweep resumed it (job 42e5d3). Raise via env GEMINI_TIMEOUT_MS if longer clips become common.
     gemini_timeout_ms: int = Field(
-        default_factory=lambda: int(os.environ.get("GEMINI_TIMEOUT_MS", "1800000")),
+        default_factory=lambda: int(os.environ.get("GEMINI_TIMEOUT_MS", "750000")),
         ge=30_000,
     )
     # How Gemini samples each video slice:
@@ -104,6 +109,10 @@ class AuditConfig(BaseModel):
     # https://ai.google.dev/gemini-api/docs/pricing#gemini-3.8-flash — $0.75 input / $3.75 output through Dec 31, 2026)
     input_cost_per_million_usd: float = Field(default=0.75, ge=0.0)
     output_cost_per_million_usd: float = Field(default=3.75, ge=0.0)
+    enable_google_chat_notification: bool = Field(
+        default_factory=lambda: os.environ.get("ENABLE_GOOGLE_CHAT_NOTIFICATION", "false").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
     google_chat_webhook_url: str = Field(
         default_factory=lambda: os.environ.get("GOOGLE_CHAT_WEBHOOK_URL", "")
     )
