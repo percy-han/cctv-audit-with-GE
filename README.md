@@ -40,12 +40,88 @@ Cloud Scheduler 看门狗（<p>-watchdog）：定时唤醒 Worker，续跑被中
 1. 一个已开通结算的 GCP 项目（可以是已有项目；多套环境可共用一个项目，只要 `name_prefix` 不同）。执行人需要项目 Owner。
 2. Gemini Enterprise 许可（用来访问 GE 应用的用户需要分配许可）。
 3. 一个 Google Workspace **机器人账号**（如 `cctv-bot@<你的域名>`），需有 Drive 存储空间：报告和证据片段存在它名下。
-4. 一位 Workspace 超级管理员，用来添加一次域委派（第 6 步）。
+4. 一位 Workspace 超级管理员，用来添加一次域委派（部署第 6 步）。
 5. 本地工具：`gcloud`、Terraform ≥ 1.7、Python 3.12+。
 
 > 所有资源名都由 `name_prefix` 派生（`<p>-worker`、`<p>-deployer`、`<p>-images`、`<p>-watchdog`、`<p>-agent`、`<p>-ge`、`<项目ID>-<p>-staging` 等），换一个前缀就能在同一个项目里再建一套，互不冲突。
 
-## 4. 部署步骤
+## 4. 账号体系与跨系统打通说明（GCP × Gemini Enterprise × Google Workspace）
+
+本方案横跨 **GCP（云基础设施与模型推理）**、**Gemini Enterprise（对话入口）** 和 **Google Workspace / GWS（Drive 视频存取、Sheets 报告与 Google Chat 通知）** 三套系统。在开始部署前，先理清三边的账号关系和打通方式：
+
+### 4.1 核心原则：GE 与 GWS 共享同一套企业员工账号，GCP 服务账号通过「机器人账号」读写 Drive
+
+1. **员工账号同源（GWS = Gemini Enterprise 登录身份）**：
+   - Gemini Enterprise 本身**不单独建一套账号密码**，它直接复用你们企业的 Google Workspace / Cloud Identity 域账号体系。
+   - 门店督导用自己的企业邮箱（如 `auditor@<你的域名>`）登录 Google Drive 上传门店视频，并用**同一个邮箱账号**登录 Gemini Enterprise 网页端发起稽核对话、在 Google Chat 接收 `@` 完成通知。
+2. **为什么要配一个「GWS 机器人账号（`workspace_impersonate_user`）」？**
+   - GCP 自动创建的 IAM 服务账号（`<p>-worker@<项目ID>.iam.gserviceaccount.com`）不是人类员工账号，它在 Google Drive 里的个人存储配额是 **0 字节**——如果直接用服务账号去新建 Google Sheet 报告或上传 20 秒证据视频，Google Drive API 会直接拒绝并报错 `storageQuotaExceeded`。
+   - 因此，需要在 GWS 里准备一个带 Drive 存储空间的普通域账号作为**机器人账号**（如 `cctv-bot@<你的域名>`），并通过 **Google Workspace 全网域委派（DWD）** 允许 GCP 的 `<p>-worker` 服务账号在运行时以无密钥（IAM `signJwt`）方式「化身为（Impersonate）」这个机器人账号去读视频、写报告和查用户 ID。
+
+### 4.2 三套系统中的 6 类账号/角色对照表
+
+| 所属系统 | 账号 / 身份名称 | 类型 | 谁来创建 / 在哪配置 | 核心职责与所需权限 |
+|---|---|---|---|---|
+| **GCP** | **1. GCP 项目管理员** | 人工账号 | 企业 Cloud 管理员 | 拥有 GCP 项目的 `roles/owner` 权限；仅在首次部署时执行第 1 步（建状态桶）和第 4 步（`bootstrap` 初始化）。 |
+| **GCP** | **2. 部署服务账号**<br>`<p>-deployer@<项目ID>.iam...` | 机器账号<br>(IAM SA) | 第 4 步 `bootstrap` **自动创建** | 供 Cloud Build 流水线使用；自动赋予构建镜像、管理 Cloud Run / GCS / Scheduler / Vertex AI Agent Engine 及注册 Gemini Enterprise 应用的权限。 |
+| **GCP** | **3. 运行时服务账号**<br>`<p>-worker@<项目ID>.iam...` | 机器账号<br>(IAM SA) | 第 4 步 `bootstrap` **自动创建** | 同时挂载在 **Agent Engine (`<p>-agent`)** 和 **Cloud Run Worker (`<p>-worker`)** 上：<br>• **对内（GCP）**：调用 Vertex AI Gemini 多模态模型、读写 GCS 状态桶、签发 OIDC Token 触发 Cloud Run；<br>• **对外（GWS）**：通过 DWD 模拟下面的「GWS 机器人账号」访问 Drive / Sheets / People API。 |
+| **GWS** | **4. GWS 超级管理员** | 人工账号 | 企业 IT 管理员 | 仅在部署第 6 步登录 `admin.google.com` 执行一次操作：将 `<p>-worker` 服务账号的数字 `Client ID` 加入「全网域委派（DWD）」白名单。 |
+| **GWS** | **5. GWS 机器人账号**<br>（如 `cctv-bot@<你的域名>`） | 专用域账号<br>(有 Drive 配额) | 企业 IT 在 GWS 创建，邮箱填入 `<env>.tfvars` 的 `workspace_impersonate_user` | **跨云桥梁身份**：拥有 Google Workspace 基础许可（含 Drive 存储空间）。被 `<p>-worker` 通过 DWD 模拟后，负责读取 SOP 规则表、从督导文件夹下载源视频、上传 20 秒违规证据 MP4，并创建 Google Sheet 稽核报告（文件归属在该机器人名下，不占服务账号 0 字节配额）。 |
+| **GWS & GE** | **6. 门店督导 / 业务用户**<br>（如 `auditor@<你的域名>`） | 人工账号 | 门店督导本人 | • **在 GWS Drive 中**：新建视频文件夹并上传监控视频，将该文件夹共享给上面的 **GWS 机器人账号（编辑者）**；<br>• **在 Gemini Enterprise 中**：需要被分配 **Gemini Enterprise License（席位许可）**，登录 GE 网页端粘贴文件夹链接发起稽核；<br>• **在 Google Chat 中**：稽核完成后在群里收到机器人自动 `@` 本人的卡片通知。 |
+
+### 4.3 三套系统是怎么打通并联动工作的？
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│ 1. 用户侧（同源 GWS 员工账号：auditor@<你的域名>）                                        │
+│    • 在 Google Drive 上传视频，把文件夹共享给【GWS 机器人账号 cctv-bot@】（编辑者）         │
+│    • 用同一个邮箱登录 Gemini Enterprise Web UI（需在 GCP 控制台分配 GE 席位许可）          │
+└───────────────────────────────┬─────────────────────────────────────────────────────────┘
+                                │ ① 在 GE 聊天框发送 Drive 文件夹链接 / 回复"确认开始"
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│ 2. Gemini Enterprise 应用 (<p>-ge) ──[Discovery Engine 自动绑定]──► Agent Engine (<p>-agent)│
+│    • 部署流水线自动创建 GE 应用并将 Vertex AI ReasoningEngine (<p>-agent) 注册挂载进去      │
+│    • GE 把当前登录督导的身份传给 <p>-agent（按用户隔离任务状态，并记录任务发起人邮箱）       │
+└───────────────────────────────┬─────────────────────────────────────────────────────────┘
+                                │ ② Google 签名 OIDC ID Token（零静态密钥，roles/run.invoker）
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│ 3. GCP Cloud Run Worker (<p>-worker，挂载运行时服务账号 <p>-worker@<项目ID>.iam...)       │
+│    • 调用 Vertex AI Gemini 模型执行多模态视频稽核，任务断点实时写入 GCS staging bucket      │
+│    • Cloud Scheduler 看门狗 (<p>-watchdog) 每 5 分钟通过 OIDC 唤醒 Worker 续跑中断任务      │
+└──────────────┬───────────────────────────────────────────────────┬──────────────────────┘
+               │ ③ 全网域委派 (DWD，IAM signJwt 免密钥模拟)          │ ④ Incoming Webhook POST
+               │   化身【GWS 机器人账号 cctv-bot@<你的域名>】        │   (结合 DWD userinfo.profile)
+               ▼                                                   ▼
+┌──────────────────────────────────────────┐     ┌────────────────────────────────────────┐
+│ 4A. Google Drive & Google Sheets         │     │ 4B. Google Chat 聊天室（可选完成通知）   │
+│ • 读取 SOP 总控表（加载最新规则与模型名）  │     │ • 先通过 DWD 调 People API 把发起督导   │
+│ • 从督导文件夹流式下载视频                 │     │   邮箱解析成 GWS 数字用户 ID             │
+│ • 将 20s 违规证据 MP4 与 3-Tab 稽核报告   │     │ • 往群 Webhook 发卡片，精准 @发起督导    │
+│   Sheet 直接写回督导的同一 Drive 文件夹   │     │   本人并附上 Google Sheet 报告直链       │
+└──────────────────────────────────────────┘     └────────────────────────────────────────┘
+```
+
+要让上面四条链路全部跑通，只需要完成以下 **4 处对接配置**（均已包含在下文「第 5 节 部署步骤」中）：
+
+1. **打通 GE 与 GCP Agent Engine（流水线自动完成 + 管理员分配 License）**：
+   - **应用与 Agent 绑定**：无需手动配置。执行部署命令（第 5 步）时，`deploy/deploy_reasoning_engine.py` 会自动创建 Vertex AI `ReasoningEngine`（`<p>-agent`）、创建 Gemini Enterprise 应用（`<p>-ge`），并将 Agent 注册到 GE 应用中。
+   - **给督导开通访问权**：管理员进入 **GCP 控制台 → Gemini Enterprise → License（许可管理）**，勾选需要使用系统的督导邮箱（`auditor@<你的域名>`）分配许可。
+2. **打通 GCP Agent Engine 与 Cloud Run Worker（Terraform 自动完成）**：
+   - 无需手动配置。`bootstrap` 和 `main.tf` 会自动为 `<p>-worker` 服务账号授予 `roles/run.invoker`、`roles/aiplatform.user`、`roles/storage.objectAdmin` 和 `roles/iam.serviceAccountTokenCreator`（允许服务账号调用 IAM `signJwt` 签发 DWD 令牌）。
+3. **打通 GCP 服务账号与 Google Workspace Drive/Sheets（第 3、6、7 步）**：
+   - **配置被模拟的机器人邮箱（第 3 步）**：在 `<env>.tfvars` 中设置 `workspace_impersonate_user = "cctv-bot@<你的域名>"`。
+   - **配置 GWS 全网域委派 DWD（第 6 步，超管一次操作）**：GWS 超级管理员在 `admin.google.com` 的「管理全网域委派」中，填入 `<p>-worker` 服务账号的数字 `uniqueId`（Client ID），并授权以下 3 个 OAuth Scope：
+     - `https://www.googleapis.com/auth/drive`（读源视频、创建证据子目录、上传 20s 证据 MP4）
+     - `https://www.googleapis.com/auth/spreadsheets`（读 SOP 规则总控表、写入 3-Tab 稽核报告 Sheet）
+     - `https://www.googleapis.com/auth/userinfo.profile`（把发起督导邮箱解析为 Google Chat `@` 所需的数字用户 ID）
+   - **共享文件夹权限（第 2、7 步）**：将 SOP 规则表和督导的待稽核视频文件夹共享给 `cctv-bot@<你的域名>`（视频文件夹需给**编辑者**权限，这样机器人生成的报告 Sheet 和证据视频才能直接落盘在该文件夹内，督导无需二次授权即可直接点开观看）。
+4. **打通 Cloud Run Worker 与 Google Chat 通知群（可选配置）**：
+   - 在需要接收通知的 Google Chat 聊天室创建 **Incoming Webhook**，将 URL 填入 `<env>.tfvars` 的 `google_chat_webhook_url` 并设 `enable_google_chat_notification = true`。
+   - 只要第 6 步的域委派里包含了 `userinfo.profile`，Worker 在发通知前就会自动以机器人身份查询 People API，把发起任务的督导邮箱转为 `<users/数字ID>`，在群消息里直接高亮 `@` 到督导本人。
+
+## 5. 部署步骤
 
 下面用 `<env>` 表示这套环境的名字（任意，例如 `prod`，但不能叫 `example`），`<p>` 表示 `name_prefix`。
 
@@ -150,14 +226,14 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 
 在 Cloud Build 控制台把本 GitHub 仓库连接为第二代仓库，然后在 `bootstrap/<env>.tfvars` 设置 `trigger_repository = "projects/<项目ID>/locations/<region>/connections/<连接名>/repositories/<仓库名>"`，重新 apply bootstrap。之后推送到 `main` 分支会自动部署。如果代码不在仓库根目录，设置 `iac_dir`。
 
-## 5. 使用
+## 6. 使用
 
 1. 打开 GE 应用（控制台 → Gemini Enterprise → 应用 `<p>-ge`），给用户分配许可。
 2. 在 GE 里选择稽核 Agent，发送 Drive 文件夹链接。
 3. Agent 先做预检（权限、视频数量/时长、切片计划、生效规则和模型版本），回复"确认开始"后任务在后台运行，可以关掉页面。
 4. 随时问"好了么"查进度；完成后回复报告 Sheet 链接（若开启了 Google Chat 通知，也会在聊天室自动 `@` 发起人并附上报告链接）。
 
-## 6. 运行测试
+## 7. 运行测试
 
 ```bash
 .venv/bin/python -m pytest tests/ -q -p no:cacheprovider
@@ -166,7 +242,7 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 
 `eval/tests` 中依赖私有评测数据的用例在没有数据时会自动跳过。
 
-## 7. Prompt 调优工具（eval/）
+## 8. Prompt 调优工具（eval/）
 
 用人工稽核结果做"标准答案"，评估新规则/新 Prompt 的召回率：
 
@@ -178,7 +254,7 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 
 每个脚本都支持 `--help`。
 
-## 8. 删除环境
+## 9. 删除环境
 
 以下命令都需要项目 Owner 凭据，在仓库根目录按顺序执行。`terraform destroy` 会通过 `terraform_data.vertex_reasoning_engine` 的销毁钩子（`deploy/deploy_reasoning_engine.py destroy-stack`）自动清理该环境专属的 Gemini Enterprise Agent / 应用 / 数据存储、Vertex AI ReasoningEngine、Staging Bucket 内的缓存对象以及 Cloud Run 服务（严格校验 `service_account` 归属，绝不触碰同项目下的其他环境）：
 
