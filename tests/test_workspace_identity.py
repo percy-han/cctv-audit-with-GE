@@ -370,6 +370,29 @@ def test_unshared_sop_sheet_is_reported_not_silently_ignored(monkeypatch):
         asyncio.run(_gateway(drive).check_sheet_readable("SOP123"))
 
 
+def test_xlsx_sop_sheet_is_rejected_with_save_as_google_sheets_hint(monkeypatch):
+    _dwd_mode(monkeypatch)
+    drive = _FakeDrive()
+    drive.api.handlers["get"] = lambda **kw: _Req(
+        {
+            "id": "XLSX123",
+            "name": "master_sheet.xlsx",
+            "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
+    )
+    with pytest.raises(WorkspaceAccessError, match="另存为 Google 表格"):
+        asyncio.run(_gateway(drive).check_sheet_readable("XLSX123"))
+
+    drive.api.handlers["get"] = lambda **kw: _Req(
+        {
+            "id": "GSHEET123",
+            "name": "SOP 总控表",
+            "mimeType": gcp._SPREADSHEET_MIME,
+        }
+    )
+    assert asyncio.run(_gateway(drive).check_sheet_readable("GSHEET123")) == "SOP 总控表"
+
+
 # 3. Report Sheet ownership -------------------------------------------------------------------
 
 TAB1 = "违规事件 3 秒复核台"
@@ -772,7 +795,7 @@ def test_resolve_chat_user_id_and_completion_notification_mention(monkeypatch):
             pass
 
         def read(self):
-            return json.dumps({"sub": "104120710022716991580", "name": "test-1 user"}).encode("utf-8")
+            return json.dumps({"sub": "104120710022716991580", "name": "test-1 han"}).encode("utf-8")
 
     def _fake_urlopen(req, timeout=8.0):
         urlopen_calls.append((req.full_url, req.headers.get("Authorization")))

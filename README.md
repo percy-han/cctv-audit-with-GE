@@ -60,10 +60,11 @@ bootstrap/create_state_bucket.sh <项目ID> <region>     # 桶名默认 <项目I
 
 Sheet 是 Drive 文件，Terraform 建不了，手动准备一次即可（任选以下一种方式，**不需要**申请额外的 OAuth 敏感权限）：
 
-- **方式 A（推荐，浏览器直接导入，0 命令行认证）**：
-  1. 在浏览器里新建一个空白 Google Sheet，点击菜单栏 **文件 (File) → 导入 (Import) → 上传 (Upload)**，选择本仓库里的 `sop/master_sheet.xlsx`，导入位置选 **替换电子表格 (Replace spreadsheet)** → 点击 **导入数据**。
-  2. 把这张表共享给机器人账号（查看者即可；如果希望服务自动把新模型名追加到 Tab0，给编辑者）。
-  3. 记下地址栏里的 `<SheetID>`，第 3 步填进 `<env>.tfvars` 的 `master_prompt_sheet_id`。
+- **方式 A（推荐，浏览器直接导入或上传转换，0 命令行认证）**：
+  1. **做法 A1（在空白表格内导入）**：新建一个空白 Google Sheet，点击菜单栏 **文件 (File) → 导入 (Import) → 上传 (Upload)**，选择本仓库里的 `sop/master_sheet.xlsx`，导入位置选 **替换电子表格 (Replace spreadsheet)** → 点击 **导入数据**。
+  2. **做法 A2（直接上传 `.xlsx` 到 Google Drive）**：如果你直接把 `sop/master_sheet.xlsx` 上传到了 Google Drive，双击打开它后，注意看左上角文件名旁边是否有绿色的 **`.XLSX`** 标记（有该标记代表它仍是 Excel 二进制格式，Google Sheets API 无法直接读取）。如果有 `.XLSX` 标记，只需在左上角菜单点击一次 **文件 (File) → 另存为 Google 表格 (Save as Google Sheets)**，浏览器会弹出一个**没有 `.XLSX` 标记**的新标签页，**后续请使用这个新标签页的表格和 `<SheetID>`**。
+  3. 把最终这张原生 Google 表格（左上角无 `.XLSX` 标记）共享给你的**机器人账号**（即 `workspace_impersonate_user` 填写的邮箱，查看者即可；如果希望服务自动把新模型名追加到 Tab0，给编辑者）。
+  4. 记下地址栏里的 `<SheetID>`，第 3 步填进 `<env>.tfvars` 的 `master_prompt_sheet_id`。
 
 - **方式 B（命令行脚本写入，在第 4 步 `bootstrap` 建好服务账号后执行）**：
   > 注意：Google 默认会拦截 `gcloud` 内置客户端 ID 直接向个人账号申请 `spreadsheets` 敏感范围（报 `Google blocked this access`）。因此命令行方式改为直接复用标准 `gcloud auth application-default login`（仅 `cloud-platform` 范围），通过模拟 `<p>-worker` 服务账号写入：

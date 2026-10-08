@@ -518,10 +518,11 @@ class GoogleWorkspaceGateway:
         return await asyncio.to_thread(_probe)
 
     async def check_sheet_readable(self, sheet_id: str) -> str:
-        """The SOP master Sheet is visible to the Workspace identity; returns its title.
+        """The SOP master Sheet is visible to the Workspace identity and is a native Google Sheet.
 
-        Without this check an unshared SOP Sheet silently degrades every audit to the bundled
-        baseline prompt (`PromptManager.load_active_config` falls back on any read error).
+        Without this check an unshared SOP Sheet or a raw uploaded `.xlsx` file silently degrades
+        every audit to the bundled baseline prompt (`PromptManager.load_active_config` falls back
+        on any read error, and Sheets API v4 rejects `.xlsx` files with HTTP 400).
         """
 
         def _check() -> str:
@@ -529,7 +530,7 @@ class GoogleWorkspaceGateway:
             try:
                 meta = (
                     drive.files()
-                    .get(fileId=sheet_id, fields="id, name", supportsAllDrives=True)
+                    .get(fileId=sheet_id, fields="id, name, mimeType", supportsAllDrives=True)
                     .execute(num_retries=3)
                 )
             except Exception as exc:
@@ -539,7 +540,16 @@ class GoogleWorkspaceGateway:
                         f"读不到 SOP 总控表 `{sheet_id}`：请把它以「查看者」（或以上）身份共享给 `{who}`"
                     ) from exc
                 raise
-            return str(meta.get("name") or sheet_id)
+            name = str(meta.get("name") or sheet_id)
+            mime = meta.get("mimeType")
+            if mime and mime != _SPREADSHEET_MIME:
+                raise WorkspaceAccessError(
+                    f"SOP 总控表「{name}」(`{sheet_id}`) 当前不是原生 Google 表格（当前格式：`{mime}`，"
+                    "例如直接上传的 `.xlsx` 文件左上角会带有 `.XLSX` 标记），Google Sheets API 无法直接读取："
+                    "请在浏览器打开它，点击左上角「文件 (File) → 另存为 Google 表格 (Save as Google Sheets)」，"
+                    "然后把新生成的 Google 表格 ID 填入 `master_prompt_sheet_id` 并共享给运行身份"
+                )
+            return name
 
         return await asyncio.to_thread(_check)
 
