@@ -173,6 +173,8 @@ locals {
     "artifactregistry.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "iam.googleapis.com",
+    "iamcredentials.googleapis.com",
+    "sheets.googleapis.com",
   ])
 
   # What ../main.tf and deploy/deploy_reasoning_engine.py call, narrowest predefined role per need.

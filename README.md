@@ -58,21 +58,22 @@ bootstrap/create_state_bucket.sh <项目ID> <region>     # 桶名默认 <项目I
 
 ### 第 2 步：导入 SOP 规则表
 
-Sheet 是 Drive 文件，Terraform 建不了，需要手动一次：
+Sheet 是 Drive 文件，Terraform 建不了，手动准备一次即可（任选以下一种方式，**不需要**申请额外的 OAuth 敏感权限）：
 
-1. 在浏览器里新建一个空白 Google Sheet，记下 URL 里的 ID。
-2. 共享给机器人账号（查看者即可；如果希望服务自动把新模型名追加到 Tab0，给编辑者）。
-3. 导入：
+- **方式 A（推荐，浏览器直接导入，0 命令行认证）**：
+  1. 在浏览器里新建一个空白 Google Sheet，点击菜单栏 **文件 (File) → 导入 (Import) → 上传 (Upload)**，选择本仓库里的 `sop/master_sheet.xlsx`，导入位置选 **替换电子表格 (Replace spreadsheet)** → 点击 **导入数据**。
+  2. 把这张表共享给机器人账号（查看者即可；如果希望服务自动把新模型名追加到 Tab0，给编辑者）。
+  3. 记下地址栏里的 `<SheetID>`，第 3 步填进 `<env>.tfvars` 的 `master_prompt_sheet_id`。
 
-```bash
-gcloud auth application-default login \
-  --scopes=https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/cloud-platform
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python scripts/init_sop_sheet.py --sheet-id <SheetID> --dry-run   # 先预览
-.venv/bin/python scripts/init_sop_sheet.py --sheet-id <SheetID>
-```
-
-4. 记下 `<SheetID>`，第 3 步填进 `<env>.tfvars` 的 `master_prompt_sheet_id`（部署时会校验格式，不能留占位符）。
+- **方式 B（命令行脚本写入，在第 4 步 `bootstrap` 建好服务账号后执行）**：
+  > 注意：Google 默认会拦截 `gcloud` 内置客户端 ID 直接向个人账号申请 `spreadsheets` 敏感范围（报 `Google blocked this access`）。因此命令行方式改为直接复用标准 `gcloud auth application-default login`（仅 `cloud-platform` 范围），通过模拟 `<p>-worker` 服务账号写入：
+  1. 在浏览器里新建空白 Google Sheet，共享给 `<p>-worker@<项目ID>.iam.gserviceaccount.com` 为**编辑者**（同时共享给机器人账号）。
+  2. 完成第 4 步 `bootstrap` 后执行：
+     ```bash
+     gcloud auth application-default login
+     python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+     .venv/bin/python scripts/init_sop_sheet.py --sheet-id <SheetID> --tfvars <env>.tfvars
+     ```
 
 以后改规则直接改 Sheet：新建一个规则页签，把 Tab0 的 `Active_Prompt_Version` 改成新页签名即可生效（改回旧名就是回滚），不用重新部署。
 

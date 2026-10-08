@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load the SOP Master Sheet snapshot (sop/master_sheet.json) into a Google Sheet.
+"""Load the SOP Master Sheet snapshot (sop/master_sheet.json) into a Google Sheet, or export .xlsx.
 
 The audit service reads its Layer 2 SOP rules at run time from the Google Sheet named by
 Terraform variable `master_prompt_sheet_id`:
@@ -7,35 +7,43 @@ Terraform variable `master_prompt_sheet_id`:
     rules tab to use, `Active_Model_Version`, `Fallback_Model_Version`);
   * the rules tab holds one SOP rule per row (9 columns, header in row 1).
 A Sheet is a Drive file, not a GCP resource, so Terraform cannot create it. Run this once per
-environment.
+environment using either:
 
-Recommended (no extra OAuth scopes needed):
-  1. In the browser, create an empty Google Sheet (owned by you or by the bot account).
-  2. Share it with the bot account (`workspace_impersonate_user`) as Viewer (Editor if you want
-     the service to append newly seen model names to Tab0).
-  3. Run, with credentials that can edit that Sheet:
-       gcloud auth application-default login \\
-         --scopes=https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/cloud-platform
-       python3 scripts/init_sop_sheet.py --sheet-id <SHEET_ID_OR_URL>
-  4. Put the Sheet ID into `<env>.tfvars` -> `master_prompt_sheet_id`, then deploy.
+Option A — Browser import (zero OAuth / zero CLI setup):
+  1. In Google Sheets, create a blank spreadsheet -> File -> Import -> Upload `sop/master_sheet.xlsx`
+     -> choose "Replace spreadsheet" -> Import data.
+  2. Share the Sheet with the bot account (`workspace_impersonate_user`) as Viewer (or Editor).
+  3. Put the Sheet ID into `<env>.tfvars` -> `master_prompt_sheet_id`.
 
-The target Sheet must not already contain tabs with the same titles unless --overwrite is given
-(then those tabs are cleared and rewritten). Other tabs are left untouched. Values are written
-with valueInputOption=RAW so rule text that starts with '=' or '+' is never parsed as a formula.
+Option B — CLI via Service Account impersonation (uses standard `gcloud auth application-default login`
+without `--scopes=spreadsheets`, avoiding Google's OAuth block on the default gcloud client ID):
+  1. Run `bootstrap` first (so `<name_prefix>-worker@<project_id>.iam.gserviceaccount.com` exists).
+  2. Create an empty Google Sheet and share it as **Editor** with `<name_prefix>-worker@<project_id>.iam.gserviceaccount.com`
+     (or with `workspace_impersonate_user` if Domain-Wide Delegation is already active).
+  3. Run:
+       gcloud auth application-default login
+       python3 scripts/init_sop_sheet.py --sheet-id <SHEET_ID_OR_URL> --tfvars <env>.tfvars
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
+import zipfile
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape as xml_escape
 
 DEFAULT_SNAPSHOT = Path(__file__).resolve().parent.parent / "sop" / "master_sheet.json"
+DEFAULT_XLSX = Path(__file__).resolve().parent.parent / "sop" / "master_sheet.xlsx"
 TAB0_TITLE = "Tab0_版本总控与回滚开关"
 _SHEET_URL_RE = re.compile(r"/spreadsheets/d/([A-Za-z0-9_-]+)")
+_TFVAR_LINE_RE = re.compile(r'^\s*([a-zA-Z0-9_]+)\s*=\s*"([^"]*)"')
+_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 
 def extract_sheet_id(value: str) -> str:
@@ -47,6 +55,39 @@ def extract_sheet_id(value: str) -> str:
     if "/" in value or not re.fullmatch(r"[A-Za-z0-9_-]{20,}", value):
         raise ValueError(f"not a Google Sheet ID or Sheet URL: {value!r}")
     return value
+
+
+def parse_tfvars(path: Path) -> dict[str, str]:
+    """Extract simple `key = "value"` string assignments from a `.tfvars` file."""
+    result: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        match = _TFVAR_LINE_RE.match(line)
+        if match:
+            result[match.group(1)] = match.group(2).strip()
+    return result
+
+
+def resolve_impersonation_targets(
+    tfvars_path: Path | None,
+    service_account: str,
+    impersonate_user: str,
+) -> tuple[str, str]:
+    """Return `(worker_sa_email, workspace_impersonate_user)` from flags, `--tfvars`, or env."""
+    sa = (service_account or os.environ.get("WORKSPACE_DWD_SERVICE_ACCOUNT", "")).strip()
+    user = (impersonate_user or os.environ.get("WORKSPACE_IMPERSONATE_USER", "")).strip()
+    if tfvars_path is not None:
+        tfv = parse_tfvars(tfvars_path)
+        if not sa:
+            proj = tfv.get("project_id", "")
+            prefix = tfv.get("name_prefix", "")
+            if proj and prefix and "<" not in proj and "<" not in prefix:
+                sa = f"{prefix}-worker@{proj}.iam.gserviceaccount.com"
+        if not user:
+            cand = tfv.get("workspace_impersonate_user", "")
+            if cand and "<" not in cand:
+                user = cand
+    return sa, user
 
 
 def load_snapshot(path: Path) -> list[dict[str, Any]]:
@@ -74,6 +115,99 @@ def load_snapshot(path: Path) -> list[dict[str, Any]]:
         if tab["title"] != TAB0_TITLE and len(values[0]) != 9:
             raise ValueError(f"{path}: rules tab {tab['title']!r} must have 9 columns, got {len(values[0])}")
     return tabs
+
+
+def _col_letter(col_idx_zero_based: int) -> str:
+    """Convert 0-based column index to Excel column letters (0 -> A, 25 -> Z, 26 -> AA)."""
+    n = col_idx_zero_based + 1
+    chars: list[str] = []
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        chars.append(chr(ord("A") + rem))
+    return "".join(reversed(chars))
+
+
+def export_xlsx(tabs: list[dict[str, Any]], out_path: Path) -> None:
+    """Write a standards-compliant multi-sheet `.xlsx` file using inline strings (`t="inlineStr"`).
+
+    Using `inlineStr` guarantees every cell is imported by Google Sheets as literal text (never
+    interpreted as a formula even if a cell starts with `=` or `+`), with zero third-party deps.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet_overrides = "\n".join(
+        f'  <Override PartName="/xl/worksheets/sheet{i}.xml" '
+        f'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        for i in range(1, len(tabs) + 1)
+    )
+    content_types_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">\n'
+        '  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>\n'
+        '  <Default Extension="xml" ContentType="application/xml"/>\n'
+        '  <Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>\n'
+        f"{sheet_overrides}\n"
+        "</Types>\n"
+    )
+    root_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+        '  <Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/>\n'
+        "</Relationships>\n"
+    )
+    sheets_entries = "\n".join(
+        f'    <sheet name="{xml_escape(str(t["title"]), {"\"": "&quot;"})}" sheetId="{i}" r:id="rId{i}"/>'
+        for i, t in enumerate(tabs, start=1)
+    )
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">\n'
+        "  <sheets>\n"
+        f"{sheets_entries}\n"
+        "  </sheets>\n"
+        "</workbook>\n"
+    )
+    wb_rels_entries = "\n".join(
+        f'  <Relationship Id="rId{i}" '
+        f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        f'Target="worksheets/sheet{i}.xml"/>'
+        for i in range(1, len(tabs) + 1)
+    )
+    workbook_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+        f"{wb_rels_entries}\n"
+        "</Relationships>\n"
+    )
+
+    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types_xml)
+        zf.writestr("_rels/.rels", root_rels_xml)
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+        for i, tab in enumerate(tabs, start=1):
+            row_xml_parts: list[str] = []
+            for r_idx, row in enumerate(tab["values"], start=1):
+                cell_parts: list[str] = []
+                for c_idx, val in enumerate(row):
+                    ref = f"{_col_letter(c_idx)}{r_idx}"
+                    text = xml_escape(str(val))
+                    cell_parts.append(
+                        f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>'
+                    )
+                row_xml_parts.append(f'    <row r="{r_idx}">{"".join(cell_parts)}</row>')
+            sheet_xml = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">\n'
+                "  <sheetData>\n"
+                + "\n".join(row_xml_parts)
+                + "\n  </sheetData>\n"
+                "</worksheet>\n"
+            )
+            zf.writestr(f"xl/worksheets/sheet{i}.xml", sheet_xml)
 
 
 def _a1_quote(title: str) -> str:
@@ -130,24 +264,90 @@ def verify(service: Any, sheet_id: str, tabs: list[dict[str, Any]]) -> None:
             raise SystemExit(f"read-back mismatch in tab {tab['title']!r}")
 
 
+def build_sheets_credentials(
+    service_account: str = "",
+    impersonate_user: str = "",
+) -> Any:
+    """Build Sheets API credentials.
+
+    When `service_account` is given, uses standard `cloud-platform` ADC (from plain
+    `gcloud auth application-default login`, avoiding Google's OAuth block on `--scopes=spreadsheets`)
+    to impersonate `service_account` via IAM Credentials API. If `impersonate_user` is also set,
+    attempts Domain-Wide Delegation (`subject=impersonate_user`) first and falls back to direct
+    service-account impersonation if DWD is not yet active.
+    """
+    import google.auth
+    from google.auth import impersonated_credentials
+    from google.auth.transport.requests import Request
+
+    if not service_account:
+        creds, _ = google.auth.default(scopes=[_SHEETS_SCOPE])
+        return creds
+
+    source_creds, _ = google.auth.default(scopes=[_CLOUD_PLATFORM_SCOPE])
+    if impersonate_user:
+        dwd_creds = impersonated_credentials.Credentials(
+            source_credentials=source_creds,
+            target_principal=service_account,
+            target_scopes=[_SHEETS_SCOPE],
+            subject=impersonate_user,
+            lifetime=3600,
+        )
+        try:
+            dwd_creds.refresh(Request())
+            return dwd_creds
+        except Exception as exc:
+            print(
+                f"note: DWD refresh as {impersonate_user} not ready ({exc}); "
+                f"falling back to direct service account {service_account} (share the Sheet with {service_account} as Editor).",
+                file=sys.stderr,
+            )
+
+    sa_creds = impersonated_credentials.Credentials(
+        source_credentials=source_creds,
+        target_principal=service_account,
+        target_scopes=[_SHEETS_SCOPE],
+        lifetime=3600,
+    )
+    sa_creds.refresh(Request())
+    return sa_creds
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--sheet-id", required=True, help="Target Google Sheet ID or URL (create it in the browser first)")
+    parser.add_argument("--sheet-id", default="", help="Target Google Sheet ID or URL (create it in the browser first)")
     parser.add_argument("--snapshot", type=Path, default=DEFAULT_SNAPSHOT, help=f"default: {DEFAULT_SNAPSHOT}")
+    parser.add_argument("--export-xlsx", type=Path, default=None, help="Export snapshot to a multi-tab .xlsx file for browser File -> Import (no OAuth needed)")
+    parser.add_argument("--tfvars", type=Path, default=None, help="Optional <env>.tfvars to auto-derive worker service account and workspace_impersonate_user")
+    parser.add_argument("--service-account", default="", help="Worker service account email to impersonate via IAM Credentials API (uses plain cloud-platform ADC)")
+    parser.add_argument("--impersonate-user", default="", help="Optional Workspace bot email for DWD subject")
     parser.add_argument("--overwrite", action="store_true", help="Clear and rewrite tabs whose titles already exist")
     parser.add_argument("--dry-run", action="store_true", help="Validate the snapshot only; do not call the API")
     args = parser.parse_args(argv)
 
     tabs = load_snapshot(args.snapshot)
-    sheet_id = extract_sheet_id(args.sheet_id)
     print(f"snapshot OK: {[(t['title'], len(t['values']) - 1) for t in tabs]} (rows excl. header)")
+
+    if args.export_xlsx is not None:
+        export_xlsx(tabs, args.export_xlsx)
+        print(f"exported xlsx: {args.export_xlsx}")
+        if not args.sheet_id:
+            return 0
+
     if args.dry_run:
+        if args.sheet_id:
+            extract_sheet_id(args.sheet_id)
         return 0
 
-    import google.auth
+    if not args.sheet_id:
+        parser.error("either --sheet-id or --export-xlsx (or --dry-run) is required")
+
+    sheet_id = extract_sheet_id(args.sheet_id)
+    sa_email, bot_user = resolve_impersonation_targets(args.tfvars, args.service_account, args.impersonate_user)
+
     from googleapiclient.discovery import build
 
-    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    creds = build_sheets_credentials(service_account=sa_email, impersonate_user=bot_user)
     service = build("sheets", "v4", credentials=creds, cache_discovery=False)
     write_tabs(service, sheet_id, tabs, args.overwrite)
     verify(service, sheet_id, tabs)

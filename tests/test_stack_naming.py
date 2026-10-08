@@ -445,3 +445,81 @@ def test_unbound_namesake_is_claimed(monkeypatch):
     fake = _FakeDiscoveryEngine({"stack-a-ge": [unbound, prod_agent]}, {PROD_RE: OTHER_SA})
     _bind(fake, monkeypatch, service_account=OWN_SA)
     assert _patched_agents(fake) == ["unbound"]
+
+
+def test_init_sop_sheet_xlsx_export_and_sa_impersonation(tmp_path, monkeypatch):
+    import xml.etree.ElementTree as ET
+    import zipfile
+    from unittest import mock
+
+    spec = importlib.util.spec_from_file_location(
+        "init_sop_sheet_test", ROOT / "scripts" / "init_sop_sheet.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    tabs = mod.load_snapshot(mod.DEFAULT_SNAPSHOT)
+    xlsx_path = tmp_path / "out.xlsx"
+    rc = mod.main(["--export-xlsx", str(xlsx_path)])
+    assert rc == 0 and xlsx_path.is_file()
+
+    ns = {
+        "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    }
+    with zipfile.ZipFile(xlsx_path, "r") as zf:
+        wb = ET.fromstring(zf.read("xl/workbook.xml"))
+        sheet_names = [el.attrib["name"] for el in wb.findall("main:sheets/main:sheet", ns)]
+        assert sheet_names == [t["title"] for t in tabs]
+        for idx, tab in enumerate(tabs, start=1):
+            ws = ET.fromstring(zf.read(f"xl/worksheets/sheet{idx}.xml"))
+            parsed_rows = []
+            for row_el in ws.findall("main:sheetData/main:row", ns):
+                cells = []
+                for c_el in row_el.findall("main:c", ns):
+                    assert c_el.attrib.get("t") == "inlineStr"
+                    t_el = c_el.find("main:is/main:t", ns)
+                    cells.append(t_el.text or "" if t_el is not None else "")
+                parsed_rows.append(cells)
+            assert parsed_rows == [[str(c) for c in r] for r in tab["values"]]
+
+    tfv = tmp_path / "demo.tfvars"
+    tfv.write_text(
+        'project_id = "my-proj"\n'
+        'name_prefix = "cctv-demo"\n'
+        'workspace_impersonate_user = "bot@example.com"\n',
+        encoding="utf-8",
+    )
+    sa, bot = mod.resolve_impersonation_targets(tfv, "", "")
+    assert sa == "cctv-demo-worker@my-proj.iam.gserviceaccount.com"
+    assert bot == "bot@example.com"
+
+    # When DWD refresh fails (e.g., before Step 6 DWD is configured), falls back to direct SA impersonation
+    # using plain cloud-platform ADC (never requesting spreadsheets scope on the user's gcloud client ID).
+    adc_scopes_requested = []
+    imp_calls = []
+
+    class _FakeImpCreds:
+        def __init__(self, *, source_credentials, target_principal, target_scopes, subject=None, lifetime=3600):
+            imp_calls.append((target_principal, tuple(target_scopes), subject))
+            self.subject = subject
+
+        def refresh(self, _req):
+            if self.subject:
+                raise RuntimeError("unauthorized_client: DWD not yet active")
+
+    def _fake_adc(scopes=None):
+        adc_scopes_requested.append(tuple(scopes or ()))
+        return (mock.MagicMock(), "my-proj")
+
+    with (
+        mock.patch("google.auth.default", side_effect=_fake_adc),
+        mock.patch("google.auth.impersonated_credentials.Credentials", _FakeImpCreds),
+    ):
+        creds = mod.build_sheets_credentials(service_account=sa, impersonate_user=bot)
+        assert creds.subject is None
+        assert adc_scopes_requested == [("https://www.googleapis.com/auth/cloud-platform",)]
+        assert len(imp_calls) == 2
+        assert imp_calls[0] == (sa, ("https://www.googleapis.com/auth/spreadsheets",), "bot@example.com")
+        assert imp_calls[1] == (sa, ("https://www.googleapis.com/auth/spreadsheets",), None)
