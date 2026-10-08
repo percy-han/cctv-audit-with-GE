@@ -184,6 +184,9 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 
 1. **销毁主环境资源**：
    ```bash
+   # 若在 Cloud Shell 中执行，先禁用不通的 IPv6 以免 Terraform 报 dial tcp [2600:...]:443 cannot assign requested address
+   sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 2>/dev/null || true
+
    terraform init -reconfigure -backend-config=<env>.gcs.tfbackend
    terraform destroy -var-file=<env>.tfvars
    ```
