@@ -28,6 +28,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
@@ -567,6 +568,294 @@ def _bind_from_args(args: argparse.Namespace, reasoning_engine_name: str) -> dic
     )
 
 
+def _resolve_gcp_location(
+    *,
+    gcp_location: str,
+    image_uri: str,
+    own_engines: list[dict[str, Any]],
+    staging_bucket: str,
+    project_id: str,
+) -> str:
+    if gcp_location:
+        return gcp_location
+    for eng in own_engines:
+        for item in eng.get("spec", {}).get("deploymentSpec", {}).get("env", []):
+            if item.get("name") == "GCP_LOCATION" and item.get("value"):
+                return str(item["value"])
+    if "-docker.pkg.dev/" in image_uri:
+        candidate = image_uri.split("-docker.pkg.dev/", 1)[0].rsplit("/", 1)[-1]
+        if candidate and candidate != "placeholder":
+            return candidate
+    if staging_bucket:
+        meta = _call(
+            "GET",
+            f"https://storage.googleapis.com/storage/v1/b/{urllib.parse.quote(staging_bucket, safe='')}",
+            project_id=project_id,
+            ignore_errors=True,
+        )
+        loc = str(meta.get("location", "")).strip().lower()
+        if loc:
+            return loc
+    return ""
+
+
+def _bucket_owned_by_stack(
+    *,
+    bucket: str,
+    project_id: str,
+    name_prefix: str,
+    service_account: str,
+) -> bool:
+    if not bucket or bucket.endswith("-tfstate"):
+        return False
+    if name_prefix and bucket == f"{project_id}-{name_prefix}-staging":
+        return True
+    iam = _call(
+        "GET",
+        f"https://storage.googleapis.com/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/iam",
+        project_id=project_id,
+        ignore_errors=True,
+    )
+    if iam.get("_http_error"):
+        return False
+    wanted_member = f"serviceAccount:{service_account}"
+    for binding in iam.get("bindings", []):
+        if wanted_member in binding.get("members", []):
+            return True
+    return False
+
+
+def empty_gcs_bucket(bucket: str, *, project_id: str) -> int:
+    """Deletes all object versions in `bucket` so `google_storage_bucket` destroy succeeds."""
+    deleted = 0
+    q_bucket = urllib.parse.quote(bucket, safe="")
+    page_token = ""
+    while True:
+        url = f"https://storage.googleapis.com/storage/v1/b/{q_bucket}/o?versions=true"
+        if page_token:
+            url += f"&pageToken={urllib.parse.quote(page_token, safe='')}"
+        listing = _call("GET", url, project_id=project_id, ignore_errors=True)
+        if listing.get("_http_error"):
+            break
+        items = listing.get("items", [])
+        for item in items:
+            obj_name = item.get("name", "")
+            if not obj_name:
+                continue
+            q_obj = urllib.parse.quote(obj_name, safe="")
+            del_url = f"https://storage.googleapis.com/storage/v1/b/{q_bucket}/o/{q_obj}"
+            gen = item.get("generation")
+            if gen:
+                del_url += f"?generation={urllib.parse.quote(str(gen), safe='')}"
+            res = _call("DELETE", del_url, project_id=project_id, ignore_errors=True)
+            if not res.get("_http_error"):
+                deleted += 1
+        page_token = str(listing.get("nextPageToken", "")).strip()
+        if not page_token or not items:
+            break
+    return deleted
+
+
+def destroy_stack(
+    *,
+    project_id: str,
+    location: str,
+    service_account: str,
+    ge_engine_id: str,
+    staging_bucket: str = "",
+    gcp_location: str = "",
+    image_uri: str = "",
+) -> dict[str, Any]:
+    """Tears down the non-Terraform-native resources owned by this stack (`service_account`) during
+    `terraform destroy`:
+      1. Deletes this stack's ADK agent(s) in `ge_engine_id`, and if no foreign stack's agents live in
+         `ge_engine_id`, deletes the GE Engine `ge_engine_id` and DataStore `<ge_engine_id>-store`.
+      2. Deletes every ReasoningEngine in `location` whose `spec.serviceAccount == service_account`.
+      3. Empties `staging_bucket` (after verifying stack ownership and refusing `-tfstate` buckets).
+      4. Deletes the stack's Cloud Run v2 worker service (`<name_prefix>-worker`) if it runs as
+         `service_account`.
+    """
+    if not service_account or "@" not in service_account:
+        raise ValueError(
+            "service_account (<name_prefix>-worker@<project>.iam.gserviceaccount.com) is required "
+            "for destroy-stack so another stack's resources are never touched"
+        )
+    worker_account_id = service_account.split("@", 1)[0]
+    name_prefix = (
+        worker_account_id[: -len("-worker")]
+        if worker_account_id.endswith("-worker")
+        else worker_account_id
+    )
+
+    host = (
+        "aiplatform.googleapis.com"
+        if location == "global"
+        else f"{location}-aiplatform.googleapis.com"
+    )
+    re_base = f"https://{host}/v1/projects/{project_id}/locations/{location}/reasoningEngines"
+    re_list = _call("GET", re_base, project_id=project_id, ignore_errors=True).get("reasoningEngines", [])
+    own_engines = [
+        eng for eng in re_list if eng.get("spec", {}).get("serviceAccount") == service_account
+    ]
+    own_engine_names = {eng["name"] for eng in own_engines if eng.get("name")}
+
+    summary: dict[str, Any] = {
+        "deleted_agents": [],
+        "deleted_ge_engine": False,
+        "deleted_ge_datastore": False,
+        "deleted_reasoning_engines": [],
+        "deleted_bucket_objects": 0,
+        "deleted_cloud_run_service": "",
+    }
+
+    # 1. Gemini Enterprise agent(s) + Engine + DataStore
+    if ge_engine_id:
+        de_base = (
+            f"https://discoveryengine.googleapis.com/v1alpha/projects/{project_id}"
+            "/locations/global/collections/default_collection"
+        )
+        engine_cache: dict[str, dict[str, Any]] = {
+            eng["name"]: eng for eng in re_list if eng.get("name")
+        }
+
+        def _get_engine(name: str) -> dict[str, Any]:
+            if name not in engine_cache:
+                engine_cache[name] = _call(
+                    "GET", reasoning_engine_url(name), project_id=project_id, ignore_errors=True
+                )
+            return engine_cache[name]
+
+        agents_url = f"{de_base}/engines/{ge_engine_id}/assistants/default_assistant/agents"
+        listed = _call("GET", agents_url, project_id=project_id, ignore_errors=True)
+        stack_agents: list[dict[str, Any]] = []
+        foreign_agents: list[dict[str, Any]] = []
+        if not listed.get("_http_error"):
+            for ag in listed.get("agents", []):
+                defn = ag.get("adkAgentDefinition")
+                if defn is None:
+                    continue
+                bound_to = defn.get("provisionedReasoningEngine", {}).get("reasoningEngine", "")
+                if bound_to in own_engine_names:
+                    stack_agents.append(ag)
+                    continue
+                if not bound_to:
+                    stack_agents.append(ag)
+                    continue
+                eng_obj = _get_engine(bound_to)
+                code = eng_obj.get("_http_error")
+                if code == 404:
+                    stack_agents.append(ag)
+                elif not code and eng_obj.get("spec", {}).get("serviceAccount") == service_account:
+                    stack_agents.append(ag)
+                else:
+                    foreign_agents.append(ag)
+
+            for ag in stack_agents:
+                ag_name = ag.get("name", "")
+                if not ag_name:
+                    continue
+                print(f"🧹 Deleting ADK Agent `{ag_name}` from GE Engine `{ge_engine_id}`...")
+                res = _call(
+                    "DELETE",
+                    f"https://discoveryengine.googleapis.com/v1alpha/{ag_name}",
+                    project_id=project_id,
+                    ignore_errors=True,
+                )
+                if not res.get("_http_error"):
+                    summary["deleted_agents"].append(ag_name)
+
+        if foreign_agents:
+            print(
+                f"⛔ Keeping GE Engine `{ge_engine_id}` and DataStore `{ge_engine_id}-store`: "
+                f"{len(foreign_agents)} agent(s) belong to another stack.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"🧹 Deleting Gemini Enterprise Engine `{ge_engine_id}`...")
+            eng_del = _call(
+                "DELETE",
+                f"{de_base}/engines/{ge_engine_id}",
+                project_id=project_id,
+                ignore_errors=True,
+            )
+            if not eng_del.get("_http_error") or eng_del.get("_http_error") == 404:
+                summary["deleted_ge_engine"] = True
+            ds_id = f"{ge_engine_id}-store"
+            print(f"🧹 Deleting Discovery Engine DataStore `{ds_id}`...")
+            ds_del = _call(
+                "DELETE",
+                f"{de_base}/dataStores/{ds_id}",
+                project_id=project_id,
+                ignore_errors=True,
+            )
+            if not ds_del.get("_http_error") or ds_del.get("_http_error") == 404:
+                summary["deleted_ge_datastore"] = True
+
+    # 2. Vertex AI ReasoningEngine(s) running as `service_account`
+    for eng in own_engines:
+        re_name = eng.get("name", "")
+        if not re_name:
+            continue
+        print(f"🧹 Deleting ReasoningEngine `{re_name}` (force=true)...")
+        res = _call(
+            "DELETE",
+            f"https://{host}/v1/{re_name}?force=true",
+            project_id=project_id,
+            ignore_errors=True,
+        )
+        if not res.get("_http_error"):
+            summary["deleted_reasoning_engines"].append(re_name)
+
+    # 3. Staging bucket contents (so Terraform can delete the bucket even if force_destroy was false in state)
+    resolved_region = _resolve_gcp_location(
+        gcp_location=gcp_location,
+        image_uri=image_uri,
+        own_engines=own_engines,
+        staging_bucket=staging_bucket,
+        project_id=project_id,
+    )
+    if staging_bucket:
+        if _bucket_owned_by_stack(
+            bucket=staging_bucket,
+            project_id=project_id,
+            name_prefix=name_prefix,
+            service_account=service_account,
+        ):
+            print(f"🧹 Emptying staging bucket `gs://{staging_bucket}`...")
+            summary["deleted_bucket_objects"] = empty_gcs_bucket(
+                staging_bucket, project_id=project_id
+            )
+        else:
+            print(
+                f"⛔ Refusing to empty bucket `{staging_bucket}`: ownership by `{service_account}` "
+                "could not be verified.",
+                file=sys.stderr,
+            )
+
+    # 4. Cloud Run v2 worker service (only if its template.serviceAccount matches `service_account`)
+    if resolved_region and worker_account_id:
+        cr_url = (
+            f"https://run.googleapis.com/v2/projects/{project_id}"
+            f"/locations/{resolved_region}/services/{worker_account_id}"
+        )
+        svc = _call("GET", cr_url, project_id=project_id, ignore_errors=True)
+        if not svc.get("_http_error"):
+            svc_sa = svc.get("template", {}).get("serviceAccount", "")
+            if svc_sa == service_account:
+                print(f"🧹 Deleting Cloud Run service `{worker_account_id}` ({resolved_region})...")
+                del_res = _call("DELETE", cr_url, project_id=project_id, ignore_errors=True)
+                if not del_res.get("_http_error"):
+                    summary["deleted_cloud_run_service"] = worker_account_id
+            else:
+                print(
+                    f"⛔ Refusing to delete Cloud Run service `{worker_account_id}`: runs as "
+                    f"`{svc_sa}`, not `{service_account}`.",
+                    file=sys.stderr,
+                )
+
+    return summary
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Deploy Chagee CCTV Audit BYOC container to Vertex AI ReasoningEngine & bind to Gemini Enterprise."
@@ -652,6 +941,20 @@ def main(argv: list[str] | None = None) -> int:
     p_del = sub.add_parser("delete", help="Delete a ReasoningEngine by ID or full resource name")
     p_del.add_argument("engine_id", help="ReasoningEngine numeric ID or full resource name")
 
+    p_destroy = sub.add_parser(
+        "destroy-stack",
+        help="Tear down this stack's GE agent/app/datastore, ReasoningEngine, staging bucket objects, and Cloud Run service",
+    )
+    p_destroy.add_argument("--ge-engine-id", required=True, help="This stack's Gemini Enterprise app ID")
+    p_destroy.add_argument("--staging-bucket", default="", help="This stack's GCS staging bucket name")
+    p_destroy.add_argument(
+        "--service-account",
+        required=True,
+        help="This stack's worker service account email (mandatory ownership guard)",
+    )
+    p_destroy.add_argument("--gcp-location", default="", help="Optional stack region override")
+    p_destroy.add_argument("--image-uri", default="", help="Optional container image URI to infer region")
+
     args = parser.parse_args(argv)
     host = (
         "aiplatform.googleapis.com"
@@ -661,6 +964,11 @@ def main(argv: list[str] | None = None) -> int:
     base = f"https://{host}/v1/projects/{args.project_id}/locations/{args.location}/reasoningEngines"
 
     if args.cmd == "create":
+        if args.image_uri.startswith("placeholder-docker.pkg.dev/"):
+            raise SystemExit(
+                "container_image was not provided (still at the destroy-time placeholder default). "
+                "Deploy via cloudbuild.yaml or pass -var=container_image=<digest-pinned image URI>."
+            )
         body = build_reasoning_engine_body(
             project_id=args.project_id,
             location=args.location,
@@ -718,8 +1026,20 @@ def main(argv: list[str] | None = None) -> int:
             else f"projects/{args.project_id}/locations/{args.location}/reasoningEngines/{args.engine_id}"
         )
         print(json.dumps(_call("DELETE", f"https://{host}/v1/{target}", project_id=args.project_id), indent=2))
+    elif args.cmd == "destroy-stack":
+        res = destroy_stack(
+            project_id=args.project_id,
+            location=args.location,
+            service_account=args.service_account,
+            ge_engine_id=args.ge_engine_id,
+            staging_bucket=args.staging_bucket,
+            gcp_location=args.gcp_location,
+            image_uri=args.image_uri,
+        )
+        print(json.dumps(res, indent=2))
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
+

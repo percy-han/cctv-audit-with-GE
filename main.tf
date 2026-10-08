@@ -56,7 +56,7 @@ variable "vertex_model_location" {
 }
 
 # ---- Name overrides. Empty = derived from name_prefix. Only for adopting names that existed before
-# ---- name_prefix did (e.g. a pre-existing production environment); new stacks leave them empty.
+# ---- name_prefix did (see study-project-496907.tfvars); new stacks leave them empty.
 
 variable "artifact_repository_id" {
   description = "Image repository ID (created by bootstrap/; must equal its artifact_repository_id). Empty = <name_prefix>-images."
@@ -94,8 +94,11 @@ variable "container_image" {
     <region>-docker.pkg.dev/<project>/<repo>/<image>@sha256:<64 hex>.
     Supplied by the deploy pipeline (cloudbuild.yaml), which builds the image for the exact source
     tree being deployed and passes the digest Artifact Registry returned. Deliberately not in tfvars.
+    The placeholder default only allows `terraform destroy -var-file=<env>.tfvars` to run without
+    passing `-var container_image=...`; `deploy_reasoning_engine.py create` refuses the placeholder.
   EOT
-  type        = string
+  type    = string
+  default = "placeholder-docker.pkg.dev/project/repo/image@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
   # A mutable tag (`:latest`) keeps this string identical after a new push, so Terraform sees
   # "no changes" and new code silently never reaches Cloud Run or the ReasoningEngine.
@@ -321,7 +324,7 @@ resource "google_storage_bucket" "staging_bucket" {
   name                        = local.staging_bucket_name
   location                    = var.region
   uniform_bucket_level_access = true
-  force_destroy               = false
+  force_destroy               = true
 
   lifecycle_rule {
     condition {
@@ -393,10 +396,11 @@ resource "google_artifact_registry_repository_iam_member" "worker_image_puller" 
 # Scales from 0 to 20 instances (strictly 1 active job per container via `max_instance_request_concurrency = 1`
 # + `hold_connection = true`, up to 20 x 5 = 100 concurrent video slice streams across the audit team).
 resource "google_cloud_run_v2_service" "cctv_audit_worker" {
-  count    = var.enable_standalone_cloud_run ? 1 : 0
-  name     = local.worker_service_name
-  location = var.region
-  ingress  = "INGRESS_TRAFFIC_ALL"
+  count               = var.enable_standalone_cloud_run ? 1 : 0
+  name                = local.worker_service_name
+  location            = var.region
+  ingress             = "INGRESS_TRAFFIC_ALL"
+  deletion_protection = false
 
   template {
     service_account                  = data.google_service_account.audit_worker_sa.email
@@ -541,6 +545,20 @@ resource "terraform_data" "vertex_reasoning_engine" {
         --ge-company-name "${var.ge_company_name}" \
         --ge-tenant-label "${var.ge_tenant_label}" \
         --ge-example-folder-url "${var.ge_example_folder_url}"
+    EOT
+  }
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = <<-EOT
+      python3 ${path.module}/deploy/deploy_reasoning_engine.py \
+        --project-id "${self.triggers_replace[0]}" \
+        --location "${self.triggers_replace[1]}" \
+        destroy-stack \
+        --image-uri "${self.triggers_replace[2]}" \
+        --ge-engine-id "${self.triggers_replace[4]}" \
+        --staging-bucket "${self.triggers_replace[5]}" \
+        --service-account "${self.triggers_replace[6]}"
     EOT
   }
 

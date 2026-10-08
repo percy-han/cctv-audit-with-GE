@@ -315,7 +315,7 @@ def test_no_project_tenant_or_region_literal_in_stack_code(path):
     if path == "cloudbuild.yaml":
         # Only the substitution defaults (first environment) may carry its names.
         code = code.split("substitutions:")[0] + code.split("options:")[1]
-    for literal in ("chagee-cctv", "cctv-staging",
+    for literal in ("study-project-496907", "596821501265", "percyhan", "chagee-cctv", "cctv-staging",
                     "asia-southeast1", "us-central1", "Asia/Singapore", '"cctv-audit"', "CHAGEE"):
         assert literal not in code, f"{path} still hard-codes {literal!r}"
 
@@ -361,6 +361,20 @@ def test_bootstrap_passes_every_stack_substitution_to_cloud_build():
         assert key in block
     assert "merge(local.build_substitutions" in boot
     assert "--substitutions=${join(" in boot
+
+
+@pytest.mark.parametrize("path", ["study-project-496907.tfvars", "bootstrap/study-project-496907.tfvars"])
+def test_first_environment_pins_its_legacy_names(path):
+    text = _tf(path)
+    assert 'name_prefix' in text and '"chagee-cctv-audit"' in text
+    assert 'artifact_repository_id = "cctv-audit"' in text
+    if path.startswith("bootstrap"):
+        assert 'deployer_account_id    = "chagee-cctv-deployer"' in text
+        assert 'display_label          = "Chagee CCTV"' in text
+    else:
+        assert 'staging_bucket_name    = "study-project-496907-cctv-staging-sg"' in text
+        assert 'ge_engine_id           = "chagee-cctv-enterprise"' in text
+        assert 'extra_ge_engine_ids = ["cctv-audit"]' in text
 
 
 @pytest.mark.parametrize("prefix,ok", [
@@ -523,3 +537,128 @@ def test_init_sop_sheet_xlsx_export_and_sa_impersonation(tmp_path, monkeypatch):
         assert len(imp_calls) == 2
         assert imp_calls[0] == (sa, ("https://www.googleapis.com/auth/spreadsheets",), "bot@example.com")
         assert imp_calls[1] == (sa, ("https://www.googleapis.com/auth/spreadsheets",), None)
+
+
+# --------------------------------------------------------------------------- Round 63: native terraform destroy
+
+
+def test_destroy_stack_deletes_only_this_stacks_resources_and_preserves_foreign_stacks(monkeypatch):
+    calls: list[tuple[str, str]] = []
+    re_list = {
+        "reasoningEngines": [
+            _engine("1", "stack-b-agent", OTHER_SA),
+            {
+                **_engine("2", "stack-a-agent", OWN_SA),
+                "spec": {
+                    "serviceAccount": OWN_SA,
+                    "deploymentSpec": {"env": [{"name": "GCP_LOCATION", "value": "asia-southeast1"}]},
+                },
+            },
+        ]
+    }
+    agents_list = {
+        "agents": [
+            _adk_agent("a1", "stack-a-ge", "Stack A agent", f"{RE_BASE}/2"),
+            {"name": "built_in", "displayName": "Deep Research"},
+        ]
+    }
+
+    def fake_call(method, url, body=None, project_id="", ignore_errors=False):
+        calls.append((method, url))
+        if method == "GET" and url.endswith("/reasoningEngines"):
+            return re_list
+        if method == "GET" and url.endswith("/agents"):
+            return agents_list
+        if method == "GET" and "/storage/v1/b/my-project-stack-a-staging/o?" in url:
+            return {
+                "items": [
+                    {"name": "jobs/u1/j1.json", "generation": "111"},
+                    {"name": "jobs/media/j1/seg_0.mp4", "generation": "222"},
+                ]
+            }
+        if method == "GET" and url.endswith("/services/stack-a-worker"):
+            return {"name": url, "template": {"serviceAccount": OWN_SA}}
+        return {}
+
+    monkeypatch.setattr(deploy, "_call", fake_call)
+    rc = deploy.main(
+        [
+            "--project-id", "my-project",
+            "--location", "us-central1",
+            "destroy-stack",
+            "--ge-engine-id", "stack-a-ge",
+            "--staging-bucket", "my-project-stack-a-staging",
+            "--service-account", OWN_SA,
+        ]
+    )
+    assert rc == 0
+    deleted_urls = [u for m, u in calls if m == "DELETE"]
+    # Stack A's GE agent, GE Engine, and DataStore are deleted
+    assert any(u.endswith("/agents/a1") for u in deleted_urls)
+    assert any(u.endswith("/engines/stack-a-ge") for u in deleted_urls)
+    assert any(u.endswith("/dataStores/stack-a-ge-store") for u in deleted_urls)
+    # Stack A's ReasoningEngine is force-deleted; Stack B's ReasoningEngine is untouched
+    assert any(u.endswith(f"{RE_BASE}/2?force=true") for u in deleted_urls)
+    assert not any(f"{RE_BASE}/1" in u for _, u in calls)
+    # Staging bucket objects are deleted
+    assert any("/o/jobs%2Fu1%2Fj1.json?generation=111" in u for u in deleted_urls)
+    assert any("/o/jobs%2Fmedia%2Fj1%2Fseg_0.mp4?generation=222" in u for u in deleted_urls)
+    # Stack A's Cloud Run service is deleted
+    assert any(u.endswith("/locations/asia-southeast1/services/stack-a-worker") for u in deleted_urls)
+
+
+def test_destroy_stack_refuses_foreign_ge_engine_foreign_cloud_run_and_tfstate_bucket(monkeypatch):
+    calls: list[tuple[str, str]] = []
+
+    def fake_call(method, url, body=None, project_id="", ignore_errors=False):
+        calls.append((method, url))
+        if method == "GET" and url.endswith("/reasoningEngines"):
+            return {"reasoningEngines": [_engine("1", "stack-b-agent", OTHER_SA)]}
+        if method == "GET" and url.endswith("/agents"):
+            return {"agents": [_adk_agent("b1", "shared-ge", "Stack B agent", f"{RE_BASE}/1")]}
+        if method == "GET" and url.endswith("/services/stack-a-worker"):
+            return {"name": url, "template": {"serviceAccount": OTHER_SA}}
+        return {}
+
+    monkeypatch.setattr(deploy, "_call", fake_call)
+    summary = deploy.destroy_stack(
+        project_id="my-project",
+        location="us-central1",
+        service_account=OWN_SA,
+        ge_engine_id="shared-ge",
+        staging_bucket="my-project-tfstate",
+        image_uri="asia-southeast1-docker.pkg.dev/my-project/stack-a-images/w@sha256:" + "0" * 64,
+    )
+    deleted_urls = [u for m, u in calls if m == "DELETE"]
+    assert deleted_urls == []
+    assert summary["deleted_ge_engine"] is False
+    assert summary["deleted_bucket_objects"] == 0
+    assert summary["deleted_cloud_run_service"] == ""
+
+
+def test_create_rejects_destroy_placeholder_image_uri():
+    with pytest.raises(SystemExit, match="placeholder"):
+        deploy.main(
+            [
+                "--project-id", "my-project",
+                "--location", "us-central1",
+                "create",
+                "--image-uri",
+                "placeholder-docker.pkg.dev/project/repo/image@sha256:" + "0" * 64,
+                "--display-name", "stack-a-agent",
+                "--gcp-location", "asia-southeast1",
+                "--master-prompt-sheet-id", "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-abcd",
+                "--ge-engine-id", "stack-a-ge",
+            ]
+        )
+
+
+def test_terraform_roots_support_native_destroy_without_manual_workarounds():
+    main, boot = _tf("main.tf"), _tf("bootstrap/main.tf")
+    assert "when    = destroy" in main
+    assert "destroy-stack" in main
+    assert "deletion_protection = false" in main
+    assert "force_destroy               = true" in main
+    assert 'default = "placeholder-docker.pkg.dev/project/repo/image@sha256:' in main
+    assert "prevent_destroy" not in boot
+

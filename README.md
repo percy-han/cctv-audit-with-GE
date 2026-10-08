@@ -180,45 +180,25 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 
 ## 8. 删除环境
 
-以下命令都需要项目 Owner 凭据，按顺序执行。有三类资源带了防误删保护，直接 `terraform destroy` 会失败，要先按下面的步骤处理。
+以下命令都需要项目 Owner 凭据，在仓库根目录按顺序执行。`terraform destroy` 会通过 `terraform_data.vertex_reasoning_engine` 的销毁钩子（`deploy/deploy_reasoning_engine.py destroy-stack`）自动清理该环境专属的 Gemini Enterprise Agent / 应用 / 数据存储、Vertex AI ReasoningEngine、Staging Bucket 内的缓存对象以及 Cloud Run 服务（严格校验 `service_account` 归属，绝不触碰同项目下的其他环境）：
 
-1. **删除 GE 与 Agent Engine**（由部署脚本创建，不在 Terraform 状态里）：
+1. **销毁主环境资源**：
    ```bash
-   python3 deploy/deploy_reasoning_engine.py --project-id <项目ID> --location <reasoning_engine_location> list
-   python3 deploy/deploy_reasoning_engine.py --project-id <项目ID> --location <reasoning_engine_location> delete <ID>
-   ```
-   在控制台 Gemini Enterprise → 应用中删除 `<p>-ge`（先删其中的稽核 Agent，再删应用），再删除数据存储 `<p>-ge-store`。
-
-2. **先手动删 Cloud Run 服务**。它开启了删除保护（`deletion_protection`，Google provider 6.x 默认开启），直接 `terraform destroy` 会被拒绝：
-   ```bash
-   gcloud run services delete <p>-worker --project=<项目ID> --region=<region>
-   ```
-
-3. **清空 staging bucket**。bucket 设置了 `force_destroy = false`，非空时 Terraform 不会删它：
-   ```bash
-   gcloud storage rm -r 'gs://<项目ID>-<p>-staging/**'
-   ```
-   （bucket 名以 `terraform output staging_bucket_name` 为准。里面是任务状态和视频切片缓存；报告和证据片段在 Drive 里，不受影响。）
-
-4. **删除主体**（第 2 步删掉的 Cloud Run 会在刷新时自动从状态中移除）：
-   ```bash
-   terraform init -backend-config=<env>.gcs.tfbackend
-   terraform destroy -var-file=<env>.tfvars -var container_image=<当前镜像>
-   ```
-   `<当前镜像>` 必须是带 digest 的地址（变量有格式校验），destroy 本身不会用到它。可以在第 2 步删除 Cloud Run 之前先记下：
-   `gcloud run services describe <p>-worker --project=<项目ID> --region=<region> --format='value(spec.template.spec.containers[0].image)'`，
-   或者从镜像仓库里查一个：`gcloud artifacts docker images list <region>-docker.pkg.dev/<项目ID>/<p>-images/cctv-audit-worker --format='value(package,version)'`（拼成 `<package>@<version>`）。
-
-5. **删除初始化部分**。bootstrap 里的镜像仓库（`google_artifact_registry_repository.images`）和 Worker 服务账号（`google_service_account.worker`）设置了 `prevent_destroy = true`，防止日常 apply 误删，直接 destroy 会报 "Instance cannot be destroyed"。确认要删时，在**本地副本**里把 `bootstrap/main.tf` 中这两处改成 `prevent_destroy = false`（不要提交），然后：
-   ```bash
-   cd bootstrap
-   terraform init -backend-config=<env>.gcs.tfbackend
+   terraform init -reconfigure -backend-config=<env>.gcs.tfbackend
    terraform destroy -var-file=<env>.tfvars
    ```
+   > **注**：若该环境是在旧版本代码下创建的（当时 `google_cloud_run_v2_service` 在状态文件里默认记录了 `deletion_protection = true`），先执行一行 `terraform state rm google_cloud_run_v2_service.cctv_audit_worker` 再执行上面的 `terraform destroy -var-file=<env>.tfvars`（`destroy-stack` 钩子会自动通过 API 删除该 Cloud Run 服务）。
 
-6. 请 Workspace 管理员删除第 6 步添加的域委派条目。
+2. **销毁初始化资源（Bootstrap）**：
+   ```bash
+   cd bootstrap
+   terraform init -reconfigure -backend-config=<env>.gcs.tfbackend
+   terraform destroy -var-file=<env>.tfvars
+   cd ..
+   ```
 
-7. （可选）删除状态桶里这套环境的状态文件：`gcloud storage rm -r gs://<项目ID>-tfstate/<p>/`。
+3. （可选）删除状态桶里这套环境的状态文件：`gcloud storage rm -r gs://<项目ID>-tfstate/<p>/`，并让 Workspace 管理员移除第 6 步添加的域委派条目。
 
 API 在删除时不会被关闭（`disable_on_destroy = false`），不影响同项目里的其他服务。项目级 IAM 授权都绑定在这套环境自己的服务账号上，会随 destroy 一起删除，不影响其他环境。
+
 

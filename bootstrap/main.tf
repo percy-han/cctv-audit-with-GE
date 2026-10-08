@@ -15,7 +15,7 @@
 # (trigger below) or running output manual_deploy_command.
 #
 # Project whose image repository and worker SA were created by ../main.tf before this root existed
-# (a legacy environment only; new projects skip this). Once, with owner credentials, before the first pipeline run:
+# (study-project-496907). Once, with owner credentials, before the first pipeline run:
 #   1. here: adopt_existing = true in <project_id>.tfvars, then the three commands above. The repo
 #      and the worker SA are imported, not re-created; IAM grants that already exist are merged.
 #   2. in ..: terraform init -migrate-state -force-copy -backend-config=<project_id>.gcs.tfbackend
@@ -68,7 +68,7 @@ variable "display_label" {
 }
 
 # ---- Name overrides. Empty = derived from name_prefix. Only for adopting names that existed before
-# ---- name_prefix did (e.g. a pre-existing production environment); new stacks leave them empty.
+# ---- name_prefix did (see study-project-496907.tfvars); new stacks leave them empty.
 
 variable "artifact_repository_id" {
   description = "Image repository ID; must equal artifact_repository_id in ../<env>.tfvars. Empty = <name_prefix>-images."
@@ -135,7 +135,7 @@ variable "trigger_env" {
 variable "iac_dir" {
   description = "Path of the directory holding ../main.tf, relative to the repository root"
   type        = string
-  default     = "."
+  default     = "03_implementation/03_iac_and_code"
 }
 
 variable "trigger_require_approval" {
@@ -227,11 +227,6 @@ resource "google_artifact_registry_repository" "images" {
     immutable_tags = true
   }
 
-  # Deleting the repository deletes every image the running services pull.
-  lifecycle {
-    prevent_destroy = true
-  }
-
   depends_on = [google_project_service.pipeline]
 }
 
@@ -251,10 +246,6 @@ resource "google_service_account" "worker" {
   project      = var.project_id
   account_id   = local.worker_account_id
   display_name = "${local.display_label} AI Audit Agent Engine Worker SA"
-
-  lifecycle {
-    prevent_destroy = true
-  }
 
   depends_on = [google_project_service.pipeline]
 }
