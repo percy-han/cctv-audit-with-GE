@@ -620,39 +620,32 @@ resource "google_monitoring_dashboard" "cctv_audit_dashboard" {
     displayName = "${local.ge_brand} CCTV AI 稽核测评与运行监控大盘 [${var.name_prefix}]"
     dashboardFilters = [
       {
-        filterType  = "METRIC_LABEL"
-        labelKey    = "model_version"
-        templateKey = "model_version"
+        filterType = "METRIC_LABEL"
+        labelKey   = "model_version"
       },
       {
-        filterType  = "METRIC_LABEL"
-        labelKey    = "sop_version"
-        templateKey = "sop_version"
+        filterType = "METRIC_LABEL"
+        labelKey   = "sop_version"
       },
       {
-        filterType  = "METRIC_LABEL"
-        labelKey    = "media_mode"
-        templateKey = "media_mode"
+        filterType = "METRIC_LABEL"
+        labelKey   = "media_mode"
       },
       {
-        filterType  = "METRIC_LABEL"
-        labelKey    = "round_id"
-        templateKey = "round_id"
+        filterType = "METRIC_LABEL"
+        labelKey   = "round_id"
       },
       {
-        filterType  = "METRIC_LABEL"
-        labelKey    = "sop_category"
-        templateKey = "sop_category"
+        filterType = "METRIC_LABEL"
+        labelKey   = "sop_category"
       },
       {
-        filterType  = "METRIC_LABEL"
-        labelKey    = "outlet_focus"
-        templateKey = "outlet_focus"
+        filterType = "METRIC_LABEL"
+        labelKey   = "outlet_focus"
       },
       {
-        filterType  = "METRIC_LABEL"
-        labelKey    = "video_name"
-        templateKey = "video_name"
+        filterType = "METRIC_LABEL"
+        labelKey   = "video_name"
       },
     ]
     mosaicLayout = {
@@ -716,10 +709,8 @@ resource "google_monitoring_dashboard" "cctv_audit_dashboard" {
               ]
               thresholds = [
                 {
-                  label     = "目标召回线 (0.75)"
-                  value     = 0.75
-                  color     = "GREEN"
-                  direction = "ABOVE"
+                  label = "目标召回线 (0.75)"
+                  value = 0.75
                 },
               ]
               yAxis = {
@@ -833,10 +824,8 @@ resource "google_monitoring_dashboard" "cctv_audit_dashboard" {
               ]
               thresholds = [
                 {
-                  label     = "告警噪音红线 (8.0 条/视频)"
-                  value     = 8.0
-                  color     = "RED"
-                  direction = "ABOVE"
+                  label = "告警噪音红线 (8.0 条/视频)"
+                  value = 8.0
                 },
               ]
               yAxis = {
@@ -888,10 +877,8 @@ resource "google_monitoring_dashboard" "cctv_audit_dashboard" {
               ]
               thresholds = [
                 {
-                  label     = "瞬时动作容差上限 (20s)"
-                  value     = 20.0
-                  color     = "YELLOW"
-                  direction = "ABOVE"
+                  label = "瞬时动作容差上限 (20s)"
+                  value = 20.0
                 },
               ]
               yAxis = {
@@ -1026,10 +1013,8 @@ resource "google_monitoring_dashboard" "cctv_audit_dashboard" {
               ]
               thresholds = [
                 {
-                  label     = "单视频告警上限 (8.0)"
-                  value     = 8.0
-                  color     = "RED"
-                  direction = "ABOVE"
+                  label = "单视频告警上限 (8.0)"
+                  value = 8.0
                 },
               ]
               yAxis = {
