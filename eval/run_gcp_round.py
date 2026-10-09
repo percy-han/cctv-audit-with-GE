@@ -64,6 +64,12 @@ from cctv_audit.video_ingestor import (  # noqa: E402
     VideoMetadataItem,
     VideoSliceSegment,
 )
+from eval.monitoring_publisher import (  # noqa: E402
+    append_eval_history_jsonl,
+    build_cloud_monitoring_timeseries,
+    build_eval_monitoring_record,
+    publish_eval_timeseries,
+)
 from eval.score_run import render_markdown, score_run  # noqa: E402
 from eval.tune_loop import (  # noqa: E402
     DEFAULT_GOLDEN_PATH,
@@ -588,6 +594,34 @@ async def run_round_async(args: argparse.Namespace) -> int:
         score_md=score_md,
     )
 
+    updated_manifest = json.loads((round_dir / "manifest.json").read_text(encoding="utf-8"))
+    mon_record = build_eval_monitoring_record(
+        project_id=cfg.gcp_project,
+        round_id=args.round,
+        run_id=run_id,
+        model_version=str(prompt_cfg.active_model_version),
+        sop_version=str(prompt_cfg.active_prompt_version),
+        media_mode=str(cfg.video_media_processing),
+        score_doc=score_doc,
+        job_docs=job_docs,
+        round_manifest=updated_manifest,
+    )
+    (res_dir / "monitoring_record.json").write_text(
+        json.dumps(mon_record, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    append_eval_history_jsonl(mon_record, args.rounds_dir / "eval_history.jsonl")
+
+    if not getattr(args, "skip_monitoring_publish", False) and not args.skip_gcs_sync:
+        try:
+            ts_payload = build_cloud_monitoring_timeseries(mon_record)
+            await asyncio.to_thread(
+                publish_eval_timeseries,
+                cfg.gcp_project,
+                ts_payload,
+            )
+        except Exception as exc:
+            logger.warning("Cloud Monitoring publish warning (non-fatal for eval run): %s", exc)
+
     if not args.skip_gcs_sync:
         gcs_prefix = f"eval/rounds/{args.round}"
         await asyncio.to_thread(
@@ -615,7 +649,7 @@ async def run_round_async(args: argparse.Namespace) -> int:
 
         st_client = storage.Client(project=cfg.gcp_project)
         bucket = st_client.bucket(cfg.staging_bucket)
-        for fname in ("ledger.json", "ledger.md"):
+        for fname in ("ledger.json", "ledger.md", "eval_history.jsonl"):
             fpath = args.rounds_dir / fname
             if fpath.exists():
                 bucket.blob(f"eval/rounds/{fname}").upload_from_filename(str(fpath))
@@ -640,6 +674,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--folder-concurrency", type=int, default=2, help="Max concurrent folders (default: 2)")
     parser.add_argument("--sync-sop-tab", action="store_true", help="Archive Prompt_v2.6_rNN tab to Master SOP Sheet")
     parser.add_argument("--skip-gcs-sync", action="store_true", help="Skip uploading round results to GCS")
+    parser.add_argument("--skip-monitoring-publish", action="store_true",
+                        help="Skip publishing custom evaluation metrics to Cloud Monitoring API")
     parser.add_argument("--ckpt-local-dir", type=Path, default=None,
                         help="Keep per-clip checkpoints in this local dir instead of GCS (tests/local runs)")
     args = parser.parse_args(argv)

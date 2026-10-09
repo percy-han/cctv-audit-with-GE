@@ -242,15 +242,26 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 
 `eval/tests` 中依赖私有评测数据的用例在没有数据时会自动跳过。
 
-## 8. Prompt 调优工具（eval/）
+## 8. 模型与 SOP 评测体系及 Cloud Monitoring 监控大盘（eval/）
 
-用人工稽核结果做"标准答案"，评估新规则/新 Prompt 的召回率：
+用人工稽核结果做"黄金基准集（Golden Dataset）"，评估不同模型版本（`model_version`）和不同 SOP 提示词版本（`sop_version`）的召回率、误报密度、定位误差与推理成本，并自动将每次评测结果推送到 **GCP Cloud Monitoring 监控大盘**（原生保留 **24 个月 / 2 年**，同时全量归档至 `eval/rounds/eval_history.jsonl`）：
 
-- `eval/build_dataset.py`：把人工稽核表冻结成 `eval/data/golden_v1.jsonl`（格式见 `eval/data/README.md`）。
-- `eval/run_gcp_round.py`：用一个调优轮次（`eval/rounds/rNN/`）的规则跑全部验证视频，并打分；也可通过 `eval/cloudbuild_round.yaml` 在 Cloud Build 上运行。
-- `eval/score_run.py`：给一次运行结果打分（Gemini 作裁判）。
-- `eval/tune_loop.py`：自动调优循环的控制器和守则（单层修改、防过拟合词表、早停）。
-- `eval/run_visibility_probe.py`：针对单条漏检，裁出前后 60–75 秒的短片，检查模型能否"看见"该动作。
+- **核心脚本**：
+  - `eval/build_dataset.py`：把人工稽核表冻结成 `eval/data/golden_v1.jsonl`（格式见 `eval/data/README.md`）。
+  - `eval/run_gcp_round.py`：用一个调优轮次（`eval/rounds/rNN/`）的规则跑全部验证视频、自动打分、追加写入 `eval/rounds/eval_history.jsonl`，并自动推送自定义指标到 Cloud Monitoring（可通过 `--skip-monitoring-publish` 跳过）；支持通过 `eval/cloudbuild_round.yaml` 在 Cloud Build 上运行。
+  - `eval/score_run.py`：确定性时间预筛 + Gemini Pro 3 次投票取中位数裁判打分。针对不同 SOP 性质采用**分化的时间容差与定位误差策略**：
+    - **瞬时定点动作（`POINT` 模式：`1.5 Handwashing and Sanitation Standard` 洗手台瞬时动作）**：采用 **`±20 秒`（前后共 40 秒跨度）** 严格时间窗口，并计算 AI 报出时刻与人工标注时刻的 **时间戳定位误差（`timestamp_drift_sec`）**。
+    - **持续过程 / 静置计时 / 跨阶段因果链（`WINDOW` 模式：制冰机 5–10 分钟静置、泡茶 30 秒内搅拌、摸头发后未洗手复工等）**：保留 **`±60 秒` 窗口（及起止时间段包含匹配）**，且**豁免单点时间戳误差统计**。
+  - `eval/monitoring_publisher.py`：将每次评测的多维指标（带 `model_version`、`sop_version`、`media_mode`、`round_id`、`run_id`、`sop_category`、`outlet_focus`、`video_name` 标签）写入 Cloud Monitoring 自定义指标 `custom.googleapis.com/cctv_audit/eval/*`。
+  - `eval/tune_loop.py`：自动调优循环的控制器和守则（单层修改、防过拟合词表、早停守卫：`findings_per_clip <= 8.0` 且 `regressed_stable_items == 0`）。
+  - `eval/run_visibility_probe.py`：针对单条漏检，裁出前后 60–75 秒的短片，检查模型能否"看见"该动作。
+
+- **Cloud Monitoring 评测与运行监控大盘（由 `main.tf` 的 `google_monitoring_dashboard.cctv_audit_dashboard` 自动部署）**：
+  - 部署后可通过 `terraform output -raw monitoring_dashboard_console_url` 打开大盘，顶部支持按 `model_version`、`sop_version`、`media_mode`、`round_id`、`sop_category`、`outlet_focus`、`video_name` 自由筛选与对比：
+    1. **第 1 行（全局模型 × SOP 版本对比与防劣化守卫）**：总体/留出集（Holdout）/开发集（Dev）召回率趋势、置信度双工作点 PR 对比（`CONFIRMED+SUSPECTED` vs 严格模式 `仅 CONFIRMED` + 有效告警命中率 `hit_rate`）、单视频平均告警数（`<= 8.0` 红线）与稳定项回退数（`== 0`）、瞬时洗手动作时间戳定位误差（`±20s` 窗口内均值）与同配置跨 Run 翻转率（`flip_rate`）。
+    2. **第 2 行（按 SOP 大类 & 门店机位分组对比）**：按 `sop_category`（`A_Handwashing` 洗手、`B_IceMaker` 制冰机、`C_TeaBar_Hygiene` 吧台卫生）和 `outlet_focus`（门店 × 机位）分组柱状对比。
+    3. **第 3 行（单段视频细粒度透视）**：按 `video_name` 展示每段视频的召回率与告警输出条数，一眼定位哪段视频提升或误报偏高。
+    4. **第 4 行（单视频 Token 成本、耗时与容器健康度）**：单段 5 分钟视频平均成本（USD）、平均耗时（秒）以及 Cloud Run Worker 活跃实例数。
 
 每个脚本都支持 `--help`。
 

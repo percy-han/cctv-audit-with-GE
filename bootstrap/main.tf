@@ -175,6 +175,7 @@ locals {
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
     "sheets.googleapis.com",
+    "monitoring.googleapis.com",
   ])
 
   # What ../main.tf and deploy/deploy_reasoning_engine.py call, narrowest predefined role per need.
@@ -190,6 +191,7 @@ locals {
     "roles/aiplatform.user",                # ReasoningEngine create/update/delete
     "roles/discoveryengine.admin",          # Gemini Enterprise engine + agent binding
     "roles/logging.logWriter",              # build logs (cloudbuild.yaml: CLOUD_LOGGING_ONLY)
+    "roles/monitoring.editor",              # google_monitoring_dashboard (Eval & Ops Dashboard)
   ])
 }
 
@@ -262,6 +264,13 @@ resource "google_service_account_iam_member" "worker_self_token_creator" {
 resource "google_project_iam_member" "worker_vertex_ai_user" {
   project = var.project_id
   role    = "roles/aiplatform.user"
+  member  = "serviceAccount:${google_service_account.worker.email}"
+}
+
+# Evaluation custom metrics (custom.googleapis.com/cctv_audit/eval/*) pushed by eval/run_gcp_round.py.
+resource "google_project_iam_member" "worker_monitoring_metric_writer" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
   member  = "serviceAccount:${google_service_account.worker.email}"
 }
 

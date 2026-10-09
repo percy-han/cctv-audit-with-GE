@@ -23,3 +23,4 @@ eval/rounds/*/runs/
 eval/rounds/ledger.json
 eval/rounds/ledger.md
 eval/rounds/active_candidate.json
+eval/rounds/eval_history.jsonl

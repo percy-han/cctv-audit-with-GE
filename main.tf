@@ -261,6 +261,7 @@ locals {
     "drive.googleapis.com",
     "sheets.googleapis.com",
     "discoveryengine.googleapis.com",
+    "monitoring.googleapis.com",
   ])
 }
 
@@ -608,6 +609,523 @@ resource "google_cloud_scheduler_job" "cctv_audit_watchdog" {
   ]
 }
 
+# 6. Cloud Monitoring Evaluation & Operations Dashboard (24-month metric retention in GCM)
+# Tracks Model Version x SOP Version recall (Overall / Holdout / Dev / Confirmed-Only 2-point PR),
+# SOP category & Outlet/Focus drill-downs, per-video recall & alert counts, point-action timestamp
+# drift (±20s window for 1.5 Handwashing vs ±60s window for continuous processes), alert density
+# guardrail (<= 8.0/clip), stability flip rate, token cost/latency per clip, and Cloud Run health.
+resource "google_monitoring_dashboard" "cctv_audit_dashboard" {
+  project = var.project_id
+  dashboard_json = jsonencode({
+    displayName = "${local.ge_brand} CCTV AI 稽核测评与运行监控大盘 [${var.name_prefix}]"
+    dashboardFilters = [
+      {
+        filterType  = "METRIC_LABEL"
+        labelKey    = "model_version"
+        templateKey = "model_version"
+      },
+      {
+        filterType  = "METRIC_LABEL"
+        labelKey    = "sop_version"
+        templateKey = "sop_version"
+      },
+      {
+        filterType  = "METRIC_LABEL"
+        labelKey    = "media_mode"
+        templateKey = "media_mode"
+      },
+      {
+        filterType  = "METRIC_LABEL"
+        labelKey    = "round_id"
+        templateKey = "round_id"
+      },
+      {
+        filterType  = "METRIC_LABEL"
+        labelKey    = "sop_category"
+        templateKey = "sop_category"
+      },
+      {
+        filterType  = "METRIC_LABEL"
+        labelKey    = "outlet_focus"
+        templateKey = "outlet_focus"
+      },
+      {
+        filterType  = "METRIC_LABEL"
+        labelKey    = "video_name"
+        templateKey = "video_name"
+      },
+    ]
+    mosaicLayout = {
+      columns = 12
+      tiles = [
+        # ---- Row 1: Model Version x SOP Version Recall, 2-Point PR, Alert Density Guardrail & Drift
+        {
+          xPos   = 0
+          yPos   = 0
+          width  = 6
+          height = 4
+          widget = {
+            title = "1.1 黄金基准集召回率趋势：总体 vs 留出集 (Holdout) vs 开发集 (Dev) [按 Model × SOP 版本]"
+            xyChart = {
+              dataSets = [
+                {
+                  legendTemplate = "总体召回 ($${metric.labels.model_version} | $${metric.labels.sop_version} | $${metric.labels.media_mode})"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/overall_recall\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.model_version", "metric.label.sop_version", "metric.label.media_mode"]
+                      }
+                    }
+                  }
+                },
+                {
+                  legendTemplate = "留出集 Holdout ($${metric.labels.model_version} | $${metric.labels.sop_version})"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/holdout_recall\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.model_version", "metric.label.sop_version"]
+                      }
+                    }
+                  }
+                },
+                {
+                  legendTemplate = "开发集 Dev ($${metric.labels.model_version} | $${metric.labels.sop_version})"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/dev_recall\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.model_version", "metric.label.sop_version"]
+                      }
+                    }
+                  }
+                },
+              ]
+              thresholds = [
+                {
+                  label     = "目标召回线 (0.75)"
+                  value     = 0.75
+                  color     = "GREEN"
+                  direction = "ABOVE"
+                },
+              ]
+              yAxis = {
+                label = "Recall (0.0 - 1.0)"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 0
+          width  = 6
+          height = 4
+          widget = {
+            title = "1.2 置信度双工作点 PR 对比：严格模式 (仅 CONFIRMED) vs 含疑似 (CONFIRMED+SUSPECTED)"
+            xyChart = {
+              dataSets = [
+                {
+                  legendTemplate = "标准工作点 CONFIRMED+SUSPECTED ($${metric.labels.model_version} | $${metric.labels.sop_version})"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/overall_recall\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.model_version", "metric.label.sop_version"]
+                      }
+                    }
+                  }
+                },
+                {
+                  legendTemplate = "严格工作点 仅 CONFIRMED ($${metric.labels.model_version} | $${metric.labels.sop_version})"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/confirmed_only_recall\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.model_version", "metric.label.sop_version"]
+                      }
+                    }
+                  }
+                },
+                {
+                  legendTemplate = "有效告警命中率 Hit Rate ($${metric.labels.model_version} | $${metric.labels.sop_version})"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/hit_rate\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.model_version", "metric.label.sop_version"]
+                      }
+                    }
+                  }
+                },
+              ]
+              yAxis = {
+                label = "Ratio (0.0 - 1.0)"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          xPos   = 0
+          yPos   = 4
+          width  = 6
+          height = 4
+          widget = {
+            title = "1.3 误报噪音守卫：单段视频平均告警条数 (上限 <= 8.0 条/段) & 稳定项回退数 (必须 == 0)"
+            xyChart = {
+              dataSets = [
+                {
+                  legendTemplate = "单视频平均告警数 ($${metric.labels.model_version} | $${metric.labels.sop_version})"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/findings_per_clip\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.model_version", "metric.label.sop_version"]
+                      }
+                    }
+                  }
+                },
+                {
+                  legendTemplate = "稳定项回退数 Regressed Stable Items ($${metric.labels.model_version} | $${metric.labels.sop_version})"
+                  plotType       = "STACKED_BAR"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/regressed_stable_items\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MAX"
+                        groupByFields      = ["metric.label.model_version", "metric.label.sop_version"]
+                      }
+                    }
+                  }
+                },
+              ]
+              thresholds = [
+                {
+                  label     = "告警噪音红线 (8.0 条/视频)"
+                  value     = 8.0
+                  color     = "RED"
+                  direction = "ABOVE"
+                },
+              ]
+              yAxis = {
+                label = "Count"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 4
+          width  = 6
+          height = 4
+          widget = {
+            title = "1.4 瞬时动作 (1.5 洗手规范) 时间戳定位误差 (秒, 窗口 ±20s) & 跨 Run 翻转率 Flip Rate"
+            xyChart = {
+              dataSets = [
+                {
+                  legendTemplate = "瞬时动作平均时间误差秒数 ($${metric.labels.model_version} | $${metric.labels.sop_version})"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/mean_point_timestamp_drift_sec\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.model_version", "metric.label.sop_version"]
+                      }
+                    }
+                  }
+                },
+                {
+                  legendTemplate = "跨 Run 翻转率 Flip Rate ($${metric.labels.model_version} | $${metric.labels.sop_version})"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/flip_rate\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.model_version", "metric.label.sop_version"]
+                      }
+                    }
+                  }
+                },
+              ]
+              thresholds = [
+                {
+                  label     = "瞬时动作容差上限 (20s)"
+                  value     = 20.0
+                  color     = "YELLOW"
+                  direction = "ABOVE"
+                },
+              ]
+              yAxis = {
+                label = "Seconds / Flip Ratio"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        # ---- Row 2: SOP Category & Outlet / Camera Focus Breakdown
+        {
+          xPos   = 0
+          yPos   = 8
+          width  = 6
+          height = 4
+          widget = {
+            title = "2.1 按 SOP 违规大类分组召回率 (A_Handwashing 洗手 / B_IceMaker 制冰机 / C_TeaBar_Hygiene 吧台卫生)"
+            xyChart = {
+              dataSets = [
+                {
+                  legendTemplate = "$${metric.labels.sop_category} ($${metric.labels.model_version} | $${metric.labels.sop_version})"
+                  plotType       = "STACKED_BAR"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/sop_category_recall\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.sop_category", "metric.label.model_version", "metric.label.sop_version"]
+                      }
+                    }
+                  }
+                },
+              ]
+              yAxis = {
+                label = "Category Recall (0.0 - 1.0)"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 8
+          width  = 6
+          height = 4
+          widget = {
+            title = "2.2 按门店与机位视角分组召回率 (Cantavil D2 / Bau Cat × Handwashing / Ice Maker)"
+            xyChart = {
+              dataSets = [
+                {
+                  legendTemplate = "$${metric.labels.outlet_focus} ($${metric.labels.model_version} | $${metric.labels.sop_version})"
+                  plotType       = "STACKED_BAR"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/outlet_focus_recall\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.outlet_focus", "metric.label.model_version", "metric.label.sop_version"]
+                      }
+                    }
+                  }
+                },
+              ]
+              yAxis = {
+                label = "Outlet×Focus Recall (0.0 - 1.0)"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        # ---- Row 3: Per-Video Drill-Down (Recall & Alert Count per Video)
+        {
+          xPos   = 0
+          yPos   = 12
+          width  = 6
+          height = 4
+          widget = {
+            title = "3.1 单段视频 (video_name) 细粒度召回率对比 [快速定位哪段视频提升/退步]"
+            xyChart = {
+              dataSets = [
+                {
+                  legendTemplate = "$${metric.labels.video_name} ($${metric.labels.model_version} | $${metric.labels.sop_version})"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/video_recall\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.video_name", "metric.label.model_version", "metric.label.sop_version"]
+                      }
+                    }
+                  }
+                },
+              ]
+              yAxis = {
+                label = "Video Recall (0.0 - 1.0)"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 12
+          width  = 6
+          height = 4
+          widget = {
+            title = "3.2 单段视频 (video_name) 告警输出条数对比 [定位哪段视频存在误报爆炸]"
+            xyChart = {
+              dataSets = [
+                {
+                  legendTemplate = "$${metric.labels.video_name} ($${metric.labels.model_version} | $${metric.labels.sop_version})"
+                  plotType       = "STACKED_BAR"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/video_findings_count\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.video_name", "metric.label.model_version", "metric.label.sop_version"]
+                      }
+                    }
+                  }
+                },
+              ]
+              thresholds = [
+                {
+                  label     = "单视频告警上限 (8.0)"
+                  value     = 8.0
+                  color     = "RED"
+                  direction = "ABOVE"
+                },
+              ]
+              yAxis = {
+                label = "Findings per Video"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        # ---- Row 4: Token Cost, Clip Latency & Cloud Run Worker Health
+        {
+          xPos   = 0
+          yPos   = 16
+          width  = 6
+          height = 4
+          widget = {
+            title = "4.1 单段 5 分钟视频平均 Token 成本 (USD) 与平均推理耗时 (Seconds)"
+            xyChart = {
+              dataSets = [
+                {
+                  legendTemplate = "单视频成本 USD ($${metric.labels.model_version} | $${metric.labels.media_mode})"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/cost_per_clip_usd\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.model_version", "metric.label.sop_version", "metric.label.media_mode"]
+                      }
+                    }
+                  }
+                },
+                {
+                  legendTemplate = "单视频平均耗时秒数 ($${metric.labels.model_version} | $${metric.labels.media_mode})"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/mean_clip_latency_sec\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.model_version", "metric.label.sop_version", "metric.label.media_mode"]
+                      }
+                    }
+                  }
+                },
+              ]
+              yAxis = {
+                label = "USD / Seconds"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 16
+          width  = 6
+          height = 4
+          widget = {
+            title = "4.2 Cloud Run Worker Pool 活跃容器实例数与请求吞吐 (${local.worker_service_name})"
+            xyChart = {
+              dataSets = [
+                {
+                  legendTemplate = "活跃容器实例数 ($${metric.labels.state})"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"run.googleapis.com/container/instance_count\" resource.type=\"cloud_run_revision\" resource.label.\"service_name\"=\"${local.worker_service_name}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_SUM"
+                        groupByFields      = ["metric.label.state"]
+                      }
+                    }
+                  }
+                },
+              ]
+              yAxis = {
+                label = "Instances"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+      ]
+    }
+  })
+
+  depends_on = [google_project_service.required]
+}
+
 output "staging_bucket_name" {
   description = "Regional GCS bucket for ephemeral video slices and Zero-DB cross-instance job state"
   value       = google_storage_bucket.staging_bucket.name
@@ -656,4 +1174,9 @@ output "gemini_enterprise_engine_id" {
 output "gemini_enterprise_console_url" {
   description = "GCP Console URL to open the Gemini Enterprise App & Agents panel"
   value       = "https://console.cloud.google.com/gen-app-builder/engines?project=${var.project_id}"
+}
+
+output "monitoring_dashboard_console_url" {
+  description = "GCP Console URL to open the CCTV AI Audit Evaluation & Operations Dashboard in Cloud Monitoring"
+  value       = "https://console.cloud.google.com/monitoring/dashboards?project=${var.project_id}"
 }

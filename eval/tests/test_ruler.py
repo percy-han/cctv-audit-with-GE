@@ -156,6 +156,199 @@ class ScoreRunTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             sr.score(items, sr.flatten_findings([job]), lambda c: [(0.7, "MATCH=F001; x")])
 
+    def test_point_vs_window_temporal_mode_and_drift(self):
+        # 1.5 Handwashing -> POINT (±20s, drift enabled)
+        hw_item = {
+            "item_id": "R08",
+            "sheet_row": 8,
+            "split": "holdout",
+            "focus": "Handwashing Monitoring",
+            "outlet_name": "Cantavil D2",
+            "audit_clause": "1.5 Handwashing and Sanitation Standard",
+            "finding_verbatim": "Footage 4: 120720 Partner apply soap before wet hand",
+            "video_filenames": ["a.mov"],
+            "parts": [{"part_id": "R08", "description": "Partner apply soap before wet hand", "osd_times": ["12:07:20"]}],
+        }
+        # 5.8 Ice Maker -> WINDOW (±60s, drift exempt)
+        ice_item = {
+            "item_id": "R14",
+            "sheet_row": 14,
+            "split": "dev",
+            "focus": "Ice Maker Weekly Cleaning",
+            "outlet_name": "Cantavil D2",
+            "audit_clause": "5.8 Ice Maker Routine Cleaning and Maintenance",
+            "finding_verbatim": "Footage 1: 221647 Leave chemical for 5 minutes",
+            "video_filenames": ["b.mov"],
+            "parts": [{"part_id": "R14", "description": "Leave chemical for 5 minutes", "osd_times": ["22:16:47"]}],
+        }
+        self.assertEqual(sr.classify_temporal_mode(hw_item, hw_item["parts"][0]), "POINT")
+        self.assertEqual(sr.part_window_sec("POINT"), 20)
+        self.assertEqual(sr.classify_temporal_mode(ice_item, ice_item["parts"][0]), "WINDOW")
+        self.assertEqual(sr.part_window_sec("WINDOW"), 60)
+
+        # Finding at +25s from label: must be REJECTED for POINT (±20s) but ACCEPTED for WINDOW (±60s).
+        job_25s = {"job_id": "j", "completed_segments": {
+            "a": {"filename": "a.mov", "segment_index": 0, "findings": [
+                self._finding(rule_id="A3", on_screen_clock="12:07:45", global_offset_sec=465.0, evidence="soap")
+            ]},
+            "b": {"filename": "b.mov", "segment_index": 0, "findings": [
+                self._finding(rule_id="B2", on_screen_clock="22:17:12", global_offset_sec=132.0, evidence="dwell")
+            ]},
+        }}
+        fs_25s = sr.flatten_findings([job_25s])
+        self.assertEqual(sr.prefilter(hw_item["parts"][0], ["a.mov"], fs_25s, window_sec=20), [])
+        self.assertEqual(len(sr.prefilter(ice_item["parts"][0], ["b.mov"], fs_25s, window_sec=60)), 1)
+
+        # Finding at +6s for POINT (12:07:26 vs 12:07:20) and +25s for WINDOW (22:17:12 vs 22:16:47):
+        job_match = {"job_id": "j2", "completed_segments": {
+            "a": {"filename": "a.mov", "segment_index": 0, "findings": [
+                self._finding(
+                    rule_id="A3",
+                    violation_disposition="CONFIRMED",
+                    on_screen_clock="12:07:26",
+                    global_offset_sec=446.0,
+                    evidence="soap before wet",
+                )
+            ]},
+            "b": {"filename": "b.mov", "segment_index": 0, "findings": [
+                self._finding(
+                    rule_id="B2",
+                    violation_disposition="SUSPECTED",
+                    on_screen_clock="22:17:12",
+                    global_offset_sec=132.0,
+                    evidence="dwell < 5 min",
+                )
+            ]},
+        }}
+        fs_match = sr.flatten_findings([job_match])
+        rep = sr.score(
+            [hw_item, ice_item],
+            fs_match,
+            lambda cases: [
+                (1.0, "MATCH=F001; ok") if c["case_id"] == "R08" else (1.0, "MATCH=F002; ok")
+                for c in cases
+            ],
+        )
+        parts_by_id = {p["part_id"]: p for it in rep["items"] for p in it["parts"]}
+        self.assertEqual(parts_by_id["R08"]["temporal_mode"], "POINT")
+        self.assertEqual(parts_by_id["R08"]["window_sec"], 20)
+        self.assertEqual(parts_by_id["R08"]["timestamp_drift_sec"], 6.0)
+        self.assertEqual(parts_by_id["R14"]["temporal_mode"], "WINDOW")
+        self.assertEqual(parts_by_id["R14"]["window_sec"], 60)
+        self.assertIsNone(parts_by_id["R14"]["timestamp_drift_sec"])
+
+        qm = rep["quality_metrics"]
+        self.assertEqual(qm["mean_point_timestamp_drift_sec"], 6.0)
+        self.assertEqual(qm["confirmed_only_recall"], 0.5)
+        self.assertEqual(qm["hit_rate"], 1.0)
+        self.assertEqual(rep["sop_category_recall"]["A_Handwashing"]["recall"], 1.0)
+        self.assertEqual(rep["sop_category_recall"]["B_IceMaker"]["recall"], 1.0)
+        self.assertEqual(rep["video_breakdown"]["a.mov"]["recall"], 1.0)
+
+
+class MonitoringPublisherTest(unittest.TestCase):
+    def test_build_record_and_timeseries_and_history_dedup(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        import monitoring_publisher as mp
+
+        score_doc = {
+            "recall": {
+                "all": {"points": 15.0, "rows": 19, "recall": 0.7895},
+                "holdout": {"points": 7.5, "rows": 9, "recall": 0.8333},
+                "dev": {"points": 7.5, "rows": 10, "recall": 0.75},
+            },
+            "quality_metrics": {
+                "confirmed_only_points": 12.0,
+                "confirmed_only_recall": 0.6316,
+                "matched_findings_count": 16,
+                "total_findings_count": 32,
+                "hit_rate": 0.5,
+                "point_window_sec": 20,
+                "window_sec": 60,
+                "point_parts_total": 8,
+                "point_parts_matched": 6,
+                "window_parts_total": 13,
+                "mean_point_timestamp_drift_sec": 3.5,
+                "max_point_timestamp_drift_sec": 6.0,
+            },
+            "sop_category_recall": {
+                "A_Handwashing": {"points": 9.0, "rows": 11, "recall": 0.8182},
+                "B_IceMaker": {"points": 5.0, "rows": 6, "recall": 0.8333},
+                "C_TeaBar_Hygiene": {"points": 1.0, "rows": 2, "recall": 0.5},
+            },
+            "outlet_focus_recall": {
+                "Cantavil D2 | Handwashing Monitoring": {"points": 4.0, "rows": 5, "recall": 0.8},
+            },
+            "video_breakdown": {
+                "a.mov": {"points": 2.0, "rows": 2, "recall": 1.0, "findings_count": 3},
+            },
+            "items": [
+                {"item_id": "R02", "score": 1.0},
+                {"item_id": "R07", "score": 1.0},
+                {"item_id": "R08", "score": 1.0},
+            ],
+        }
+        job_docs = [
+            {
+                "completed_segments": {"a:0": {}, "b:0": {}},
+                "token_ledger": [
+                    {"estimated_cost_usd": 0.2, "processing_latency_sec": 350.0, "total_token_count": 200000},
+                    {"estimated_cost_usd": 0.3, "processing_latency_sec": 370.0, "total_token_count": 250000},
+                ],
+            }
+        ]
+        manifest = {
+            "runs": [
+                {"run_id": "r01_a", "row_scores": {"R02": 1.0, "R07": 1.0, "R08": 0.0}},
+                {"run_id": "r01_b", "row_scores": {"R02": 1.0, "R07": 1.0, "R08": 1.0}},
+            ]
+        }
+        rec = mp.build_eval_monitoring_record(
+            project_id="study-project-496907",
+            round_id="r01",
+            run_id="r01_b",
+            model_version="gemini-3.8-flash",
+            sop_version="v2.6_r01",
+            media_mode="agentic",
+            score_doc=score_doc,
+            job_docs=job_docs,
+            round_manifest=manifest,
+            timestamp_iso="2026-10-08T12:00:00Z",
+        )
+        self.assertEqual(rec["metrics"]["cost_per_clip_usd"], 0.25)
+        self.assertEqual(rec["metrics"]["mean_clip_latency_sec"], 360.0)
+        self.assertAlmostEqual(rec["metrics"]["flip_rate"], 1 / 3, places=4)
+
+        ts = mp.build_cloud_monitoring_timeseries(rec)
+        metric_types = {t["metric"]["type"] for t in ts}
+        self.assertIn("custom.googleapis.com/cctv_audit/eval/overall_recall", metric_types)
+        self.assertIn("custom.googleapis.com/cctv_audit/eval/confirmed_only_recall", metric_types)
+        self.assertIn("custom.googleapis.com/cctv_audit/eval/mean_point_timestamp_drift_sec", metric_types)
+        self.assertIn("custom.googleapis.com/cctv_audit/eval/sop_category_recall", metric_types)
+        self.assertIn("custom.googleapis.com/cctv_audit/eval/outlet_focus_recall", metric_types)
+        self.assertIn("custom.googleapis.com/cctv_audit/eval/video_recall", metric_types)
+        self.assertIn("custom.googleapis.com/cctv_audit/eval/video_findings_count", metric_types)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hist = Path(tmp) / "eval_history.jsonl"
+            mp.append_eval_history_jsonl(rec, hist)
+            mp.append_eval_history_jsonl(rec, hist)
+            lines = [json.loads(line) for line in hist.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(lines[0]["run_id"], "r01_b")
+
+        fake_sess = mock.MagicMock()
+        fake_resp = mock.MagicMock(status_code=200, text="{}")
+        fake_sess.post.return_value = fake_resp
+        with mock.patch("google.auth.transport.requests.AuthorizedSession", return_value=fake_sess):
+            res = mp.publish_eval_timeseries("study-project-496907", ts, credentials=mock.MagicMock())
+        self.assertEqual(res, len(ts))
+        self.assertEqual(fake_sess.post.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
+

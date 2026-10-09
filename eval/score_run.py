@@ -29,7 +29,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-WINDOW_SEC = 60
+POINT_WINDOW_SEC = 20  # ±20s (40s total span) for instant point actions (POINT); drift enabled
+WINDOW_SEC = 60  # ±60s for continuous process / dwell / causal-chain actions (WINDOW); drift exempt
 NEAR_MISS_SEC = 180  # diagnostics only: same-video findings just outside the window
 SPAN_MAX_SEC = 330  # a described span longer than one clip is not trusted
 CLIP_SEC = 300
@@ -37,6 +38,60 @@ _HMS = re.compile(r"(?<![\d:])(\d{1,2}):(\d{2}):(\d{2})(?![\d:])")
 _MS = re.compile(r"(?<![\d:])(\d{1,2}):(\d{2})(?![\d:])")
 _MATCH = re.compile(r"MATCH\s*=\s*([^;]*);", re.I)
 _FID = re.compile(r"\bF\d{3,}\b")
+
+POINT_ACTION_KEYWORDS: tuple[str, ...] = (
+    "soaping time is less than 20s",
+    "apply soap before wet hand",
+    "not dry hand with hand towel",
+    "not rinse hand before applying handwashing gel",
+)
+
+
+def classify_temporal_mode(item: dict[str, Any], part: dict[str, Any] | None = None) -> str:
+    """Classify a golden item/part as ``POINT`` (±20s, timestamp drift enabled) or
+    ``WINDOW`` (±60s + span containment, exempt from single-point timestamp drift).
+
+    - ``POINT``: instant single-step actions at the handwashing sink (e.g. Clause 1.5
+      soaping <20s, applying soap before wetting hands, not rinsing before gel, not
+      drying hands with a paper towel) that have an explicit OSD timestamp.
+    - ``WINDOW``: continuous processes, 5-10 min sanitizer dwell windows, multi-step
+      equipment cleaning, 3-stage cross-contamination causal chains (trigger -> no
+      handwash -> resume production), 30s tea-stirring timers, or unanchored whole-clip
+      state checks (e.g. R13 apron storage with no OSD timestamp).
+    """
+    explicit = str((part or {}).get("temporal_mode") or item.get("temporal_mode") or "").strip().upper()
+    if explicit in ("POINT", "WINDOW"):
+        return explicit
+    osd_list = (part or {}).get("osd_times") if part is not None else item.get("osd_times")
+    if not osd_list:
+        return "WINDOW"
+    clause = str(item.get("audit_clause") or "").strip().lower()
+    desc = str((part or {}).get("description") or item.get("finding_verbatim") or "").strip().lower()
+    if "1.5 handwashing" in clause:
+        return "POINT"
+    if any(kw in desc for kw in POINT_ACTION_KEYWORDS):
+        return "POINT"
+    return "WINDOW"
+
+
+def part_window_sec(mode: str) -> int:
+    """Return the prefilter window in seconds for the given temporal mode."""
+    return POINT_WINDOW_SEC if str(mode).upper() == "POINT" else WINDOW_SEC
+
+
+def classify_sop_category(item: dict[str, Any]) -> str:
+    """Map a golden item to one of the 3 canonical SOP categories for dashboard drill-down."""
+    explicit = str(item.get("sop_category") or "").strip()
+    if explicit:
+        return explicit
+    clause = str(item.get("audit_clause") or "").strip().lower()
+    focus = str(item.get("focus") or "").strip().lower()
+    if "ice maker" in clause or "equipment cleaning" in clause or "ice maker" in focus:
+        return "B_IceMaker"
+    if "tea maker" in clause or "personal belonging" in clause or "6.2" in clause or "1.4" in clause:
+        return "C_TeaBar_Hygiene"
+    return "A_Handwashing"
+
 
 JUDGE_TEMPLATE = """你是连锁茶饮门店 CCTV 稽核的阅卷老师。任务：判断 AI 稽核输出里，有没有抓到下面这 1 条人工标注的违规。
 
@@ -121,7 +176,7 @@ def flatten_findings(jobs: Iterable[dict[str, Any]]) -> list[Finding]:
                         job_id=str(job.get("job_id")),
                         filename=str(seg.get("filename") or f.get("filename") or ""),
                         rule_id=str(f.get("rule_id") or ""),
-                        disposition=str(f.get("disposition") or ""),
+                        disposition=str(f.get("disposition") or f.get("violation_disposition") or ""),
                         severity=str(f.get("severity") or ""),
                         confidence=float(f.get("confidence") or 0.0),
                         osd=str(f.get("on_screen_clock") or ""),
@@ -139,22 +194,56 @@ def ring_gap(a: int, b: int) -> int:
     return min(d, 86400 - d)
 
 
-def time_matches(label_sec: int, times: list[int]) -> bool:
+def time_matches(label_sec: int, times: list[int], window_sec: int = WINDOW_SEC) -> bool:
     if not times:
         return False
-    if any(ring_gap(t, label_sec) <= WINDOW_SEC for t in times):
+    if any(ring_gap(t, label_sec) <= window_sec for t in times):
         return True
     lo, hi = min(times), max(times)
-    return hi - lo <= SPAN_MAX_SEC and lo <= label_sec <= hi
+    span_limit = (2 * window_sec) if window_sec < WINDOW_SEC else SPAN_MAX_SEC
+    return hi - lo <= span_limit and lo <= label_sec <= hi
 
 
-def prefilter(part: dict[str, Any], files: list[str], findings: list[Finding]) -> list[Finding]:
+def prefilter(
+    part: dict[str, Any],
+    files: list[str],
+    findings: list[Finding],
+    window_sec: int = WINDOW_SEC,
+) -> list[Finding]:
     same_video = [f for f in findings if f.filename in files]
     label_secs = [hms_to_sec(t) for t in part["osd_times"]]
     label_secs = [s for s in label_secs if s is not None]
     if not label_secs:
         return same_video
-    return [f for f in same_video if any(time_matches(s, f.osd_times) for s in label_secs)]
+    return [f for f in same_video if any(time_matches(s, f.osd_times, window_sec=window_sec) for s in label_secs)]
+
+
+def compute_point_timestamp_drift(
+    part: dict[str, Any],
+    matched_findings: list[Finding],
+    mode: str,
+) -> int | None:
+    """Compute OSD timestamp drift in seconds for a matched ``POINT`` action part.
+
+    Returns ``None`` for ``WINDOW`` parts (continuous processes / dwell windows /
+    multi-step causal chains are exempt from single-point timestamp drift), or when
+    the part is unmatched or has no labelled OSD timestamp.
+    """
+    if str(mode).upper() != "POINT" or not matched_findings:
+        return None
+    label_secs = [s for s in (hms_to_sec(t) for t in part.get("osd_times") or []) if s is not None]
+    if not label_secs:
+        return None
+    candidate_secs: list[int] = []
+    for f in matched_findings:
+        primary_sec = hms_to_sec(f.osd)
+        if primary_sec is not None:
+            candidate_secs.append(primary_sec)
+        elif f.osd_times:
+            candidate_secs.extend(f.osd_times)
+    if not candidate_secs:
+        return None
+    return min(ring_gap(ft, ls) for ft in candidate_secs for ls in label_secs)
 
 
 def render_candidates(cands: list[Finding]) -> str:
@@ -311,14 +400,31 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
     by_id = {f.finding_id: f for f in findings}
     cases: list[dict[str, str]] = []
     part_rows: list[dict[str, Any]] = []
+    part_spec_by_id: dict[str, dict[str, Any]] = {}
     for it in items:
-        per_part = {p["part_id"]: prefilter(p, it["video_filenames"], findings) for p in it["parts"]}
+        per_part: dict[str, list[Finding]] = {}
+        part_modes: dict[str, str] = {}
+        for p in it["parts"]:
+            mode = classify_temporal_mode(it, p)
+            part_modes[p["part_id"]] = mode
+            part_spec_by_id[p["part_id"]] = p
+            per_part[p["part_id"]] = prefilter(
+                p, it["video_filenames"], findings, window_sec=part_window_sec(mode)
+            )
         assign_exclusive_candidates(it, per_part)
         for p in it["parts"]:
+            mode = part_modes[p["part_id"]]
+            w_sec = part_window_sec(mode)
             cands = per_part[p["part_id"]]
             ids = [c.finding_id for c in cands]
-            row = {"item_id": it["item_id"], "part_id": p["part_id"], "candidate_ids": ids,
-                   "near_misses": near_misses(p, it["video_filenames"], findings, set(ids))}
+            row = {
+                "item_id": it["item_id"],
+                "part_id": p["part_id"],
+                "temporal_mode": mode,
+                "window_sec": w_sec,
+                "candidate_ids": ids,
+                "near_misses": near_misses(p, it["video_filenames"], findings, set(ids)),
+            }
             if cands:
                 row["case_index"] = len(cases)
                 cases.append({"case_id": p["part_id"],
@@ -329,8 +435,15 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
     if len(verdicts) != len(cases):
         raise RuntimeError(f"judge returned {len(verdicts)} verdicts for {len(cases)} cases")
     for row in part_rows:
+        w_sec = int(row.get("window_sec") or WINDOW_SEC)
+        mode = str(row.get("temporal_mode") or "WINDOW")
         if "case_index" not in row:
-            row.update(score=0.0, explanation=f"代码预筛：同一视频 ±{WINDOW_SEC} 秒内没有任何 AI 条目", matched_ids=[])
+            row.update(
+                score=0.0,
+                explanation=f"代码预筛：同一视频 ±{w_sec} 秒内没有任何 AI 条目",
+                matched_ids=[],
+                timestamp_drift_sec=None,
+            )
             continue
         s, expl = verdicts[row.pop("case_index")]
         if s is None:
@@ -341,19 +454,42 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
         matched = [m for m in parse_match(expl) if m in row["candidate_ids"]]
         if s > 0 and not matched:
             raise RuntimeError(f"judge scored {row['part_id']}={s} without citing a candidate: {expl}")
-        row.update(score=s, explanation=expl, matched_ids=matched)
+        matched_objs = [by_id[m] for m in matched if m in by_id]
+        drift_sec = compute_point_timestamp_drift(
+            part_spec_by_id.get(row["part_id"], {}), matched_objs, mode
+        ) if s > 0 else None
+        row.update(score=s, explanation=expl, matched_ids=matched, timestamp_drift_sec=drift_sec)
 
     results = []
+    confirmed_only_total_pts = 0.0
+    all_matched_fids: set[str] = set()
     for it in items:
         parts = [r for r in part_rows if r["item_id"] == it["item_id"]]
         row_score = sum(r["score"] for r in parts) / len(parts)
-        matched = [by_id[m] for r in parts for m in r["matched_ids"]]
+        matched = [by_id[m] for r in parts for m in r["matched_ids"] if m in by_id]
+        for m_obj in matched:
+            all_matched_fids.add(m_obj.finding_id)
+        confirmed_part_scores = []
+        for r in parts:
+            has_confirmed = any(
+                by_id[m].disposition.strip().upper() == "CONFIRMED"
+                for m in r["matched_ids"]
+                if m in by_id
+            )
+            confirmed_part_scores.append(r["score"] if has_confirmed else 0.0)
+        confirmed_row_score = sum(confirmed_part_scores) / len(parts) if parts else 0.0
+        confirmed_only_total_pts += confirmed_row_score
+        sop_cat = classify_sop_category(it)
         results.append({
             "item_id": it["item_id"], "sheet_row": it["sheet_row"], "split": it["split"],
             "focus": it["focus"], "outlet_name": it["outlet_name"],
+            "audit_clause": it.get("audit_clause", ""),
+            "sop_category": sop_cat,
             "finding_verbatim": it["finding_verbatim"],
             "video_filenames": it["video_filenames"],
-            "score": row_score, "parts": parts,
+            "score": row_score,
+            "confirmed_only_score": confirmed_row_score,
+            "parts": parts,
             "matched": [dataclasses.asdict(m) for m in matched],
         })
 
@@ -365,6 +501,73 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
     per_clip: dict[str, int] = {}
     for f in findings:
         per_clip[f.filename] = per_clip.get(f.filename, 0) + 1
+
+    # Drill-down 1: Recall by SOP Category (A_Handwashing, B_IceMaker, C_TeaBar_Hygiene)
+    sop_category_recall: dict[str, dict[str, Any]] = {}
+    for cat in ("A_Handwashing", "B_IceMaker", "C_TeaBar_Hygiene"):
+        cat_rows = [r for r in results if r["sop_category"] == cat]
+        if cat_rows:
+            pts = sum(r["score"] for r in cat_rows)
+            sop_category_recall[cat] = {
+                "points": pts,
+                "rows": len(cat_rows),
+                "recall": pts / len(cat_rows),
+            }
+
+    # Drill-down 2: Recall by Outlet & Camera Focus
+    outlet_focus_recall: dict[str, dict[str, Any]] = {}
+    seen_of_keys: list[str] = []
+    for r in results:
+        of_key = f"{r['outlet_name']} | {r['focus']}"
+        if of_key not in seen_of_keys:
+            seen_of_keys.append(of_key)
+    for of_key in seen_of_keys:
+        of_rows = [r for r in results if f"{r['outlet_name']} | {r['focus']}" == of_key]
+        pts = sum(r["score"] for r in of_rows)
+        outlet_focus_recall[of_key] = {
+            "outlet_name": of_rows[0]["outlet_name"],
+            "focus": of_rows[0]["focus"],
+            "points": pts,
+            "rows": len(of_rows),
+            "recall": pts / len(of_rows) if of_rows else 0.0,
+        }
+
+    # Drill-down 3: Per-video recall & alert count
+    video_breakdown: dict[str, dict[str, Any]] = {}
+    all_video_names: list[str] = []
+    for r in results:
+        for vf in r["video_filenames"]:
+            if vf not in all_video_names:
+                all_video_names.append(vf)
+    for vf in per_clip:
+        if vf not in all_video_names:
+            all_video_names.append(vf)
+    for vf in all_video_names:
+        v_rows = [r for r in results if vf in r["video_filenames"]]
+        pts = sum(r["score"] for r in v_rows)
+        video_breakdown[vf] = {
+            "points": pts,
+            "rows": len(v_rows),
+            "recall": pts / len(v_rows) if v_rows else 0.0,
+            "findings_count": per_clip.get(vf, 0),
+        }
+
+    # Point-action timestamp drift metrics (computed strictly on POINT parts only; WINDOW exempt)
+    point_parts = [p for p in part_rows if p.get("temporal_mode") == "POINT"]
+    window_parts = [p for p in part_rows if p.get("temporal_mode") != "POINT"]
+    point_drifts = [
+        int(p["timestamp_drift_sec"])
+        for p in point_parts
+        if p.get("timestamp_drift_sec") is not None
+    ]
+    mean_point_drift = (sum(point_drifts) / len(point_drifts)) if point_drifts else None
+    max_point_drift = max(point_drifts) if point_drifts else None
+
+    total_rows = len(results)
+    total_findings_count = len(findings)
+    matched_findings_count = len(all_matched_fids)
+    hit_rate = (matched_findings_count / total_findings_count) if total_findings_count else 0.0
+
     return {
         "recall": {"all": recall(None), "dev": recall("dev"), "holdout": recall("holdout")},
         "alert_density": {
@@ -372,6 +575,23 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
             "mean_per_clip": len(findings) / len(per_clip) if per_clip else 0.0,
             "max_per_clip": max(per_clip.values()) if per_clip else 0,
             "per_clip": per_clip,
+        },
+        "sop_category_recall": sop_category_recall,
+        "outlet_focus_recall": outlet_focus_recall,
+        "video_breakdown": video_breakdown,
+        "quality_metrics": {
+            "confirmed_only_points": confirmed_only_total_pts,
+            "confirmed_only_recall": (confirmed_only_total_pts / total_rows) if total_rows else 0.0,
+            "matched_findings_count": matched_findings_count,
+            "total_findings_count": total_findings_count,
+            "hit_rate": hit_rate,
+            "point_window_sec": POINT_WINDOW_SEC,
+            "window_sec": WINDOW_SEC,
+            "point_parts_total": len(point_parts),
+            "point_parts_matched": len(point_drifts),
+            "window_parts_total": len(window_parts),
+            "mean_point_timestamp_drift_sec": mean_point_drift,
+            "max_point_timestamp_drift_sec": max_point_drift,
         },
         "items": results,
         "judge_cases": len(cases),
@@ -388,6 +608,14 @@ def load_json(path: str) -> dict[str, Any]:
 def render_markdown(run_label: str, rep: dict[str, Any]) -> str:
     r = rep["recall"]
     ad = rep["alert_density"]
+    qm = rep.get("quality_metrics") or {}
+    drift_str = (
+        f"平均 {qm['mean_point_timestamp_drift_sec']:.1f}s（最大 {qm['max_point_timestamp_drift_sec']}s，"
+        f"仅统计 {qm.get('point_parts_matched', 0)}/{qm.get('point_parts_total', 0)} 个 POINT 瞬时动作，±{qm.get('point_window_sec', POINT_WINDOW_SEC)}s 窗口；"
+        f"{qm.get('window_parts_total', 0)} 个 WINDOW 持续过程动作豁免偏移统计）"
+        if qm.get("mean_point_timestamp_drift_sec") is not None
+        else f"无命中的 POINT 瞬时动作（POINT ±{qm.get('point_window_sec', POINT_WINDOW_SEC)}s / WINDOW ±{qm.get('window_sec', WINDOW_SEC)}s）"
+    )
     mark = {1.0: "✓ 命中", 0.5: "◐ 半对", 0.0: "✗ 漏掉"}
     lines = [
         f"# 尺子打分：{run_label}",
@@ -395,14 +623,21 @@ def render_markdown(run_label: str, rep: dict[str, Any]) -> str:
         f"- 加权召回（全部 19 行）：**{r['all']['points']:.1f} / {r['all']['rows']} = {r['all']['recall']:.1%}**",
         f"- 开卷 dev：{r['dev']['points']:.1f} / {r['dev']['rows']} = {r['dev']['recall']:.1%}",
         f"- 检查 holdout：{r['holdout']['points']:.1f} / {r['holdout']['rows']} = {r['holdout']['recall']:.1%}",
-        f"- 告警密度：{ad['findings']} 条 / {ad['clips']} 段 = 平均 {ad['mean_per_clip']:.1f} 条/段，最多 {ad['max_per_clip']} 条/段",
+        f"- 仅 CONFIRMED 召回率：{qm.get('confirmed_only_points', 0.0):.1f} / {r['all']['rows']} = {qm.get('confirmed_only_recall', 0.0):.1%}",
+        f"- 告警密度：{ad['findings']} 条 / {ad['clips']} 段 = 平均 {ad['mean_per_clip']:.1f} 条/段，最多 {ad['max_per_clip']} 条/段（有效命中率 Hit Rate = {qm.get('hit_rate', 0.0):.1%}）",
+        f"- 瞬时动作时间戳定位误差（POINT ±{qm.get('point_window_sec', POINT_WINDOW_SEC)}s）：{drift_str}",
         f"- 裁判调用：{rep['judge_cases']} 个 part；judge = {rep.get('judge_model', '?')}",
         "",
-        "| 行 | 分组 | 客户标注 | 判分 | 裁判理由 | 命中的 AI 条目 | 窗口外近邻（仅供校准，不计分） |",
-        "|---|---|---|---|---|---|---|",
+        "| 行 | 分组 | 时间窗模式 | 客户标注 | 判分 | 裁判理由 | 命中的 AI 条目 | 窗口外近邻（仅供校准，不计分） |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for it in rep["items"]:
         grp = f"{it['split']} · {it['focus'].split()[0]} · {it['outlet_name']}"
+        modes = "/".join(
+            f"{p.get('temporal_mode', 'WINDOW')}(±{p.get('window_sec', WINDOW_SEC)}s"
+            + (f",偏移{p['timestamp_drift_sec']}s)" if p.get("timestamp_drift_sec") is not None else ")")
+            for p in it["parts"]
+        )
         reasons = " / ".join(f"{p['part_id']}: {p['explanation']}" for p in it["parts"])
         hits = "<br>".join(
             f"{m['finding_id']} {m['osd']} {m['rule_id']}：{m['evidence'][:80]}" for m in it["matched"]
@@ -410,7 +645,7 @@ def render_markdown(run_label: str, rep: dict[str, Any]) -> str:
         near = "<br>".join(n for p in it["parts"] for n in p.get("near_misses", [])) or "—"
         label = it["finding_verbatim"].replace("|", "/")
         lines.append(
-            f"| {it['sheet_row']} | {grp} | {label} | {mark.get(it['score'], it['score'])} | "
+            f"| {it['sheet_row']} | {grp} | {modes} | {label} | {mark.get(it['score'], it['score'])} | "
             f"{reasons.replace('|', '/')} | {hits.replace('|', '/')} | {near.replace('|', '/')} |"
         )
     return "\n".join(lines) + "\n"
@@ -459,6 +694,7 @@ def score_run(*, run_dir: str | os.PathLike[str], golden_path: str | os.PathLike
         judge_passes=judge_passes, run_label=run_label, judge_model=judge_model or "injected",
         job_ids=[j.get("job_id") for j in jobs],
         scored_at=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        point_window_sec=POINT_WINDOW_SEC,
         window_sec=WINDOW_SEC,
     )
     rep["_sdk_result"] = sdk_result[0] if sdk_result else None
