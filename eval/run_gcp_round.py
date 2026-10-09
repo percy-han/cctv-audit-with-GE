@@ -65,11 +65,15 @@ from cctv_audit.video_ingestor import (  # noqa: E402
     VideoSliceSegment,
 )
 from eval.monitoring_publisher import (  # noqa: E402
+    DEFAULT_EXPERIMENT_LOCATION,
+    DEFAULT_ROUND_EXPERIMENT_NAME,
+    DEFAULT_RUNS_EXPERIMENT_NAME,
     append_eval_history_jsonl,
     build_cloud_monitoring_timeseries,
     build_eval_monitoring_record,
     build_round_monitoring_timeseries,
     publish_eval_timeseries,
+    publish_vertex_experiment_records,
     write_round_averages_jsonl,
 )
 from eval.score_run import render_markdown, score_run  # noqa: E402
@@ -640,6 +644,34 @@ async def run_round_async(args: argparse.Namespace) -> int:
             )
         except Exception as exc:
             logger.warning("Cloud Monitoring publish warning (non-fatal for eval run): %s", exc)
+        exp_location = os.environ.get("GCP_REGION") or DEFAULT_EXPERIMENT_LOCATION
+        try:
+            await asyncio.to_thread(
+                publish_vertex_experiment_records,
+                cfg.gcp_project,
+                [mon_record],
+                location=exp_location,
+                experiment_name=DEFAULT_RUNS_EXPERIMENT_NAME,
+                experiment_description="CHAGEE CCTV AI Audit Per-Run Detailed Evaluation Ledger",
+                is_round_average=False,
+            )
+        except Exception as exc:
+            logger.warning("Vertex AI Experiments per-run publish warning (non-fatal for eval run): %s", exc)
+        if matching_round_avg is not None:
+            try:
+                await asyncio.to_thread(
+                    publish_vertex_experiment_records,
+                    cfg.gcp_project,
+                    [matching_round_avg],
+                    location=exp_location,
+                    experiment_name=DEFAULT_ROUND_EXPERIMENT_NAME,
+                    experiment_description=(
+                        "CHAGEE CCTV AI Audit MLOps Evaluation (Model x SOP Version x Round Comparison)"
+                    ),
+                    is_round_average=True,
+                )
+            except Exception as exc:
+                logger.warning("Vertex AI Experiments round-avg publish warning (non-fatal for eval run): %s", exc)
 
     if not args.skip_gcs_sync:
         gcs_prefix = f"eval/rounds/{args.round}"

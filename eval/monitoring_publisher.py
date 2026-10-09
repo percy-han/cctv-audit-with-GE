@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any, Sequence
 
 from eval.tune_loop import evaluate_run_guardrails
@@ -26,6 +27,10 @@ logger = logging.getLogger("eval.monitoring_publisher")
 METRIC_PREFIX = "custom.googleapis.com/cctv_audit/eval"
 ROUND_METRIC_PREFIX = "custom.googleapis.com/cctv_audit/eval_round"
 MAX_TIMESERIES_PER_BATCH = 200
+
+DEFAULT_EXPERIMENT_LOCATION = "asia-southeast1"
+DEFAULT_ROUND_EXPERIMENT_NAME = "chagee-cctv-audit-eval"
+DEFAULT_RUNS_EXPERIMENT_NAME = "chagee-cctv-audit-eval-runs"
 
 
 def extract_run_resource_summary(job_docs: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -657,11 +662,176 @@ def publish_eval_timeseries(
     return written
 
 
+def slugify_experiment_id(raw: str, max_len: int = 60) -> str:
+    """Convert an arbitrary identifier into a valid Vertex AI Metadata resource ID.
+
+    Vertex AI Metadata ``Context`` IDs must match ``^[a-z0-9][a-z0-9-]{0,126}[a-z0-9]$``
+    (lowercase letters, digits, and hyphens only).
+    """
+    cleaned = re.sub(r"[^a-z0-9]+", "-", str(raw or "").strip().lower()).strip("-")
+    if not cleaned:
+        cleaned = "run"
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip("-")
+    if len(cleaned) < 2:
+        cleaned = f"{cleaned}-0"
+    return cleaned
+
+
+def build_vertex_experiment_run_payload(
+    record: dict[str, Any],
+    *,
+    is_round_average: bool = False,
+) -> dict[str, Any]:
+    """Build ``{"run_name": str, "params": dict, "metrics": dict}`` for Vertex AI / Agent Platform Experiments."""
+    round_id = str(record.get("round_id") or "r00")
+    model_version = str(record.get("model_version") or "unknown")
+    sop_version = str(record.get("sop_version") or "unknown")
+    media_mode = str(record.get("media_mode") or "agentic")
+    judge_model = str(record.get("judge_model") or "")
+    timestamp_iso = str(record.get("timestamp") or "")
+    m = record.get("metrics") or {}
+
+    if is_round_average:
+        raw_name = f"{round_id}-{sop_version}-{model_version}"
+        runs_count = int(record.get("runs_count") or 1)
+        run_ids_str = ",".join(str(x) for x in (record.get("run_ids") or []))
+    else:
+        run_id = str(record.get("run_id") or "run")
+        raw_name = f"{round_id}-{run_id}-{sop_version}"
+        runs_count = 1
+        run_ids_str = run_id
+
+    run_name = slugify_experiment_id(raw_name, max_len=60)
+    params: dict[str, float | int | str] = {
+        "round_id": round_id,
+        "sop_version": sop_version,
+        "model_version": model_version,
+        "media_mode": media_mode,
+        "judge_model": judge_model,
+        "runs_count": runs_count,
+        "run_ids": run_ids_str[:120],
+        "guardrails_passed": "true" if m.get("guardrails_passed") else "false",
+        "point_window_sec": int(m.get("point_window_sec", 20)),
+        "window_sec": int(m.get("window_sec", 60)),
+        "evaluated_at": timestamp_iso,
+    }
+
+    metrics: dict[str, float | int | str] = {
+        "overall_recall": round(float(m.get("overall_recall", 0.0)), 6),
+        "holdout_recall": round(float(m.get("holdout_recall", 0.0)), 6),
+        "dev_recall": round(float(m.get("dev_recall", 0.0)), 6),
+        "confirmed_only_recall": round(float(m.get("confirmed_only_recall", 0.0)), 6),
+        "hit_rate": round(float(m.get("hit_rate", 0.0)), 6),
+        "findings_per_clip": round(float(m.get("findings_per_clip", 0.0)), 6),
+        "total_findings": round(float(m.get("total_findings", 0.0)), 2),
+        "flip_rate": round(float(m.get("flip_rate", 0.0)), 6),
+        "regressed_stable_items": int(m.get("regressed_stable_items", 0)),
+        "cost_per_clip_usd": round(float(m.get("cost_per_clip_usd", 0.0)), 6),
+        "total_cost_usd": round(float(m.get("total_cost_usd", 0.0)), 6),
+        "mean_clip_latency_sec": round(float(m.get("mean_clip_latency_sec", 0.0)), 3),
+        "max_clip_latency_sec": round(float(m.get("max_clip_latency_sec", 0.0)), 3),
+        "total_token_count": int(m.get("total_token_count", 0)),
+    }
+    if m.get("mean_point_timestamp_drift_sec") is not None:
+        metrics["mean_point_timestamp_drift_sec"] = round(
+            float(m["mean_point_timestamp_drift_sec"]), 3
+        )
+    if m.get("max_point_timestamp_drift_sec") is not None:
+        metrics["max_point_timestamp_drift_sec"] = int(m["max_point_timestamp_drift_sec"])
+
+    for sop_cat, cat_obj in sorted((record.get("sop_category_recall") or {}).items()):
+        safe_cat = re.sub(r"[^a-zA-Z0-9_]+", "_", str(sop_cat)).strip("_")
+        metrics[f"recall_sop_{safe_cat}"] = round(float(cat_obj.get("recall", 0.0)), 6)
+
+    for of_key, of_obj in sorted((record.get("outlet_focus_recall") or {}).items()):
+        safe_of = re.sub(r"[^a-zA-Z0-9_]+", "_", str(of_key)).strip("_")
+        metrics[f"recall_store_{safe_of}"] = round(float(of_obj.get("recall", 0.0)), 6)
+
+    return {
+        "run_name": run_name,
+        "params": params,
+        "metrics": metrics,
+    }
+
+
+def publish_vertex_experiment_records(
+    project_id: str,
+    records: Sequence[dict[str, Any]],
+    *,
+    location: str = DEFAULT_EXPERIMENT_LOCATION,
+    experiment_name: str = DEFAULT_ROUND_EXPERIMENT_NAME,
+    experiment_description: str = (
+        "CHAGEE CCTV AI Audit MLOps Evaluation (Model x SOP Version x Round Comparison)"
+    ),
+    is_round_average: bool = False,
+    credentials: Any = None,
+) -> list[str]:
+    """Log evaluation records as runs in Vertex AI / Agent Platform Experiments."""
+    if not project_id or not records:
+        return []
+
+    try:
+        from google.cloud import aiplatform
+    except ImportError as exc:
+        logger.warning(
+            "google-cloud-aiplatform is not installed; skipping Vertex AI Experiment logging: %s",
+            exc,
+        )
+        return []
+
+    exp_slug = slugify_experiment_id(experiment_name, max_len=60)
+    aiplatform.init(
+        project=project_id,
+        location=location,
+        experiment=exp_slug,
+        experiment_description=experiment_description,
+        experiment_tensorboard=False,
+        credentials=credentials,
+    )
+
+    logged_runs: list[str] = []
+    for rec in records:
+        payload = build_vertex_experiment_run_payload(
+            rec, is_round_average=is_round_average
+        )
+        run_name = payload["run_name"]
+        try:
+            try:
+                aiplatform.start_run(run=run_name, resume=True)
+            except Exception:
+                aiplatform.start_run(run=run_name, resume=False)
+            try:
+                aiplatform.log_params(payload["params"])
+                aiplatform.log_metrics(payload["metrics"])
+            finally:
+                aiplatform.end_run()
+            logged_runs.append(run_name)
+        except Exception as exc:
+            logger.warning(
+                "Failed to log run '%s' to Vertex AI Experiment '%s': %s",
+                run_name,
+                exp_slug,
+                exc,
+            )
+
+    logger.info(
+        "Logged %d/%d evaluation runs to Vertex AI Experiment '%s' (%s/%s): %s",
+        len(logged_runs),
+        len(records),
+        exp_slug,
+        project_id,
+        location,
+        logged_runs,
+    )
+    return logged_runs
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Publish a CCTV AI Audit evaluation monitoring_record.json to GCP Cloud Monitoring"
+        description="Publish a CCTV AI Audit evaluation monitoring_record.json to GCP Cloud Monitoring & Vertex AI Experiments"
     )
     parser.add_argument("--project-id", required=True, help="Target GCP project ID")
     parser.add_argument(
@@ -675,11 +845,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Optional RFC3339 UTC timestamp override (defaults to current UTC time when original timestamp is >24h old)",
     )
+    parser.add_argument(
+        "--experiment-location",
+        default=DEFAULT_EXPERIMENT_LOCATION,
+        help="Vertex AI / Agent Platform Experiment region (default: asia-southeast1)",
+    )
+    parser.add_argument(
+        "--skip-experiments",
+        action="store_true",
+        help="Skip logging to Vertex AI / Agent Platform Experiments",
+    )
     args = parser.parse_args(argv)
     record = json.loads(args.record_json.read_text(encoding="utf-8"))
     ts = build_cloud_monitoring_timeseries(record, emit_timestamp=args.emit_timestamp)
     count = publish_eval_timeseries(args.project_id, ts)
     print(f"Published {count} TimeSeries points for run_id={record.get('run_id')} to {args.project_id}.")
+    if not args.skip_experiments:
+        try:
+            runs = publish_vertex_experiment_records(
+                args.project_id,
+                [record],
+                location=args.experiment_location,
+                experiment_name=DEFAULT_RUNS_EXPERIMENT_NAME,
+                experiment_description="CHAGEE CCTV AI Audit Per-Run Detailed Evaluation Ledger",
+                is_round_average=False,
+            )
+            print(f"Logged Vertex AI Experiment run(s): {runs}")
+        except Exception as exc:
+            logger.warning("Vertex AI Experiment publish warning (non-fatal): %s", exc)
     return 0
 
 
@@ -687,4 +880,5 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(main())
+
 

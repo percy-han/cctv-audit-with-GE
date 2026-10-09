@@ -371,6 +371,58 @@ class MonitoringPublisherTest(unittest.TestCase):
                 self.assertEqual(t["metric"]["labels"]["runs_count"], "2")
                 self.assertNotIn("run_id", t["metric"]["labels"])
 
+            exp_round_payload = mp.build_vertex_experiment_run_payload(r_avg, is_round_average=True)
+            self.assertEqual(exp_round_payload["run_name"], "r01-v2-6-r01-gemini-3-8-flash")
+            self.assertEqual(exp_round_payload["params"]["sop_version"], "v2.6_r01")
+            self.assertEqual(exp_round_payload["params"]["model_version"], "gemini-3.8-flash")
+            self.assertEqual(exp_round_payload["params"]["runs_count"], 2)
+            self.assertAlmostEqual(
+                exp_round_payload["metrics"]["overall_recall"], (0.60 + 0.7895) / 2, places=5
+            )
+            self.assertIn("recall_sop_A_Handwashing", exp_round_payload["metrics"])
+
+            exp_run_payload = mp.build_vertex_experiment_run_payload(rec, is_round_average=False)
+            self.assertEqual(exp_run_payload["run_name"], "r01-r01-b-v2-6-r01")
+            self.assertEqual(exp_run_payload["params"]["runs_count"], 1)
+
+            with (
+                mock.patch("google.cloud.aiplatform.init") as mock_init,
+                mock.patch(
+                    "google.cloud.aiplatform.start_run",
+                    side_effect=[
+                        RuntimeError("404 Context not found"),
+                        RuntimeError("403 PermissionDenied on first run"),
+                        RuntimeError("404 Context not found"),
+                        mock.MagicMock(),
+                    ],
+                ) as mock_start,
+                mock.patch("google.cloud.aiplatform.log_params") as mock_params,
+                mock.patch("google.cloud.aiplatform.log_metrics") as mock_metrics,
+                mock.patch("google.cloud.aiplatform.end_run") as mock_end,
+            ):
+                bad_avg = {**r_avg, "round_id": "r00", "sop_version": "v2.5_r00"}
+                logged = mp.publish_vertex_experiment_records(
+                    "study-project-496907",
+                    [bad_avg, r_avg],
+                    location="asia-southeast1",
+                    experiment_name="chagee-cctv-audit-eval",
+                    is_round_average=True,
+                )
+            self.assertEqual(logged, ["r01-v2-6-r01-gemini-3-8-flash"])
+            mock_init.assert_called_once()
+            self.assertEqual(
+                mock_start.call_args_list,
+                [
+                    mock.call(run="r00-v2-5-r00-gemini-3-8-flash", resume=True),
+                    mock.call(run="r00-v2-5-r00-gemini-3-8-flash", resume=False),
+                    mock.call(run="r01-v2-6-r01-gemini-3-8-flash", resume=True),
+                    mock.call(run="r01-v2-6-r01-gemini-3-8-flash", resume=False),
+                ],
+            )
+            mock_params.assert_called_once_with(exp_round_payload["params"])
+            mock_metrics.assert_called_once_with(exp_round_payload["metrics"])
+            mock_end.assert_called_once()
+
         fake_sess = mock.MagicMock()
         fake_resp = mock.MagicMock(status_code=200, text="{}")
         fake_sess.post.return_value = fake_resp
@@ -382,4 +434,5 @@ class MonitoringPublisherTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 
