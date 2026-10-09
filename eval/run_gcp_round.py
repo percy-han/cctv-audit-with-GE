@@ -68,7 +68,9 @@ from eval.monitoring_publisher import (  # noqa: E402
     append_eval_history_jsonl,
     build_cloud_monitoring_timeseries,
     build_eval_monitoring_record,
+    build_round_monitoring_timeseries,
     publish_eval_timeseries,
+    write_round_averages_jsonl,
 )
 from eval.score_run import render_markdown, score_run  # noqa: E402
 from eval.tune_loop import (  # noqa: E402
@@ -609,11 +611,28 @@ async def run_round_async(args: argparse.Namespace) -> int:
     (res_dir / "monitoring_record.json").write_text(
         json.dumps(mon_record, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    append_eval_history_jsonl(mon_record, args.rounds_dir / "eval_history.jsonl")
+    history_jsonl = args.rounds_dir / "eval_history.jsonl"
+    append_eval_history_jsonl(mon_record, history_jsonl)
+    round_averages = write_round_averages_jsonl(
+        history_jsonl,
+        args.rounds_dir / "eval_round_averages.jsonl",
+    )
+    matching_round_avg = next(
+        (
+            r
+            for r in reversed(round_averages)
+            if r.get("round_id") == args.round
+            and r.get("model_version") == mon_record["model_version"]
+            and r.get("sop_version") == mon_record["sop_version"]
+        ),
+        None,
+    )
 
     if not getattr(args, "skip_monitoring_publish", False) and not args.skip_gcs_sync:
         try:
             ts_payload = build_cloud_monitoring_timeseries(mon_record)
+            if matching_round_avg is not None:
+                ts_payload.extend(build_round_monitoring_timeseries(matching_round_avg))
             await asyncio.to_thread(
                 publish_eval_timeseries,
                 cfg.gcp_project,
@@ -649,7 +668,7 @@ async def run_round_async(args: argparse.Namespace) -> int:
 
         st_client = storage.Client(project=cfg.gcp_project)
         bucket = st_client.bucket(cfg.staging_bucket)
-        for fname in ("ledger.json", "ledger.md", "eval_history.jsonl"):
+        for fname in ("ledger.json", "ledger.md", "eval_history.jsonl", "eval_round_averages.jsonl"):
             fpath = args.rounds_dir / fname
             if fpath.exists():
                 bucket.blob(f"eval/rounds/{fname}").upload_from_filename(str(fpath))

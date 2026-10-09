@@ -24,6 +24,7 @@ from eval.tune_loop import evaluate_run_guardrails
 logger = logging.getLogger("eval.monitoring_publisher")
 
 METRIC_PREFIX = "custom.googleapis.com/cctv_audit/eval"
+ROUND_METRIC_PREFIX = "custom.googleapis.com/cctv_audit/eval_round"
 MAX_TIMESERIES_PER_BATCH = 200
 
 
@@ -233,6 +234,7 @@ def _make_gauge_series(
     end_time: str,
     double_value: float | None = None,
     int64_value: int | None = None,
+    metric_prefix: str = METRIC_PREFIX,
 ) -> dict[str, Any]:
     if int64_value is not None:
         value_type = "INT64"
@@ -244,7 +246,7 @@ def _make_gauge_series(
     clean_labels = {k: str(v)[:100] for k, v in labels.items() if v is not None}
     return {
         "metric": {
-            "type": f"{METRIC_PREFIX}/{metric_name}",
+            "type": f"{metric_prefix}/{metric_name}",
             "labels": clean_labels,
         },
         "resource": {
@@ -262,28 +264,17 @@ def _make_gauge_series(
     }
 
 
-def build_cloud_monitoring_timeseries(
+def _build_timeseries_with_prefix(
     record: dict[str, Any],
     *,
+    metric_prefix: str,
+    base_labels: dict[str, str],
     emit_timestamp: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Build GCP Cloud Monitoring v3 ``TimeSeries`` objects from an evaluation record.
-
-    Note: Cloud Monitoring custom metrics require ``interval.endTime`` to be within the last
-    25 hours when written live. ``emit_timestamp`` defaults to ``datetime.now(timezone.utc)``
-    when publishing live, or can be passed explicitly in tests.
-    """
     project_id = str(record["project_id"])
     end_time = emit_timestamp or datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
         "+00:00", "Z"
     )
-    base_labels = {
-        "model_version": str(record.get("model_version") or "unknown"),
-        "sop_version": str(record.get("sop_version") or "unknown"),
-        "media_mode": str(record.get("media_mode") or "agentic"),
-        "round_id": str(record.get("round_id") or "r00"),
-        "run_id": str(record.get("run_id") or "unknown"),
-    }
     m = record.get("metrics") or {}
     series: list[dict[str, Any]] = []
 
@@ -307,6 +298,7 @@ def build_cloud_monitoring_timeseries(
                     labels=base_labels,
                     end_time=end_time,
                     double_value=float(m[name]),
+                    metric_prefix=metric_prefix,
                 )
             )
 
@@ -318,6 +310,7 @@ def build_cloud_monitoring_timeseries(
                 labels=base_labels,
                 end_time=end_time,
                 double_value=float(m["mean_point_timestamp_drift_sec"]),
+                metric_prefix=metric_prefix,
             )
         )
 
@@ -328,6 +321,7 @@ def build_cloud_monitoring_timeseries(
             labels=base_labels,
             end_time=end_time,
             int64_value=int(m.get("regressed_stable_items") or 0),
+            metric_prefix=metric_prefix,
         )
     )
 
@@ -339,6 +333,7 @@ def build_cloud_monitoring_timeseries(
                 labels={**base_labels, "sop_category": str(sop_cat)},
                 end_time=end_time,
                 double_value=float(cat_obj.get("recall", 0.0)),
+                metric_prefix=metric_prefix,
             )
         )
 
@@ -355,6 +350,7 @@ def build_cloud_monitoring_timeseries(
                 },
                 end_time=end_time,
                 double_value=float(of_obj.get("recall", 0.0)),
+                metric_prefix=metric_prefix,
             )
         )
 
@@ -372,19 +368,234 @@ def build_cloud_monitoring_timeseries(
                 labels=v_labels,
                 end_time=end_time,
                 double_value=float(v_obj.get("recall", 0.0)),
+                metric_prefix=metric_prefix,
             )
         )
-        series.append(
-            _make_gauge_series(
-                project_id=project_id,
-                metric_name="video_findings_count",
-                labels=v_labels,
-                end_time=end_time,
-                int64_value=int(v_obj.get("findings_count") or 0),
+        if metric_prefix == ROUND_METRIC_PREFIX:
+            series.append(
+                _make_gauge_series(
+                    project_id=project_id,
+                    metric_name="video_findings_count",
+                    labels=v_labels,
+                    end_time=end_time,
+                    double_value=float(v_obj.get("findings_count") or 0.0),
+                    metric_prefix=metric_prefix,
+                )
             )
-        )
+        else:
+            series.append(
+                _make_gauge_series(
+                    project_id=project_id,
+                    metric_name="video_findings_count",
+                    labels=v_labels,
+                    end_time=end_time,
+                    int64_value=int(round(float(v_obj.get("findings_count") or 0))),
+                    metric_prefix=metric_prefix,
+                )
+            )
 
     return series
+
+
+def build_cloud_monitoring_timeseries(
+    record: dict[str, Any],
+    *,
+    emit_timestamp: str | None = None,
+) -> list[dict[str, Any]]:
+    """Build per-run GCP Cloud Monitoring v3 ``TimeSeries`` objects under ``eval/*``."""
+    base_labels = {
+        "model_version": str(record.get("model_version") or "unknown"),
+        "sop_version": str(record.get("sop_version") or "unknown"),
+        "media_mode": str(record.get("media_mode") or "agentic"),
+        "round_id": str(record.get("round_id") or "r00"),
+        "run_id": str(record.get("run_id") or "unknown"),
+    }
+    return _build_timeseries_with_prefix(
+        record,
+        metric_prefix=METRIC_PREFIX,
+        base_labels=base_labels,
+        emit_timestamp=emit_timestamp,
+    )
+
+
+def build_round_monitoring_timeseries(
+    round_record: dict[str, Any],
+    *,
+    emit_timestamp: str | None = None,
+) -> list[dict[str, Any]]:
+    """Build round-averaged GCP Cloud Monitoring v3 ``TimeSeries`` objects under ``eval_round/*``.
+
+    Each ``(round_id, model_version, sop_version, media_mode)`` combination emits exactly ONE
+    averaged point per metric so trend charts show a single representative point per round
+    without duplicate same-round run dots.
+    """
+    base_labels = {
+        "model_version": str(round_record.get("model_version") or "unknown"),
+        "sop_version": str(round_record.get("sop_version") or "unknown"),
+        "media_mode": str(round_record.get("media_mode") or "agentic"),
+        "round_id": str(round_record.get("round_id") or "r00"),
+        "runs_count": str(int(round_record.get("runs_count") or 1)),
+    }
+    return _build_timeseries_with_prefix(
+        round_record,
+        metric_prefix=ROUND_METRIC_PREFIX,
+        base_labels=base_labels,
+        emit_timestamp=emit_timestamp,
+    )
+
+
+def aggregate_round_monitoring_record(records_for_round: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Average multiple per-run monitoring records for the same ``(round_id, model_version, sop_version)``."""
+    if not records_for_round:
+        raise ValueError("records_for_round must not be empty")
+
+    n = len(records_for_round)
+    last = records_for_round[-1]
+    mean_keys = (
+        "overall_recall",
+        "holdout_recall",
+        "dev_recall",
+        "confirmed_only_recall",
+        "findings_per_clip",
+        "hit_rate",
+        "cost_per_clip_usd",
+        "total_cost_usd",
+        "mean_clip_latency_sec",
+    )
+    avg_metrics: dict[str, Any] = {}
+    for k in mean_keys:
+        vals = [
+            float((r.get("metrics") or {}).get(k, 0.0))
+            for r in records_for_round
+            if (r.get("metrics") or {}).get(k) is not None
+        ]
+        avg_metrics[k] = round(sum(vals) / len(vals), 6) if vals else 0.0
+
+    total_findings_vals = [int((r.get("metrics") or {}).get("total_findings") or 0) for r in records_for_round]
+    avg_metrics["total_findings"] = round(sum(total_findings_vals) / n, 2)
+
+    reg_vals = [int((r.get("metrics") or {}).get("regressed_stable_items") or 0) for r in records_for_round]
+    avg_metrics["regressed_stable_items"] = max(reg_vals) if reg_vals else 0
+    avg_metrics["guardrails_passed"] = all(
+        bool((r.get("metrics") or {}).get("guardrails_passed", False)) for r in records_for_round
+    )
+
+    flip_vals = [float((r.get("metrics") or {}).get("flip_rate") or 0.0) for r in records_for_round]
+    avg_metrics["flip_rate"] = round(max(flip_vals), 6) if flip_vals else 0.0
+
+    drift_vals = [
+        float((r.get("metrics") or {})["mean_point_timestamp_drift_sec"])
+        for r in records_for_round
+        if (r.get("metrics") or {}).get("mean_point_timestamp_drift_sec") is not None
+    ]
+    avg_metrics["mean_point_timestamp_drift_sec"] = (
+        round(sum(drift_vals) / len(drift_vals), 3) if drift_vals else None
+    )
+    max_drift_vals = [
+        int((r.get("metrics") or {})["max_point_timestamp_drift_sec"])
+        for r in records_for_round
+        if (r.get("metrics") or {}).get("max_point_timestamp_drift_sec") is not None
+    ]
+    avg_metrics["max_point_timestamp_drift_sec"] = max(max_drift_vals) if max_drift_vals else None
+
+    last_m = last.get("metrics") or {}
+    avg_metrics["point_window_sec"] = int(last_m.get("point_window_sec", 20))
+    avg_metrics["window_sec"] = int(last_m.get("window_sec", 60))
+    max_lat_vals = [float((r.get("metrics") or {}).get("max_clip_latency_sec") or 0.0) for r in records_for_round]
+    avg_metrics["max_clip_latency_sec"] = round(max(max_lat_vals), 3) if max_lat_vals else 0.0
+    tok_vals = [int((r.get("metrics") or {}).get("total_token_count") or 0) for r in records_for_round]
+    avg_metrics["total_token_count"] = int(round(sum(tok_vals) / n))
+
+    # Aggregate sop_category_recall
+    cat_keys = sorted({k for r in records_for_round for k in (r.get("sop_category_recall") or {})})
+    avg_sop_cat: dict[str, Any] = {}
+    for ck in cat_keys:
+        objs = [(r.get("sop_category_recall") or {}).get(ck) for r in records_for_round]
+        objs = [o for o in objs if isinstance(o, dict)]
+        if objs:
+            avg_sop_cat[ck] = {
+                "points": round(sum(float(o.get("points", 0.0)) for o in objs) / len(objs), 4),
+                "rows": int(objs[-1].get("rows", 0)),
+                "recall": round(sum(float(o.get("recall", 0.0)) for o in objs) / len(objs), 6),
+            }
+
+    # Aggregate outlet_focus_recall
+    of_keys = sorted({k for r in records_for_round for k in (r.get("outlet_focus_recall") or {})})
+    avg_of: dict[str, Any] = {}
+    for ok in of_keys:
+        objs = [(r.get("outlet_focus_recall") or {}).get(ok) for r in records_for_round]
+        objs = [o for o in objs if isinstance(o, dict)]
+        if objs:
+            avg_of[ok] = {
+                "outlet_name": str(objs[-1].get("outlet_name") or ""),
+                "focus": str(objs[-1].get("focus") or ""),
+                "points": round(sum(float(o.get("points", 0.0)) for o in objs) / len(objs), 4),
+                "rows": int(objs[-1].get("rows", 0)),
+                "recall": round(sum(float(o.get("recall", 0.0)) for o in objs) / len(objs), 6),
+            }
+
+    # Aggregate video_breakdown
+    v_keys = sorted({k for r in records_for_round for k in (r.get("video_breakdown") or {})})
+    avg_vb: dict[str, Any] = {}
+    for vk in v_keys:
+        objs = [(r.get("video_breakdown") or {}).get(vk) for r in records_for_round]
+        objs = [o for o in objs if isinstance(o, dict)]
+        if objs:
+            avg_vb[vk] = {
+                "points": round(sum(float(o.get("points", 0.0)) for o in objs) / len(objs), 4),
+                "rows": int(objs[-1].get("rows", 0)),
+                "recall": round(sum(float(o.get("recall", 0.0)) for o in objs) / len(objs), 6),
+                "findings_count": round(sum(float(o.get("findings_count", 0.0)) for o in objs) / len(objs), 2),
+            }
+
+    return {
+        "timestamp": str(last.get("timestamp") or ""),
+        "project_id": str(last.get("project_id") or ""),
+        "round_id": str(last.get("round_id") or "r00"),
+        "runs_count": n,
+        "run_ids": [str(r.get("run_id") or "") for r in records_for_round],
+        "model_version": str(last.get("model_version") or "unknown"),
+        "sop_version": str(last.get("sop_version") or "unknown"),
+        "media_mode": str(last.get("media_mode") or "agentic"),
+        "judge_model": str(last.get("judge_model") or ""),
+        "metrics": avg_metrics,
+        "sop_category_recall": avg_sop_cat,
+        "outlet_focus_recall": avg_of,
+        "video_breakdown": avg_vb,
+    }
+
+
+def compute_all_round_averages(history_records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group ``history_records`` by ``(round_id, model_version, sop_version, media_mode)`` in order and average."""
+    groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    for rec in history_records:
+        key = (
+            str(rec.get("round_id") or "r00"),
+            str(rec.get("model_version") or "unknown"),
+            str(rec.get("sop_version") or "unknown"),
+            str(rec.get("media_mode") or "agentic"),
+        )
+        groups.setdefault(key, []).append(rec)
+    return [aggregate_round_monitoring_record(recs) for recs in groups.values()]
+
+
+def write_round_averages_jsonl(history_path: Path, output_path: Path | None = None) -> list[dict[str, Any]]:
+    """Read ``eval_history.jsonl``, compute per-round averages, and write ``eval_round_averages.jsonl``."""
+    if output_path is None:
+        output_path = history_path.parent / "eval_round_averages.jsonl"
+    records: list[dict[str, Any]] = []
+    if history_path.exists():
+        for line in history_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    round_records = compute_all_round_averages(records)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in round_records) + ("\n" if round_records else ""),
+        encoding="utf-8",
+    )
+    return round_records
 
 
 def append_eval_history_jsonl(record: dict[str, Any], history_path: Path) -> None:

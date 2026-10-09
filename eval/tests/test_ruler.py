@@ -334,11 +334,42 @@ class MonitoringPublisherTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             hist = Path(tmp) / "eval_history.jsonl"
+            rec_a = {
+                **rec,
+                "run_id": "r01_a",
+                "metrics": {**rec["metrics"], "overall_recall": 0.60, "findings_per_clip": 5.0},
+                "video_breakdown": {
+                    "a.mov": {"points": 1.0, "rows": 2, "recall": 0.5, "findings_count": 2},
+                },
+            }
+            mp.append_eval_history_jsonl(rec_a, hist)
             mp.append_eval_history_jsonl(rec, hist)
             mp.append_eval_history_jsonl(rec, hist)
             lines = [json.loads(line) for line in hist.read_text(encoding="utf-8").splitlines() if line.strip()]
-            self.assertEqual(len(lines), 1)
-            self.assertEqual(lines[0]["run_id"], "r01_b")
+            self.assertEqual(len(lines), 2)
+            self.assertEqual([r["run_id"] for r in lines], ["r01_a", "r01_b"])
+
+            round_avg_path = Path(tmp) / "eval_round_averages.jsonl"
+            round_avgs = mp.write_round_averages_jsonl(hist, round_avg_path)
+            self.assertEqual(len(round_avgs), 1)
+            r_avg = round_avgs[0]
+            self.assertEqual(r_avg["round_id"], "r01")
+            self.assertEqual(r_avg["runs_count"], 2)
+            self.assertEqual(r_avg["run_ids"], ["r01_a", "r01_b"])
+            self.assertAlmostEqual(r_avg["metrics"]["overall_recall"], (0.60 + 0.7895) / 2, places=5)
+            self.assertAlmostEqual(r_avg["metrics"]["findings_per_clip"], 2.5, places=5)
+            self.assertAlmostEqual(r_avg["video_breakdown"]["a.mov"]["findings_count"], 2.5, places=2)
+
+            round_ts = mp.build_round_monitoring_timeseries(r_avg, emit_timestamp="2026-10-09T00:00:00Z")
+            round_metric_types = {t["metric"]["type"] for t in round_ts}
+            self.assertIn("custom.googleapis.com/cctv_audit/eval_round/overall_recall", round_metric_types)
+            self.assertIn("custom.googleapis.com/cctv_audit/eval_round/sop_category_recall", round_metric_types)
+            self.assertIn("custom.googleapis.com/cctv_audit/eval_round/outlet_focus_recall", round_metric_types)
+            self.assertIn("custom.googleapis.com/cctv_audit/eval_round/video_recall", round_metric_types)
+            self.assertIn("custom.googleapis.com/cctv_audit/eval_round/video_findings_count", round_metric_types)
+            for t in round_ts:
+                self.assertEqual(t["metric"]["labels"]["runs_count"], "2")
+                self.assertNotIn("run_id", t["metric"]["labels"])
 
         fake_sess = mock.MagicMock()
         fake_resp = mock.MagicMock(status_code=200, text="{}")
