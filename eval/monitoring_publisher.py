@@ -962,7 +962,10 @@ def publish_agent_platform_evaluation(
     bucket = storage_client.bucket(bucket_name)
     client = vertexai.Client(project=project_id, location=location)
 
-    overall_recall = float((score_doc.get("summary") or {}).get("overall_recall", 0.0))
+    recall_all = ((score_doc.get("recall") or {}).get("all") or {}).get("recall")
+    if recall_all is None:
+        recall_all = (score_doc.get("summary") or {}).get("overall_recall", 0.0)
+    overall_recall = float(recall_all or 0.0)
     desc = f"{sop_version} · {model_version} (Recall {overall_recall * 100:.1f}%)"
     agent_cfg = types.evals.AgentConfig(
         agent_id="chagee_cctv_audit_agent",
@@ -1062,6 +1065,11 @@ def publish_agent_platform_evaluation(
         evaluation_items=item_resource_names,
         display_name=f"CHAGEE CCTV Agent Golden Set — {round_id} ({run_id})",
     )
+    # Note: EvaluationExperiment.labels is a free-form proto map<string, string> in
+    # google.cloud.aiplatform.v1beta1.EvaluationExperiment (not a GCE label), and the
+    # Cloud Console Angular UI (agents/evaluation/details/details_resolver.ts &
+    # get_started_subtask.ts) requires the full EvaluationSet resource path in
+    # labels['vertex-ai-evaluation-set-name'] so it can call getEvaluationSet(evalSetName).
     exp_labels: dict[str, str] = {
         "vertex-ai-evaluation-set-name": eval_set.name,
         "vertex-ai-evaluation-agent-engine-location": location,

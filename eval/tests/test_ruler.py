@@ -515,6 +515,7 @@ class MonitoringPublisherTest(unittest.TestCase):
             },
         )
         exp_call_kwargs = fake_eval_client.evals.create_evaluation_experiment.call_args.kwargs
+        self.assertIn("Recall 79.0%", exp_call_kwargs["display_name"])
         self.assertEqual(
             exp_call_kwargs["labels"]["vertex-ai-evaluation-agent-engine-id"],
             "9876543210987654321",
