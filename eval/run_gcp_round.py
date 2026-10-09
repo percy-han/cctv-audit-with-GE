@@ -65,6 +65,7 @@ from cctv_audit.video_ingestor import (  # noqa: E402
     VideoSliceSegment,
 )
 from eval.monitoring_publisher import (  # noqa: E402
+    DEFAULT_AGENT_EVAL_LOCATION,
     DEFAULT_EXPERIMENT_LOCATION,
     DEFAULT_ROUND_EXPERIMENT_NAME,
     DEFAULT_RUNS_EXPERIMENT_NAME,
@@ -72,6 +73,7 @@ from eval.monitoring_publisher import (  # noqa: E402
     build_cloud_monitoring_timeseries,
     build_eval_monitoring_record,
     build_round_monitoring_timeseries,
+    publish_agent_platform_evaluation,
     publish_eval_timeseries,
     publish_vertex_experiment_records,
     write_round_averages_jsonl,
@@ -672,6 +674,28 @@ async def run_round_async(args: argparse.Namespace) -> int:
                 )
             except Exception as exc:
                 logger.warning("Vertex AI Experiments round-avg publish warning (non-fatal for eval run): %s", exc)
+        try:
+            golden_rows = [
+                json.loads(line)
+                for line in args.golden.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            agent_eval_loc = os.environ.get("VERTEX_AGENT_EVAL_LOCATION") or DEFAULT_AGENT_EVAL_LOCATION
+            await asyncio.to_thread(
+                publish_agent_platform_evaluation,
+                project_id=cfg.gcp_project,
+                gcs_bucket=cfg.staging_bucket,
+                round_id=args.round,
+                run_id=run_id,
+                sop_version=str(prompt_cfg.active_prompt_version),
+                model_version=str(prompt_cfg.active_model_version),
+                score_doc=score_doc,
+                golden_items=golden_rows,
+                job_docs=job_docs,
+                location=agent_eval_loc,
+            )
+        except Exception as exc:
+            logger.warning("Agent Platform Evaluation publish warning (non-fatal for eval run): %s", exc)
 
     if not args.skip_gcs_sync:
         gcs_prefix = f"eval/rounds/{args.round}"

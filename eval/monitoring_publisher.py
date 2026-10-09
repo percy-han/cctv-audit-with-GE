@@ -29,6 +29,7 @@ ROUND_METRIC_PREFIX = "custom.googleapis.com/cctv_audit/eval_round"
 MAX_TIMESERIES_PER_BATCH = 200
 
 DEFAULT_EXPERIMENT_LOCATION = "asia-southeast1"
+DEFAULT_AGENT_EVAL_LOCATION = "us-central1"
 DEFAULT_ROUND_EXPERIMENT_NAME = "chagee-cctv-audit-eval"
 DEFAULT_RUNS_EXPERIMENT_NAME = "chagee-cctv-audit-eval-runs"
 
@@ -825,6 +826,297 @@ def publish_vertex_experiment_records(
         logged_runs,
     )
     return logged_runs
+
+
+def build_agent_platform_evaluation_items(
+    *,
+    round_id: str,
+    run_id: str,
+    sop_version: str,
+    model_version: str,
+    score_doc: dict[str, Any],
+    golden_items: Sequence[dict[str, Any]],
+    job_docs: Sequence[dict[str, Any]],
+    agent_id: str = "chagee_cctv_audit_agent",
+    agent_engine_id: str = "",
+) -> list[dict[str, Any]]:
+    """Build structured ``EvaluationItemRequest`` dicts for Gemini Enterprise Agent Platform Evaluation.
+
+    Each item represents one golden annotation part with:
+    - ``prompt``: the golden annotation metadata and reference text
+    - ``golden_response``: the reference text
+    - ``candidate_responses``: ``AgentData`` containing the user prompt event,
+      the ``analyze_cctv_segment`` tool call & response events, and the final
+      formatted response containing the ruler verdict and candidate findings.
+    """
+    from eval import score_run
+
+    findings = score_run.flatten_findings(list(job_docs))
+    part_score_map: dict[str, dict[str, Any]] = {}
+    for item in score_doc.get("items") or []:
+        for p in item.get("parts") or []:
+            part_score_map[str(p.get("part_id") or "")] = p
+
+    items_out: list[dict[str, Any]] = []
+    for item in golden_items:
+        sop_cat = score_run.classify_sop_category(item)
+        for part in item.get("parts") or []:
+            part_id = str(part.get("part_id") or "")
+            t_mode = score_run.classify_temporal_mode(item, part)
+            w_sec = score_run.part_window_sec(t_mode)
+            ref_text = score_run.render_reference(item, part)
+            video_filenames = list(item.get("video_filenames") or [])
+            cands = score_run.prefilter(
+                {"osd_times": part.get("osd_times") or [], "description": part.get("description") or ""},
+                video_filenames,
+                findings,
+                window_sec=w_sec,
+            )
+            raw_resp = score_run.render_candidates(cands) or "（该时间窗内无候选告警）"
+            p_info = part_score_map.get(part_id, {})
+            sc = float(p_info.get("score", 0.0))
+            expl = str(p_info.get("explanation", "MATCH=NONE; 该视频在标注时间窗内无候选条目"))
+            badge = "✓ 命中 (1.0)" if sc == 1.0 else ("◐ 半对 (0.5)" if sc == 0.5 else "✗ 漏检 (0.0)")
+            formatted_resp = (
+                f"【尺子判定：{badge}】\n"
+                f"【裁判理由】{expl}\n\n"
+                f"【AI 稽核原始候选条目】\n{raw_resp}"
+            )
+            outlet_name = str(item.get("outlet_name") or "")
+            split = str(item.get("split") or "holdout")
+            prompt_display = (
+                f"[{part_id} | {split} | {sop_cat} | {outlet_name} | {t_mode} ±{w_sec}s]\n"
+                f"{ref_text}"
+            )
+            items_out.append(
+                {
+                    "part_id": part_id,
+                    "display_name": f"{part_id} · {outlet_name} · {sop_cat}",
+                    "prompt_display": prompt_display,
+                    "reference_text": ref_text,
+                    "raw_response": raw_resp,
+                    "formatted_response": formatted_resp,
+                    "score": sc,
+                    "explanation": expl,
+                    "outlet_name": outlet_name,
+                    "video_filenames": video_filenames,
+                    "sop_category": sop_cat,
+                    "temporal_mode": t_mode,
+                    "window_sec": w_sec,
+                    "round_id": round_id,
+                    "run_id": run_id,
+                    "sop_version": sop_version,
+                    "model_version": model_version,
+                    "agent_id": agent_id,
+                    "agent_engine_id": agent_engine_id,
+                }
+            )
+    return items_out
+
+
+def publish_agent_platform_evaluation(
+    *,
+    project_id: str,
+    gcs_bucket: str,
+    round_id: str,
+    run_id: str,
+    sop_version: str,
+    model_version: str,
+    score_doc: dict[str, Any],
+    golden_items: Sequence[dict[str, Any]],
+    job_docs: Sequence[dict[str, Any]],
+    location: str = DEFAULT_AGENT_EVAL_LOCATION,
+    agent_engine_id: str = "",
+) -> dict[str, str]:
+    """Register and launch a server-side EvaluationExperiment + EvaluationRun in Agent Platform Evaluation UI."""
+    if not project_id or not gcs_bucket or not golden_items:
+        return {}
+
+    import os
+    import uuid
+    import vertexai
+    from vertexai import types
+    from google.cloud import storage
+    from google.genai import types as genai_types
+    from eval import score_run
+
+    resolved_engine_id = (
+        agent_engine_id
+        or os.environ.get("VERTEX_AGENT_ENGINE_ID", "").strip()
+    )
+    items_spec = build_agent_platform_evaluation_items(
+        round_id=round_id,
+        run_id=run_id,
+        sop_version=sop_version,
+        model_version=model_version,
+        score_doc=score_doc,
+        golden_items=golden_items,
+        job_docs=job_docs,
+        agent_engine_id=resolved_engine_id,
+    )
+    if not items_spec:
+        return {}
+
+    storage_client = storage.Client(project=project_id)
+    bucket_name = gcs_bucket.replace("gs://", "").strip("/").split("/")[0]
+    bucket = storage_client.bucket(bucket_name)
+    client = vertexai.Client(project=project_id, location=location)
+
+    overall_recall = float((score_doc.get("summary") or {}).get("overall_recall", 0.0))
+    desc = f"{sop_version} · {model_version} (Recall {overall_recall * 100:.1f}%)"
+    agent_cfg = types.evals.AgentConfig(
+        agent_id="chagee_cctv_audit_agent",
+        instruction=f"CHAGEE CCTV AI Audit Agent ({desc})",
+        description=f"ReasoningEngine {resolved_engine_id or 'chagee-cctv-audit'} ({round_id}/{run_id})",
+    )
+    dest_prefix = f"agent_platform_eval/agent_eval_{round_id}_{run_id}"
+    item_resource_names: list[str] = []
+
+    for spec in items_spec:
+        part_id = spec["part_id"]
+        user_event = types.evals.AgentEvent(
+            author="user",
+            content=genai_types.Content(
+                role="user",
+                parts=[genai_types.Part(text=spec["prompt_display"])],
+            ),
+        )
+        tool_call_event = types.evals.AgentEvent(
+            author="chagee_cctv_audit_agent",
+            content=genai_types.Content(
+                role="model",
+                parts=[
+                    genai_types.Part(
+                        function_call=genai_types.FunctionCall(
+                            name="analyze_cctv_segment",
+                            args={
+                                "outlet_name": spec["outlet_name"],
+                                "video_files": spec["video_filenames"],
+                                "sop_version": sop_version,
+                                "temporal_mode": spec["temporal_mode"],
+                                "window_sec": spec["window_sec"],
+                            },
+                        )
+                    )
+                ],
+            ),
+        )
+        tool_resp_event = types.evals.AgentEvent(
+            author="analyze_cctv_segment",
+            content=genai_types.Content(
+                role="user",
+                parts=[
+                    genai_types.Part(
+                        function_response=genai_types.FunctionResponse(
+                            name="analyze_cctv_segment",
+                            response={
+                                "findings": spec["raw_response"],
+                                "ruler_score": spec["score"],
+                                "ruler_explanation": spec["explanation"],
+                            },
+                        )
+                    )
+                ],
+            ),
+        )
+        model_event = types.evals.AgentEvent(
+            author="chagee_cctv_audit_agent",
+            content=genai_types.Content(
+                role="model",
+                parts=[genai_types.Part(text=spec["formatted_response"])],
+            ),
+        )
+        agent_data = types.evals.AgentData(
+            turns=[
+                types.evals.ConversationTurn(
+                    turn_index=0,
+                    turn_id=f"{part_id}_turn_0",
+                    events=[user_event, tool_call_event, tool_resp_event, model_event],
+                )
+            ],
+            agents={"chagee_cctv_audit_agent": agent_cfg},
+        )
+        req = types.EvaluationItemRequest(
+            prompt=types.EvaluationPrompt(text=spec["prompt_display"]),
+            golden_response=types.CandidateResponse(text=spec["reference_text"]),
+            candidate_responses=[
+                types.CandidateResponse(
+                    candidate="chagee_cctv_audit_agent",
+                    agent_data=agent_data,
+                )
+            ],
+        )
+        blob_path = f"{dest_prefix}/agent_req_{part_id}_{uuid.uuid4().hex[:8]}.json"
+        bucket.blob(blob_path).upload_from_string(
+            json.dumps(req.model_dump(mode="json", by_alias=True, exclude_none=True), ensure_ascii=False),
+            content_type="application/json",
+        )
+        eval_item = client.evals.create_evaluation_item(
+            evaluation_item_type=types.EvaluationItemType.REQUEST,
+            gcs_uri=f"gs://{bucket_name}/{blob_path}",
+            display_name=spec["display_name"],
+        )
+        item_resource_names.append(eval_item.name)
+
+    eval_set = client.evals.create_evaluation_set(
+        evaluation_items=item_resource_names,
+        display_name=f"CHAGEE CCTV Agent Golden Set — {round_id} ({run_id})",
+    )
+    exp_labels: dict[str, str] = {
+        "vertex-ai-evaluation-set-name": eval_set.name,
+        "vertex-ai-evaluation-agent-engine-location": location,
+        "round-id": slugify_experiment_id(round_id, max_len=60),
+        "run-id": slugify_experiment_id(run_id, max_len=60),
+    }
+    if resolved_engine_id:
+        exp_labels["vertex-ai-evaluation-agent-engine-id"] = resolved_engine_id
+
+    eval_exp = client.evals.create_evaluation_experiment(
+        display_name=f"CHAGEE CCTV AI Audit — {round_id} ({desc})",
+        labels=exp_labels,
+    )
+    label_hit_metric = types.LLMMetric(
+        name="label_hit",
+        prompt_template=score_run.JUDGE_TEMPLATE,
+    )
+    run_kwargs: dict[str, Any] = {
+        "name": f"{round_id}_{run_id}_agent_eval",
+        "display_name": f"CHAGEE CCTV Agent Eval — {round_id} ({run_id})",
+        "dataset": types.EvaluationRunDataSource(evaluation_set=eval_set.name),
+        "metrics": [
+            label_hit_metric,
+            types.RubricMetric.FINAL_RESPONSE_QUALITY,
+        ],
+        "dest": f"gs://{bucket_name}/{dest_prefix}/outputs",
+        "agent_info": types.evals.AgentInfo(
+            name="chagee_cctv_audit_agent",
+            agents={"chagee_cctv_audit_agent": agent_cfg},
+        ),
+        "evaluation_experiment": eval_exp.name,
+        "labels": {
+            k: v
+            for k, v in exp_labels.items()
+            if k != "vertex-ai-evaluation-set-name"
+        },
+    }
+    if resolved_engine_id:
+        run_kwargs["agent"] = (
+            f"projects/{project_id}/locations/{location}/reasoningEngines/{resolved_engine_id}"
+        )
+
+    eval_run = client.evals.create_evaluation_run(**run_kwargs)
+    logger.info(
+        "Launched Agent Platform EvaluationRun for %s/%s: experiment=%s, run=%s",
+        round_id,
+        run_id,
+        eval_exp.name,
+        eval_run.name,
+    )
+    return {
+        "experiment_name": str(eval_exp.name),
+        "evaluation_set_name": str(eval_set.name),
+        "evaluation_run_name": str(eval_run.name),
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:

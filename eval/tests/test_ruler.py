@@ -307,7 +307,7 @@ class MonitoringPublisherTest(unittest.TestCase):
             ]
         }
         rec = mp.build_eval_monitoring_record(
-            project_id="study-project-496907",
+            project_id="example-project",
             round_id="r01",
             run_id="r01_b",
             model_version="gemini-3.8-flash",
@@ -402,7 +402,7 @@ class MonitoringPublisherTest(unittest.TestCase):
             ):
                 bad_avg = {**r_avg, "round_id": "r00", "sop_version": "v2.5_r00"}
                 logged = mp.publish_vertex_experiment_records(
-                    "study-project-496907",
+                    "example-project",
                     [bad_avg, r_avg],
                     location="asia-southeast1",
                     experiment_name="chagee-cctv-audit-eval",
@@ -427,9 +427,102 @@ class MonitoringPublisherTest(unittest.TestCase):
         fake_resp = mock.MagicMock(status_code=200, text="{}")
         fake_sess.post.return_value = fake_resp
         with mock.patch("google.auth.transport.requests.AuthorizedSession", return_value=fake_sess):
-            res = mp.publish_eval_timeseries("study-project-496907", ts, credentials=mock.MagicMock())
+            res = mp.publish_eval_timeseries("example-project", ts, credentials=mock.MagicMock())
         self.assertEqual(res, len(ts))
         self.assertEqual(fake_sess.post.call_count, 1)
+
+        sample_golden = [
+            {
+                "item_id": "R02",
+                "sheet_row": 2,
+                "split": "dev",
+                "outlet_name": "1-Bau Cat",
+                "focus": "Handwashing",
+                "audit_clause": "4.2.1 Hand Washing Procedure",
+                "video_filenames": ["Footage 1.mov"],
+                "parts": [
+                    {
+                        "part_id": "R02_p0",
+                        "osd_times": ["12:17:45"],
+                        "description": "Not wash hand for at least 20 seconds",
+                    }
+                ],
+            }
+        ]
+        score_with_parts = {
+            **score_doc,
+            "items": [
+                {
+                    "item_id": "R02",
+                    "score": 1.0,
+                    "parts": [{"part_id": "R02_p0", "score": 1.0, "explanation": "MATCH=0; 命中"}],
+                }
+            ],
+        }
+        items_spec = mp.build_agent_platform_evaluation_items(
+            round_id="r01",
+            run_id="r01_run1",
+            sop_version="v2.6_r01",
+            model_version="gemini-3.8-flash",
+            score_doc=score_with_parts,
+            golden_items=sample_golden,
+            job_docs=job_docs,
+            agent_engine_id="9876543210987654321",
+        )
+        self.assertEqual(len(items_spec), 1)
+        self.assertEqual(items_spec[0]["part_id"], "R02_p0")
+        self.assertIn("✓ 命中 (1.0)", items_spec[0]["formatted_response"])
+        self.assertEqual(items_spec[0]["agent_engine_id"], "9876543210987654321")
+
+        from types import SimpleNamespace
+
+        fake_eval_client = mock.MagicMock()
+        fake_eval_client.evals.create_evaluation_item.return_value = SimpleNamespace(
+            name="projects/123456789012/locations/us-central1/evaluationItems/111"
+        )
+        fake_eval_client.evals.create_evaluation_set.return_value = SimpleNamespace(
+            name="projects/123456789012/locations/us-central1/evaluationSets/222"
+        )
+        fake_eval_client.evals.create_evaluation_experiment.return_value = SimpleNamespace(
+            name="projects/123456789012/locations/us-central1/evaluationExperiments/333"
+        )
+        fake_eval_client.evals.create_evaluation_run.return_value = SimpleNamespace(
+            name="projects/123456789012/locations/us-central1/evaluationRuns/444"
+        )
+        fake_storage_client = mock.MagicMock()
+        with (
+            mock.patch("vertexai.Client", return_value=fake_eval_client),
+            mock.patch("google.cloud.storage.Client", return_value=fake_storage_client),
+        ):
+            pub_res = mp.publish_agent_platform_evaluation(
+                project_id="example-project",
+                gcs_bucket="gs://example-project-tfstate",
+                round_id="r01",
+                run_id="r01_run1",
+                sop_version="v2.6_r01",
+                model_version="gemini-3.8-flash",
+                score_doc=score_with_parts,
+                golden_items=sample_golden,
+                job_docs=job_docs,
+                agent_engine_id="9876543210987654321",
+            )
+        self.assertEqual(
+            pub_res,
+            {
+                "experiment_name": "projects/123456789012/locations/us-central1/evaluationExperiments/333",
+                "evaluation_set_name": "projects/123456789012/locations/us-central1/evaluationSets/222",
+                "evaluation_run_name": "projects/123456789012/locations/us-central1/evaluationRuns/444",
+            },
+        )
+        exp_call_kwargs = fake_eval_client.evals.create_evaluation_experiment.call_args.kwargs
+        self.assertEqual(
+            exp_call_kwargs["labels"]["vertex-ai-evaluation-agent-engine-id"],
+            "9876543210987654321",
+        )
+        self.assertEqual(
+            exp_call_kwargs["labels"]["vertex-ai-evaluation-set-name"],
+            "projects/123456789012/locations/us-central1/evaluationSets/222",
+        )
 
 
 if __name__ == "__main__":
