@@ -326,7 +326,7 @@ def test_both_roots_derive_names_from_name_prefix():
         assert re.search(r'regex\("\^\[a-z\]\[a-z0-9-\]\{0,18\}\[a-z0-9\]\$", var\.name_prefix\)', text)
         assert '"${var.name_prefix}-worker"' in text
         assert '"${var.name_prefix}-images"' in text
-    for derived in ("-watchdog", "-agent", "-ge", "-staging"):
+    for derived in ("-watchdog", "-agent", "-ge", "-staging", "-workspace"):
         assert f'{derived}"' in main
     for derived in ("-deployer", "-deploy"):
         assert f'"${{var.name_prefix}}{derived}"' in boot
@@ -648,3 +648,51 @@ def test_terraform_roots_support_native_destroy_without_manual_workarounds():
     assert 'default = "placeholder-docker.pkg.dev/project/repo/image@sha256:' in main
     assert "prevent_destroy" not in boot
 
+
+
+def test_workspace_bucket_versioned_seeded_and_wired():
+    """Round 71: GCS mode is turnkey - versioned workspace bucket, seeded SOP workbook, GCS_SOP_URI env."""
+    main = _tf("main.tf")
+    start = main.index('resource "google_storage_bucket" "workspace_bucket"')
+    bucket = main[start: main.index("\n}\n", start)]
+    assert "name                        = local.workspace_bucket_name" in bucket
+    assert "versioning {\n    enabled = true\n  }" in bucket
+    # Only archived generations beyond the 30 newest are pruned; no age-based delete of live objects.
+    assert "num_newer_versions = 30" in bucket and 'with_state         = "ARCHIVED"' in bucket
+    assert not re.search(r"\bage\s*=", bucket)
+    assert '"${var.project_id}-${var.name_prefix}-workspace"' in main
+    assert 'gcs_sop_uri            = "gs://${local.workspace_bucket_name}/sop/master_sheet.xlsx"' in main
+    for res in ("workspace_bucket_rw", "workspace_bucket_meta_reader"):
+        s = main.index(f'resource "google_storage_bucket_iam_member" "{res}"')
+        blk = main[s: main.index("\n}\n", s)]
+        assert "bucket = google_storage_bucket.workspace_bucket.name" in blk
+        assert 'member = "serviceAccount:${data.google_service_account.audit_worker_sa.email}"' in blk
+    s = main.index('resource "google_storage_bucket_object" "default_sop_workbook"')
+    obj = main[s: main.index("\n}\n", s)]
+    assert 'name         = "sop/master_sheet.xlsx"' in obj
+    assert 'source       = "${path.module}/sop/master_sheet.xlsx"' in obj
+    assert "ignore_changes = [source, content, source_md5hash, metadata]" in obj
+    assert (ROOT / "sop" / "master_sheet.xlsx").is_file()
+    sop = 'gs://${google_storage_bucket.workspace_bucket.name}/sop/master_sheet.xlsx'
+    assert f'name  = "GCS_SOP_URI"\n        value = "{sop}"' in main
+    assert f'--gcs-sop-uri "{sop}"' in main
+    dep = main[main.index("depends_on = [", main.index('resource "terraform_data" "vertex_reasoning_engine"')):]
+    dep = dep[: dep.index("]")]
+    assert "google_storage_bucket_iam_member.workspace_bucket_rw" in dep
+    assert "google_storage_bucket_object.default_sop_workbook" in dep
+    assert 'output "workspace_bucket_name"' in main and 'output "gcs_sop_uri"' in main
+
+
+def test_reasoning_engine_body_carries_gcs_sop_uri_only_when_set():
+    common = dict(
+        project_id="my-project",
+        location="us-central1",
+        image_uri="img",
+        master_prompt_sheet_id="",
+        display_name="stack-a-agent",
+        gcp_location="europe-west4",
+    )
+    env = lambda body: {e["name"]: e["value"] for e in body["spec"]["deploymentSpec"]["env"]}  # noqa: E731
+    assert "GCS_SOP_URI" not in env(deploy.build_reasoning_engine_body(**common))
+    uri = "gs://my-project-stack-a-workspace/sop/master_sheet.xlsx"
+    assert env(deploy.build_reasoning_engine_body(**common, gcs_sop_uri=uri))["GCS_SOP_URI"] == uri

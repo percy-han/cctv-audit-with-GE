@@ -16,10 +16,14 @@ reasoning_engine_location  = "<region>" # Vertex AI Agent Engine region, e.g. us
 #                                                with Object Versioning; upload/refresh it with
 #                                                scripts/init_sop_sheet.py --gcs-uri; append #<generation> to pin a version
 #   ""                                           built-in V25 rules
+# Independently of this, main.tf always creates the versioned bucket <project-id>-<prefix>-workspace
+# (override: workspace_bucket_name) and seeds gs://<project-id>-<prefix>-workspace/sop/master_sheet.xlsx
+# (terraform output gcs_sop_uri); gs:// store folders use that workbook unless this value is itself gs://.
 master_prompt_sheet_id     = "<master-prompt-sheet-id>"
 workspace_impersonate_user = "<bot-user@customer-domain>" # "" = the worker SA itself (Shared Drives only)
 
 # Optional
+# workspace_bucket_name = ""                    # "" = <project-id>-<prefix>-workspace (versioned GCS-mode bucket)
 # vertex_model_location = "global"
 # scheduler_time_zone   = "Etc/UTC"            # also the timestamp zone of eval report Sheet names
 # eval_results_folder_id = "<drive-folder-id>"  # eval runs create one timestamped Sheet report here;

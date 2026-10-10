@@ -9,7 +9,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from .gcs_uri import normalize_gcs_target, split_generation
+from .gcs_uri import is_gcs_target, normalize_gcs_target, split_generation
 
 # Accepts both `/spreadsheets/d/<ID>` and the multi-account `/spreadsheets/u/<N>/d/<ID>`
 # form that Google emits for users signed into more than one account.
@@ -80,6 +80,9 @@ class AuditConfig(BaseModel):
     master_prompt_sheet_id: str = Field(
         default_factory=lambda: os.environ.get("MASTER_PROMPT_SHEET_ID", "")
     )
+    # Terraform-seeded gs://<project>-<prefix>-workspace/sop/master_sheet.xlsx (main.tf output gcs_sop_uri).
+    # Empty = not provisioned. See `effective_sop_source`.
+    gcs_sop_uri: str = Field(default_factory=lambda: os.environ.get("GCS_SOP_URI", ""))
     fallback_model_version: str = Field(
         default_factory=lambda: os.environ.get(
             "FALLBACK_MODEL_VERSION", "gemini-3.8-flash"
@@ -140,6 +143,36 @@ class AuditConfig(BaseModel):
     @classmethod
     def _normalize_sheet_id(cls, v: str) -> str:
         return extract_spreadsheet_id(str(v)) if str(v).strip() else ""
+
+    @field_validator("gcs_sop_uri", mode="before")
+    @classmethod
+    def _normalize_gcs_sop_uri(cls, v: str) -> str:
+        raw = str(v or "").strip()
+        if not raw:
+            return ""
+        normalized = extract_spreadsheet_id(raw)
+        if not is_gcs_target(normalized):
+            raise ValueError(f"GCS_SOP_URI 必须是 gs://<bucket>/<path>.xlsx|.json[#<generation>]，当前为: {raw!r}")
+        return normalized
+
+    def effective_sop_source(self, folder_id: str = "") -> str:
+        """Resolves the active SOP source for `folder_id`.
+
+        - If `master_prompt_sheet_id` is explicitly a `gs://` URI (including a `#<generation>` pin),
+          it always wins.
+        - Otherwise, when auditing a GCS folder (`gs://...`), prefer `gcs_sop_uri`
+          (`gs://<workspace_bucket>/sop/master_sheet.xlsx`) if configured, so GCS mode runs with
+          zero Google Workspace calls even on dual-mode deployments.
+        - For Google Drive folders (or when `gcs_sop_uri` is unset), use `master_prompt_sheet_id`
+          (falling back to `gcs_sop_uri` when `master_prompt_sheet_id` is empty).
+        """
+        primary = (self.master_prompt_sheet_id or "").strip()
+        gcs_fallback = (self.gcs_sop_uri or "").strip()
+        if is_gcs_target(primary):
+            return primary
+        if is_gcs_target(folder_id) and gcs_fallback:
+            return gcs_fallback
+        return primary or gcs_fallback
 
 
 config = AuditConfig()

@@ -1407,7 +1407,7 @@ def test_tier1_tier2_crash_checkpoint_and_resume_zero_duplicate_tokens() -> None
                 return win_res, ledger
 
         class _FastPromptManager:
-            async def load_active_config(self) -> PromptModelConfig:
+            async def load_active_config(self, sheet_id=None) -> PromptModelConfig:
                 return PromptModelConfig(
                     active_model_version="gemini-1.5-flash-002",
                     active_prompt_version="Prompt_v1.0_基准73%版",
@@ -1515,7 +1515,7 @@ def test_unattended_watchdog_auto_resumes_crashed_tier2_after_20_min_without_use
         carryover_received: dict[int, str] = {}
 
         class _FastPromptManager:
-            async def load_active_config(self) -> PromptModelConfig:
+            async def load_active_config(self, sheet_id=None) -> PromptModelConfig:
                 return PromptModelConfig(
                     active_model_version="gemini-1.5-flash-002",
                     active_prompt_version="Prompt_v1.0_基准73%版",
@@ -1982,7 +1982,7 @@ def test_tc017_ge_stream_heartbeat_and_turn_latency_optimizations() -> None:
         warmed = {"calls": 0}
 
         class _CountingPromptManager:
-            async def load_active_config(self) -> PromptModelConfig:
+            async def load_active_config(self, sheet_id=None) -> PromptModelConfig:
                 warmed["calls"] += 1
                 return PromptModelConfig(system_instruction="warmed")
 

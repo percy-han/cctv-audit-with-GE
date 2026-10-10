@@ -163,6 +163,7 @@ def build_reasoning_engine_body(
     google_chat_webhook_url: str = "",
     company_name: str = "",
     tenant_label: str = "",
+    gcs_sop_uri: str = "",
 ) -> dict[str, Any]:
     if not display_name:
         raise ValueError("display_name is required: it is how this stack's ReasoningEngine is found again")
@@ -178,6 +179,9 @@ def build_reasoning_engine_body(
     ]
     if staging_bucket:
         env_list.append({"name": "STAGING_BUCKET", "value": staging_bucket})
+    # Terraform-seeded gs://<workspace_bucket>/sop/master_sheet.xlsx (Zero-GWS / GCS-mode SOP source).
+    if gcs_sop_uri:
+        env_list.append({"name": "GCS_SOP_URI", "value": gcs_sop_uri})
     if cloud_run_worker_url:
         env_list.append({"name": "CLOUD_RUN_WORKER_URL", "value": cloud_run_worker_url})
     # Same Workspace identity as the Tier-2 worker (main.tf): keyless DWD when a bot user is set.
@@ -906,6 +910,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     p_create.add_argument("--staging-bucket", default=os.environ.get("STAGING_BUCKET", ""))
+    p_create.add_argument(
+        "--gcs-sop-uri",
+        default="",
+        help="gs://<workspace_bucket>/sop/master_sheet.xlsx seeded by main.tf (GCS mode SOP source); empty = unset",
+    )
     p_create.add_argument("--service-account", default=os.environ.get("ENGINE_SERVICE_ACCOUNT", ""))
     p_create.add_argument("--cloud-run-worker-url", default=os.environ.get("CLOUD_RUN_WORKER_URL", ""))
     p_create.add_argument("--vertex-model-location", default="global")
@@ -988,6 +997,7 @@ def main(argv: list[str] | None = None) -> int:
             workspace_dwd_service_account=args.workspace_dwd_service_account,
             company_name=args.ge_company_name,
             tenant_label=args.ge_tenant_label,
+            gcs_sop_uri=args.gcs_sop_uri,
         )
         # This stack's engine (by display name, owned by its service account) is PATCHed in place.
         existing_list = _call("GET", base, project_id=args.project_id).get("reasoningEngines", [])

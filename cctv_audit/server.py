@@ -69,6 +69,7 @@ except ImportError:  # Graceful fallback when running unit tests without fastapi
 from pydantic import BaseModel, Field
 
 from .audit_service import AuditService
+from .config import config
 from .turn import TurnAction, classify_turn_with_llm
 from .video_ingestor import VideoIngestor, VideoMetadataItem, progress_unit_label
 
@@ -734,7 +735,9 @@ async def internal_execute_job(req: InternalJobExecuteRequest) -> Any:
     job = await audit_service.jobs.get(req.user_id, req.job_id)
     if job is None:
         return {"dispatched": False, "error": f"job {req.job_id} not found for {req.user_id}"}
-    prompt_cfg = await audit_service.prompt_manager.load_active_config()
+    prompt_cfg = await audit_service.prompt_manager.load_active_config(
+        sheet_id=config.effective_sop_source(job.folder_id)
+    )
     if req.hold_connection:
         await audit_service._run_detached_audit(job, prompt_cfg)
         return {"dispatched": True, "completed": True, "job_id": job.job_id, "user_id": job.user_id}

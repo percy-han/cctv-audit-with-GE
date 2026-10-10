@@ -235,7 +235,14 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 
 ### Zero-GWS / GCS 兜底模式（没有 Google Workspace 时）
 
-没有 Google Workspace（或暂时不想配 Drive 域委派）时，可以把视频放在 GCS 里，用法几乎一样：
+没有 Google Workspace（或暂时不想配 Drive 域委派）时，可以把视频放在 GCS 里，用法几乎一样。
+
+> **Terraform 会自动准备好 GCS 模式要用的东西**（第 5 步部署时创建）：
+> - 一个开启了对象版本控制的存储桶 `<项目ID>-<p>-workspace`（可用 `workspace_bucket_name` 改名），Worker 服务账号自动拥有读写权限。里面放门店视频（如 `gs://<项目ID>-<p>-workspace/stores/<门店>/`）、Excel 报告、证据切片和 SOP 规则表。这个桶没有按时间自动删除的规则，只会清理每个文件第 30 个之前的旧版本。
+> - 默认 SOP 规则表 `gs://<项目ID>-<p>-workspace/sop/master_sheet.xlsx`，由仓库里的 `sop/master_sheet.xlsx` 在建桶时写入一次，之后客户改过的版本不会被 Terraform 覆盖。地址可以用 `terraform output gcs_sop_uri` 查看。
+> - 这个地址会以 `GCS_SOP_URI` 的形式注入 Worker 和 Agent Engine。督导发 `gs://` 目录时，如果 `master_prompt_sheet_id` 本身不是 `gs://` 地址，就自动用这个规则表，全程不调用 Google Workspace。发 Drive 文件夹时仍用 `master_prompt_sheet_id` 指向的 Google Sheet；没填 Sheet 时 Drive 文件夹也用这个规则表。
+>
+> 所以用 Terraform 部署后，把视频上传到 `gs://<项目ID>-<p>-workspace/stores/<门店>/`，在 GE 里发这个地址就能直接稽核。下面第 1 步说明怎么改规则、怎么回滚；如果想把 SOP 放在客户自己的其他桶里，也按这一步操作。
 
 1. **SOP 规则放哪里：GCS `master_sheet.xlsx` + 存储桶版本控制（推荐标准方案）**（第 6、7 步的域委派、共享 Drive 文件夹都可以跳过）：
    1. 在客户自己的存储桶上开启对象版本控制（Object Versioning），之后每次覆盖上传，旧版本都会自动归档：

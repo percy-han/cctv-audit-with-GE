@@ -84,18 +84,18 @@ class AuditService:
         self._warmup_tasks: Set[asyncio.Task] = set()
         self._in_flight_jobs: Set[str] = set()
 
-    async def _warm_prompt_config_quietly(self) -> None:
+    async def _warm_prompt_config_quietly(self, folder_id: str = "") -> None:
         """Pre-warms the PromptManager Sheet TTL cache in the background after preflight
         so the subsequent `confirm` turn (`start_audit`) hits memory in <1ms without
         adding any latency to the `inspect` turn response.
         """
         try:
-            await self.prompt_manager.load_active_config()
+            await self.prompt_manager.load_active_config(sheet_id=config.effective_sop_source(folder_id))
         except (asyncio.CancelledError, Exception) as exc:
             logger.debug("Background prompt config warm-up skipped/cancelled: %s", exc)
 
-    def _schedule_prompt_config_warmup(self) -> asyncio.Task:
-        task = asyncio.create_task(self._warm_prompt_config_quietly())
+    def _schedule_prompt_config_warmup(self, folder_id: str = "") -> asyncio.Task:
+        task = asyncio.create_task(self._warm_prompt_config_quietly(folder_id))
         self._warmup_tasks.add(task)
         task.add_done_callback(self._warmup_tasks.discard)
         return task
@@ -154,7 +154,7 @@ class AuditService:
         )
         saved_job = await self.jobs.save(job)
         if new_state == JobState.READY and preloaded_items is None:
-            self._schedule_prompt_config_warmup()
+            self._schedule_prompt_config_warmup(folder_id)
         return saved_job
 
     async def _workspace_setup_problem(self, folder_id: str) -> str:
@@ -170,7 +170,7 @@ class AuditService:
         # Any configured SOP source is verified before spend; the routing gateway sends a
         # `gs://.../master_sheet.xlsx|.json` to GCS and a Google Sheet ID to Workspace (also for
         # hybrid deployments with videos in GCS). "" = Zero-GWS built-in rules, nothing to check.
-        sop_id = (config.master_prompt_sheet_id or "").strip()
+        sop_id = config.effective_sop_source(folder_id)
         if sop_id:
             checks.append(
                 asyncio.wait_for(gateway.check_sheet_readable(sop_id), timeout=15.0)
@@ -223,7 +223,9 @@ class AuditService:
         # Every restart of a FAILED / stale-RUNNING job counts toward MAX_AUTO_RESUMES -- including one
         # that failed before its first checkpoint; otherwise the watchdog would retry it forever.
         is_restart = job.state in (JobState.FAILED, JobState.RUNNING)
-        prompt_cfg = await self.prompt_manager.load_active_config()
+        prompt_cfg = await self.prompt_manager.load_active_config(
+            sheet_id=config.effective_sop_source(job.folder_id)
+        )
         job = job.model_copy(
             update={
                 "state": JobState.RUNNING,
@@ -749,7 +751,9 @@ class AuditService:
                 time.time() - job.heartbeat_at,
                 len(job.completed_segments),
             )
-            prompt_cfg = await self.prompt_manager.load_active_config()
+            prompt_cfg = await self.prompt_manager.load_active_config(
+                sheet_id=config.effective_sop_source(job.folder_id)
+            )
             job = job.model_copy(
                 update={
                     "resume_count": job.resume_count + 1,

@@ -1028,3 +1028,101 @@ def test_init_script_continues_when_versioning_forbidden(monkeypatch, capsys):
     assert not any(m == "PATCH" for m, _ in fake2.calls)
     with pytest.raises(WorkspaceAccessError, match="30 天后自动删除"):
         mod.main(["--gcs-uri", f"gs://{STAGING}/sop/master_sheet.xlsx"])
+
+
+# ---------------------------------------------------------------------------------------------
+# Round 71: Terraform-provisioned workspace bucket -> GCS_SOP_URI -> effective_sop_source(folder_id)
+# ---------------------------------------------------------------------------------------------
+
+from cctv_audit.config import AuditConfig  # noqa: E402
+
+WS_SOP = "gs://proj-cctv-workspace/sop/master_sheet.xlsx"
+SHEET_ID = "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-abcd"
+
+
+def test_gcs_sop_uri_config_normalisation():
+    assert AuditConfig(gcs_sop_uri="").gcs_sop_uri == ""
+    assert AuditConfig(gcs_sop_uri=f" {WS_SOP} ").gcs_sop_uri == WS_SOP
+    assert AuditConfig(gcs_sop_uri=f"{WS_SOP}#{GEN}").gcs_sop_uri == f"{WS_SOP}#{GEN}"
+    console = "https://console.cloud.google.com/storage/browser/_details/proj-cctv-workspace/sop/master_sheet.xlsx"
+    assert AuditConfig(gcs_sop_uri=console).gcs_sop_uri == WS_SOP
+    for bad in (SHEET_ID, "gs://proj-cctv-workspace", "gs://proj-cctv-workspace/sop/x.csv"):
+        with pytest.raises(ValueError):
+            AuditConfig(gcs_sop_uri=bad)
+
+
+@pytest.mark.parametrize(
+    "primary, fallback, folder, expected",
+    [
+        # explicit gs:// master_prompt_sheet_id always wins (incl. a generation pin)
+        (f"gs://cust/sop/m.xlsx#{GEN}", WS_SOP, "gs://cust/stores/a", f"gs://cust/sop/m.xlsx#{GEN}"),
+        (f"gs://cust/sop/m.xlsx#{GEN}", WS_SOP, "DRIVEFOLDER", f"gs://cust/sop/m.xlsx#{GEN}"),
+        # dual-mode: gs:// folder uses the workspace SOP, Drive folder uses the Google Sheet
+        (SHEET_ID, WS_SOP, "gs://proj-cctv-workspace/stores/a", WS_SOP),
+        (SHEET_ID, WS_SOP, "DRIVEFOLDER", SHEET_ID),
+        (SHEET_ID, WS_SOP, "", SHEET_ID),
+        # no Google Sheet: the workspace SOP serves every folder
+        ("", WS_SOP, "DRIVEFOLDER", WS_SOP),
+        ("", WS_SOP, "gs://x/stores/a", WS_SOP),
+        # no workspace SOP: unchanged behaviour
+        (SHEET_ID, "", "gs://x/stores/a", SHEET_ID),
+        ("", "", "gs://x/stores/a", ""),
+    ],
+)
+def test_effective_sop_source(primary, fallback, folder, expected):
+    cfg = AuditConfig(master_prompt_sheet_id=primary, gcs_sop_uri=fallback)
+    assert cfg.effective_sop_source(folder) == expected
+
+
+def test_dual_mode_gcs_preflight_and_start_use_workspace_sop(tmp_path, monkeypatch):
+    """Sheet-ID deployment + Terraform workspace bucket: gs:// audits read the GCS SOP, never Sheets."""
+    import cctv_audit.audit_service as audit_service_module
+
+    mod = _load_init_script()
+    fake = FakeGcs()
+    fake.put("proj-cctv-workspace", "stores/a/cam.mp4")
+    monkeypatch.setattr(audit_service_module.config, "master_prompt_sheet_id", SHEET_ID)
+    monkeypatch.setattr(audit_service_module.config, "gcs_sop_uri", WS_SOP)
+
+    class _NoSheets:
+        async def check_sheet_readable(self, sheet_id):
+            raise AssertionError("gs:// audit must not touch Google Sheets")
+
+    router = gg.RoutingStorageGateway(drive_gateway=_NoSheets(), gcs_gateway=fake)
+
+    seen_sheet_ids: List[Optional[str]] = []
+
+    class _RecordingPM:
+        async def load_active_config(self, sheet_id=None):
+            seen_sheet_ids.append(sheet_id)
+            from cctv_audit.prompt_manager import PromptModelConfig
+
+            return PromptModelConfig(
+                active_model_version="m", active_prompt_version="p", system_instruction="s"
+            )
+
+    svc = AuditService(
+        job_store=UserScopedJobStore(state_dir=tmp_path, gcs_bucket=LOCAL_PLACEHOLDER_BUCKET, gcs_store={}),
+        ingestor=VideoIngestor(drive_reader=router),
+        prompt_manager=_RecordingPM(),  # type: ignore[arg-type]
+        reporter=WorkspaceReporter(gateway=router, enable_notification=False),
+    )
+    # Workspace SOP not seeded yet -> preflight rejected with the GCS hint (Sheets never asked).
+    job = asyncio.run(svc.preflight(user_id="u@example.com", drive_url="gs://proj-cctv-workspace/stores/a"))
+    assert job.state == JobState.REJECTED and "init_sop_sheet.py --gcs-uri" in job.preflight_report.message_to_user
+
+    fake.put(
+        "proj-cctv-workspace",
+        "sop/master_sheet.xlsx",
+        mod.build_xlsx_bytes(mod.load_snapshot(mod.DEFAULT_SNAPSHOT)),
+        ctype=gg.XLSX_CONTENT_TYPE,
+    )
+
+    async def _flow():
+        j = await svc.preflight(user_id="u@example.com", drive_url="gs://proj-cctv-workspace/stores/a")
+        assert j.state == JobState.READY, j.preflight_report.message_to_user
+        await asyncio.gather(*list(svc._warmup_tasks))  # background warm-up uses the GCS SOP
+        return j
+
+    asyncio.run(_flow())
+    assert seen_sheet_ids == [WS_SOP]

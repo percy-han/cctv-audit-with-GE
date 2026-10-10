@@ -70,6 +70,12 @@ variable "staging_bucket_name" {
   default     = ""
 }
 
+variable "workspace_bucket_name" {
+  description = "Versioned GCS bucket for Zero-GWS / GCS mode (stores sop/master_sheet.xlsx, store CCTV videos, 20s evidence clips, and .xlsx audit reports). Empty = <project_id>-<name_prefix>-workspace."
+  type        = string
+  default     = ""
+}
+
 variable "scheduler_time_zone" {
   description = "IANA time zone of the watchdog cron (runs every 2 minutes, so this only affects how the schedule is displayed) and of the timestamp in eval report Sheet names (output eval_report_time_zone)"
   type        = string
@@ -291,6 +297,8 @@ locals {
   worker_service_name    = "${var.name_prefix}-worker"
   watchdog_job_name      = "${var.name_prefix}-watchdog"
   staging_bucket_name    = var.staging_bucket_name != "" ? var.staging_bucket_name : "${var.project_id}-${var.name_prefix}-staging"
+  workspace_bucket_name  = var.workspace_bucket_name != "" ? var.workspace_bucket_name : "${var.project_id}-${var.name_prefix}-workspace"
+  gcs_sop_uri            = "gs://${local.workspace_bucket_name}/sop/master_sheet.xlsx"
   ge_engine_id           = var.ge_engine_id != "" ? var.ge_engine_id : "${var.name_prefix}-ge"
   re_display_name        = var.reasoning_engine_display_name != "" ? var.reasoning_engine_display_name : "${var.name_prefix}-agent"
 
@@ -416,6 +424,59 @@ resource "google_storage_bucket_iam_member" "staging_bucket_meta_reader" {
   member = "serviceAccount:${data.google_service_account.audit_worker_sa.email}"
 }
 
+# 2b. Versioned GCS workspace bucket for Zero-GWS / GCS mode: supervisors' store CCTV videos
+# (gs://<bucket>/stores/<store>/), the .xlsx audit reports and 20s evidence clips written next to
+# them, and the Master SOP workbook gs://<bucket>/sop/master_sheet.xlsx. Object Versioning keeps every
+# overwritten SOP / report as an archived generation (Console "Version history" -> Restore, or pin
+# master_prompt_sheet_id = "gs://.../master_sheet.xlsx#<generation>"). Unlike the staging bucket there
+# is NO age-based delete: only archived versions beyond the 30 newest are pruned.
+resource "google_storage_bucket" "workspace_bucket" {
+  name                        = local.workspace_bucket_name
+  location                    = var.region
+  uniform_bucket_level_access = true
+  force_destroy               = true
+
+  versioning {
+    enabled = true
+  }
+
+  lifecycle_rule {
+    condition {
+      num_newer_versions = 30
+      with_state         = "ARCHIVED"
+    }
+    action {
+      type = "Delete"
+    }
+  }
+}
+
+resource "google_storage_bucket_iam_member" "workspace_bucket_rw" {
+  bucket = google_storage_bucket.workspace_bucket.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${data.google_service_account.audit_worker_sa.email}"
+}
+
+resource "google_storage_bucket_iam_member" "workspace_bucket_meta_reader" {
+  bucket = google_storage_bucket.workspace_bucket.name
+  role   = "roles/storage.legacyBucketReader"
+  member = "serviceAccount:${data.google_service_account.audit_worker_sa.email}"
+}
+
+# Seeds the default SOP workbook (generated from sop/master_sheet.json by
+# `scripts/init_sop_sheet.py --export-xlsx sop/master_sheet.xlsx`) once, when the bucket is created.
+# Later customer edits (Excel / WPS re-upload or `init_sop_sheet.py --gcs-uri`) are never overwritten.
+resource "google_storage_bucket_object" "default_sop_workbook" {
+  bucket       = google_storage_bucket.workspace_bucket.name
+  name         = "sop/master_sheet.xlsx"
+  source       = "${path.module}/sop/master_sheet.xlsx"
+  content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+  lifecycle {
+    ignore_changes = [source, content, source_md5hash, metadata]
+  }
+}
+
 # 3. Reasoning Engine Service Agent Pull Permission on the image repository
 # Mandatory for Vertex AI Agent Engine (`ReasoningEngine` BYOC `containerSpec`) so the deployed agent
 # appears directly in the Gemini Enterprise Console -> `Agents` dropdown menu!
@@ -509,6 +570,10 @@ resource "google_cloud_run_v2_service" "cctv_audit_worker" {
         value = var.master_prompt_sheet_id
       }
       env {
+        name  = "GCS_SOP_URI"
+        value = "gs://${google_storage_bucket.workspace_bucket.name}/sop/master_sheet.xlsx"
+      }
+      env {
         name  = "CLOUD_RUN_WORKER_URL"
         value = "https://${local.worker_service_name}-${data.google_project.current.number}.${var.region}.run.app"
       }
@@ -595,6 +660,7 @@ resource "terraform_data" "vertex_reasoning_engine" {
         --gcp-location "${var.region}" \
         --image-uri "${var.container_image}" \
         --master-prompt-sheet-id "${var.master_prompt_sheet_id}" \
+        --gcs-sop-uri "gs://${google_storage_bucket.workspace_bucket.name}/sop/master_sheet.xlsx" \
         --staging-bucket "${google_storage_bucket.staging_bucket.name}" \
         --service-account "${data.google_service_account.audit_worker_sa.email}" \
         --cloud-run-worker-url "${var.enable_standalone_cloud_run ? google_cloud_run_v2_service.cctv_audit_worker[0].uri : ""}" \
@@ -642,6 +708,8 @@ resource "terraform_data" "vertex_reasoning_engine" {
     google_project_service.required,
     google_artifact_registry_repository_iam_member.reasoning_engine_image_puller,
     google_storage_bucket_iam_member.staging_bucket_rw,
+    google_storage_bucket_iam_member.workspace_bucket_rw,
+    google_storage_bucket_object.default_sop_workbook,
     google_cloud_run_v2_service.cctv_audit_worker,
     google_cloud_run_v2_service_iam_member.reasoning_engine_worker_invoker,
   ]
@@ -685,6 +753,16 @@ resource "google_cloud_scheduler_job" "cctv_audit_watchdog" {
 output "staging_bucket_name" {
   description = "Regional GCS bucket for ephemeral video slices and Zero-DB cross-instance job state"
   value       = google_storage_bucket.staging_bucket.name
+}
+
+output "workspace_bucket_name" {
+  description = "Versioned GCS bucket for Zero-GWS / GCS mode: store videos (gs://<bucket>/stores/<store>/), reports, evidence clips and sop/master_sheet.xlsx"
+  value       = google_storage_bucket.workspace_bucket.name
+}
+
+output "gcs_sop_uri" {
+  description = "Default GCS Master SOP workbook (seeded by Terraform, never overwritten); used for gs:// audits unless master_prompt_sheet_id is itself a gs:// URI"
+  value       = "gs://${google_storage_bucket.workspace_bucket.name}/sop/master_sheet.xlsx"
 }
 
 output "artifact_registry_repo" {
