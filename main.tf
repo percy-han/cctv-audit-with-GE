@@ -614,7 +614,8 @@ resource "google_cloud_run_v2_service" "cctv_audit_worker" {
     ignore_changes = [scaling]
   }
 
-  depends_on = [google_project_service.required]
+  # stack_teardown is destroyed (runs destroy-stack) only after this worker on a real destroy.
+  depends_on = [google_project_service.required, terraform_data.stack_teardown]
 }
 
 resource "google_cloud_run_v2_service_iam_member" "ge_discovery_engine_invoker" {
@@ -678,19 +679,10 @@ resource "terraform_data" "vertex_reasoning_engine" {
     EOT
   }
 
-  provisioner "local-exec" {
-    when    = destroy
-    command = <<-EOT
-      python3 ${path.module}/deploy/deploy_reasoning_engine.py \
-        --project-id "${self.triggers_replace[0]}" \
-        --location "${self.triggers_replace[1]}" \
-        destroy-stack \
-        --image-uri "${self.triggers_replace[2]}" \
-        --ge-engine-id "${self.triggers_replace[4]}" \
-        --staging-bucket "${self.triggers_replace[5]}" \
-        --service-account "${self.triggers_replace[6]}"
-    EOT
-  }
+  # No destroy-time provisioner here: this resource is REPLACED whenever any trigger above
+  # changes (every new container_image digest), and Terraform runs destroy-time provisioners on
+  # replacement too. The full-stack teardown lives on terraform_data.stack_teardown, whose
+  # triggers are stack-identity invariants only (Round 71b; incident 2026-10-10).
 
   lifecycle {
     precondition {
@@ -705,6 +697,7 @@ resource "terraform_data" "vertex_reasoning_engine" {
   # The worker's own IAM (roles/aiplatform.user, self-TokenCreator) is not listed: bootstrap/
   # grants it before the pipeline can run at all.
   depends_on = [
+    terraform_data.stack_teardown,
     google_project_service.required,
     google_artifact_registry_repository_iam_member.reasoning_engine_image_puller,
     google_storage_bucket_iam_member.staging_bucket_rw,
@@ -712,6 +705,39 @@ resource "terraform_data" "vertex_reasoning_engine" {
     google_storage_bucket_object.default_sop_workbook,
     google_cloud_run_v2_service.cctv_audit_worker,
     google_cloud_run_v2_service_iam_member.reasoning_engine_worker_invoker,
+  ]
+}
+
+# 5b. Full-stack teardown on a real `terraform destroy` only. Its triggers are stack-identity
+# invariants (never the image, SOP sheet, bot user or worker URL), so routine deploys never replace
+# it and never run destroy-stack. On destroy, vertex_reasoning_engine and the Cloud Run worker
+# (both depend on this) go first, then destroy-stack removes the GE engine/agent, the
+# ReasoningEngine, the worker and the staging bucket contents before the bucket itself is deleted.
+resource "terraform_data" "stack_teardown" {
+  triggers_replace = [
+    var.project_id,
+    var.reasoning_engine_location,
+    local.ge_engine_id,
+    google_storage_bucket.staging_bucket.name,
+    data.google_service_account.audit_worker_sa.email,
+  ]
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = <<-EOT
+      python3 ${path.module}/deploy/deploy_reasoning_engine.py \
+        --project-id "${self.triggers_replace[0]}" \
+        --location "${self.triggers_replace[1]}" \
+        destroy-stack \
+        --ge-engine-id "${self.triggers_replace[2]}" \
+        --staging-bucket "${self.triggers_replace[3]}" \
+        --service-account "${self.triggers_replace[4]}"
+    EOT
+  }
+
+  depends_on = [
+    google_project_service.required,
+    google_storage_bucket_iam_member.staging_bucket_rw,
   ]
 }
 

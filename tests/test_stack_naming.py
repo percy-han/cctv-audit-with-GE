@@ -696,3 +696,49 @@ def test_reasoning_engine_body_carries_gcs_sop_uri_only_when_set():
     assert "GCS_SOP_URI" not in env(deploy.build_reasoning_engine_body(**common))
     uri = "gs://my-project-stack-a-workspace/sop/master_sheet.xlsx"
     assert env(deploy.build_reasoning_engine_body(**common, gcs_sop_uri=uri))["GCS_SOP_URI"] == uri
+
+
+def _tf_block(main: str, header: str) -> str:
+    start = main.index(header)
+    return main[start: main.index("\n}\n", start)]
+
+
+def test_vertex_reasoning_engine_replacement_never_triggers_destroy_stack():
+    """Round 71b (incident 2026-10-10): Terraform runs `when = destroy` provisioners on REPLACEMENT.
+
+    vertex_reasoning_engine is replaced on every new container_image digest, so it must never carry
+    the full-stack teardown; that lives on stack_teardown, keyed only by stack-identity invariants.
+    """
+    main = _tf("main.tf")
+    vre = _tf_block(main, 'resource "terraform_data" "vertex_reasoning_engine"')
+    assert not re.search(r"when\s*=\s*destroy", vre)
+    assert "destroy-stack" not in vre
+    assert "terraform_data.stack_teardown" in vre  # destroyed before the teardown runs
+
+    td = _tf_block(main, 'resource "terraform_data" "stack_teardown"')
+    assert "when    = destroy" in td and "destroy-stack" in td
+    triggers = td[td.index("triggers_replace = ["): td.index("\n  ]", td.index("triggers_replace = ["))]
+    for forbidden in (
+        "var.container_image",
+        "var.master_prompt_sheet_id",
+        "var.workspace_impersonate_user",
+        "cctv_audit_worker",
+    ):
+        assert forbidden not in triggers, forbidden
+    items = [line.strip().rstrip(",") for line in triggers.splitlines()[1:] if line.strip()]
+    assert items == [
+        "var.project_id",
+        "var.reasoning_engine_location",
+        "local.ge_engine_id",
+        "google_storage_bucket.staging_bucket.name",
+        "data.google_service_account.audit_worker_sa.email",
+    ]
+    for i, flag in enumerate(("--project-id", "--location")):
+        assert f'{flag} "${{self.triggers_replace[{i}]}}"' in td
+    assert '--ge-engine-id "${self.triggers_replace[2]}"' in td
+    assert '--staging-bucket "${self.triggers_replace[3]}"' in td
+    assert '--service-account "${self.triggers_replace[4]}"' in td
+    # Exactly one destroy-time provisioner in the whole root, and only on stack_teardown.
+    assert len(re.findall(r"when\s*=\s*destroy", main)) == 1
+    worker = _tf_block(main, 'resource "google_cloud_run_v2_service" "cctv_audit_worker"')
+    assert "terraform_data.stack_teardown" in worker
