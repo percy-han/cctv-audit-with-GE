@@ -349,6 +349,10 @@ def _report(action: str, eng: str, result: dict[str, Any], reasoning_engine_name
         print(f"✅ {action} ADK Agent in GE Engine `{eng}` -> {result.get('name')} (bound to {reasoning_engine_name})")
 
 
+# Second DataStore ID used while `<ge_engine_id>-store` is still being deleted (deletion takes hours).
+GE_DATASTORE_FALLBACK_SUFFIX = "-store-v2"
+
+
 def ensure_gemini_enterprise_and_bind_agent(
     project_id: str,
     reasoning_engine_name: str,
@@ -375,25 +379,45 @@ def ensure_gemini_enterprise_and_bind_agent(
     if not ge_engine_id:
         raise ValueError("ge_engine_id is required")
     de_base = f"https://discoveryengine.googleapis.com/v1alpha/projects/{project_id}/locations/global/collections/default_collection"
+    engine_create_error = ""
 
-    # 1. Ensure a backing DataStore exists if we need to create a new Engine
+    # 1. Ensure a backing DataStore exists if we need to create a new Engine. A DataStore ID that was
+    #    just deleted (e.g. by destroy-stack) stays reserved for hours ("is being deleted"), so fall back
+    #    to `<ge_engine_id>-store-v2` instead of leaving the app uncreatable until then.
+    ds_body = {
+        "displayName": f"{ge_display_name} Data Store",
+        "industryVertical": "GENERIC",
+        "solutionTypes": ["SOLUTION_TYPE_SEARCH"],
+        "contentConfig": "NO_CONTENT",
+    }
     ds_id = f"{ge_engine_id}-store"
-    ds_url = f"{de_base}/dataStores/{ds_id}"
-    ds_check = _call("GET", ds_url, project_id=project_id, ignore_errors=True)
+    ds_check = _call("GET", f"{de_base}/dataStores/{ds_id}", project_id=project_id, ignore_errors=True)
     if ds_check.get("_http_error") == 404:
-        print(f"📦 Creating Discovery Engine DataStore `{ds_id}`...")
-        _call(
-            "POST",
-            f"{de_base}/dataStores?dataStoreId={ds_id}",
-            body={
-                "displayName": f"{ge_display_name} Data Store",
-                "industryVertical": "GENERIC",
-                "solutionTypes": ["SOLUTION_TYPE_SEARCH"],
-                "contentConfig": "NO_CONTENT",
-            },
-            project_id=project_id,
-            ignore_errors=True,
-        )
+        fallback_id = f"{ge_engine_id}{GE_DATASTORE_FALLBACK_SUFFIX}"
+        fb_check = _call("GET", f"{de_base}/dataStores/{fallback_id}", project_id=project_id, ignore_errors=True)
+        if not fb_check.get("_http_error"):
+            ds_id = fallback_id  # created by an earlier fallback run
+        else:
+            print(f"📦 Creating Discovery Engine DataStore `{ds_id}`...")
+            created_ds = _call(
+                "POST", f"{de_base}/dataStores?dataStoreId={ds_id}", body=ds_body, project_id=project_id, ignore_errors=True
+            )
+            if created_ds.get("_http_error") and "being deleted" in str(created_ds.get("_error_body", "")):
+                print(f"♻️ DataStore `{ds_id}` is still being deleted; using `{fallback_id}` instead.")
+                ds_id = fallback_id
+                created_ds = _call(
+                    "POST",
+                    f"{de_base}/dataStores?dataStoreId={ds_id}",
+                    body=ds_body,
+                    project_id=project_id,
+                    ignore_errors=True,
+                )
+            if created_ds.get("_http_error"):
+                print(
+                    f"❌ Creating DataStore `{ds_id}` FAILED: HTTP {created_ds['_http_error']} "
+                    f"{created_ds.get('_error_body', '')}",
+                    file=sys.stderr,
+                )
 
     # 2. Check or create Gemini Enterprise Engine (`ge_engine_id`)
     eng_url = f"{de_base}/engines/{ge_engine_id}"
@@ -426,12 +450,17 @@ def ensure_gemini_enterprise_and_bind_agent(
             ignore_errors=True,
         )
         print("Engine creation response:", json.dumps(op, ensure_ascii=False))
+        if op.get("_http_error"):
+            # Fail the deploy (after binding the extra apps below) instead of reporting success
+            # while the stack's own GE app does not exist.
+            engine_create_error = f"HTTP {op['_http_error']} {op.get('_error_body', '')}"
+            print(f"❌ Creating GE Engine `{ge_engine_id}` FAILED: {engine_create_error}", file=sys.stderr)
         time.sleep(5)
     else:
         print(f"✅ Gemini Enterprise App `{ge_engine_id}` already exists.")
 
     # 3. Bind/Update this stack's ADK Agent on `ge_engine_id` + each existing `extra_engine_ids` app.
-    target_engines = [ge_engine_id]
+    target_engines = [] if engine_create_error else [ge_engine_id]
     for extra in extra_engine_ids:
         if not extra or extra in target_engines:
             continue
@@ -495,12 +524,15 @@ def ensure_gemini_enterprise_and_bind_agent(
             for ag in stack_agents:
                 existing_agent_name = ag["name"]
                 patch_body = dict(agent_payload)
+                # `state` is immutable on PATCH (HTTP 400 "updateMask contains an immutable path"); an agent
+                # created ENABLED stays ENABLED, so it is only sent when the agent is first created.
+                patch_body.pop("state", None)
                 # Preserve existing custom displayName if already set on a legacy engine
                 if ag.get("displayName"):
                     patch_body["displayName"] = ag["displayName"]
                 patch_url = (
                     f"https://discoveryengine.googleapis.com/v1alpha/{existing_agent_name}"
-                    "?updateMask=displayName,description,adkAgentDefinition,state,starterPrompts,customPlaceholderText"
+                    "?updateMask=displayName,description,adkAgentDefinition,starterPrompts,customPlaceholderText"
                 )
                 updated = _call(
                     "PATCH",
@@ -530,6 +562,11 @@ def ensure_gemini_enterprise_and_bind_agent(
             "another stack; no agent was created or changed there. Give this stack its own "
             "ge_agent_display_name (the default includes name_prefix) and remove foreign apps from "
             "ge_engine_id / extra_ge_engine_ids."
+        )
+    if engine_create_error:
+        raise SystemExit(
+            f"GE app `{ge_engine_id}` could not be created ({engine_create_error}); agents in the extra "
+            f"apps {target_engines} were bound. Re-run this deploy once the cause is fixed."
         )
     return bound_agents
 
@@ -775,6 +812,7 @@ def destroy_stack(
                 file=sys.stderr,
             )
         else:
+            eng_meta = _call("GET", f"{de_base}/engines/{ge_engine_id}", project_id=project_id, ignore_errors=True)
             print(f"🧹 Deleting Gemini Enterprise Engine `{ge_engine_id}`...")
             eng_del = _call(
                 "DELETE",
@@ -784,16 +822,27 @@ def destroy_stack(
             )
             if not eng_del.get("_http_error") or eng_del.get("_http_error") == 404:
                 summary["deleted_ge_engine"] = True
-            ds_id = f"{ge_engine_id}-store"
-            print(f"🧹 Deleting Discovery Engine DataStore `{ds_id}`...")
-            ds_del = _call(
-                "DELETE",
-                f"{de_base}/dataStores/{ds_id}",
-                project_id=project_id,
-                ignore_errors=True,
-            )
-            if not ds_del.get("_http_error") or ds_del.get("_http_error") == 404:
-                summary["deleted_ge_datastore"] = True
+            # The app's own DataStore(s): whatever the engine lists, plus both IDs this script may create.
+            ds_ids: list[str] = []
+            for candidate in [
+                *[str(d).rsplit("/", 1)[-1] for d in (eng_meta.get("dataStoreIds") or [])],
+                f"{ge_engine_id}-store",
+                f"{ge_engine_id}{GE_DATASTORE_FALLBACK_SUFFIX}",
+            ]:
+                if candidate and candidate not in ds_ids:
+                    ds_ids.append(candidate)
+            all_ok = True
+            for ds_id in ds_ids:
+                print(f"🧹 Deleting Discovery Engine DataStore `{ds_id}`...")
+                ds_del = _call(
+                    "DELETE",
+                    f"{de_base}/dataStores/{ds_id}",
+                    project_id=project_id,
+                    ignore_errors=True,
+                )
+                if ds_del.get("_http_error") and ds_del.get("_http_error") != 404:
+                    all_ok = False
+            summary["deleted_ge_datastore"] = all_ok
 
     # 2. Vertex AI ReasoningEngine(s) running as `service_account`
     for eng in own_engines:

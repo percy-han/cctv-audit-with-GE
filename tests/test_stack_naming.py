@@ -742,3 +742,114 @@ def test_vertex_reasoning_engine_replacement_never_triggers_destroy_stack():
     assert len(re.findall(r"when\s*=\s*destroy", main)) == 1
     worker = _tf_block(main, 'resource "google_cloud_run_v2_service" "cctv_audit_worker"')
     assert "terraform_data.stack_teardown" in worker
+
+
+def test_new_app_falls_back_to_v2_datastore_while_store_is_being_deleted(monkeypatch):
+    """Incident 2026-10-10: a just-deleted `<ge>-store` stays reserved for hours (400 'is being deleted')."""
+    fake = _FakeDiscoveryEngine({})
+    calls: list[tuple[str, str, Any]] = []
+
+    def call(method, url, body=None, project_id="", ignore_errors=False):
+        calls.append((method, url, body))
+        if method == "GET" and "/dataStores/" in url:
+            return {"_http_error": 404, "_error_body": "nf"}
+        if method == "POST" and "dataStoreId=stack-a-ge-store" in url and not url.endswith("-v2"):
+            return {"_http_error": 400, "_error_body": "DataStore ... is being deleted, please wait"}
+        return fake(method, url, body, project_id, ignore_errors)
+
+    monkeypatch.setattr(deploy, "_call", call)
+    monkeypatch.setattr(deploy.time, "sleep", lambda _s: None)
+    deploy.ensure_gemini_enterprise_and_bind_agent(
+        project_id="my-project",
+        reasoning_engine_name=f"{RE_BASE}/mine",
+        ge_engine_id="stack-a-ge",
+        ge_display_name="Stack A app",
+        agent_display_name="Stack A agent",
+    )
+    ds_posts = [u for m, u, _ in calls if m == "POST" and "dataStoreId=" in u]
+    assert ds_posts == [f"{DE}/dataStores?dataStoreId=stack-a-ge-store", f"{DE}/dataStores?dataStoreId=stack-a-ge-store-v2"]
+    engine_body = next(b for m, u, b in calls if m == "POST" and "engines?engineId=stack-a-ge" in u)
+    assert engine_body["dataStoreIds"] == ["stack-a-ge-store-v2"]
+
+
+def test_existing_v2_datastore_is_reused(monkeypatch):
+    fake = _FakeDiscoveryEngine({})
+    calls: list[tuple[str, str, Any]] = []
+
+    def call(method, url, body=None, project_id="", ignore_errors=False):
+        calls.append((method, url, body))
+        if method == "GET" and url.endswith("/dataStores/stack-a-ge-store"):
+            return {"_http_error": 404, "_error_body": "nf"}
+        return fake(method, url, body, project_id, ignore_errors)
+
+    monkeypatch.setattr(deploy, "_call", call)
+    monkeypatch.setattr(deploy.time, "sleep", lambda _s: None)
+    deploy.ensure_gemini_enterprise_and_bind_agent(
+        project_id="my-project",
+        reasoning_engine_name=f"{RE_BASE}/mine",
+        ge_engine_id="stack-a-ge",
+        ge_display_name="Stack A app",
+        agent_display_name="Stack A agent",
+    )
+    assert not any(m == "POST" and "dataStoreId=" in u for m, u, _ in calls)
+    engine_body = next(b for m, u, b in calls if m == "POST" and "engines?engineId=stack-a-ge" in u)
+    assert engine_body["dataStoreIds"] == ["stack-a-ge-store-v2"]
+
+
+def test_failed_engine_creation_fails_the_deploy_after_binding_extra_apps(monkeypatch):
+    mine = _adk_agent("m", "cctv-audit", "门店视频稽核", f"{RE_BASE}/mine")
+    fake = _FakeDiscoveryEngine({"cctv-audit": [mine]})
+
+    def call(method, url, body=None, project_id="", ignore_errors=False):
+        if method == "POST" and "engines?engineId=stack-a-ge" in url:
+            fake.calls.append((method, url, body))
+            return {"_http_error": 409, "_error_body": "Engine is being deleted"}
+        return fake(method, url, body, project_id, ignore_errors)
+
+    monkeypatch.setattr(deploy, "_call", call)
+    monkeypatch.setattr(deploy.time, "sleep", lambda _s: None)
+    with pytest.raises(SystemExit, match="could not be created"):
+        deploy.ensure_gemini_enterprise_and_bind_agent(
+            project_id="my-project",
+            reasoning_engine_name=f"{RE_BASE}/mine",
+            ge_engine_id="stack-a-ge",
+            ge_display_name="Stack A app",
+            agent_display_name="Stack A agent",
+            extra_engine_ids=["cctv-audit"],
+        )
+    # The extra app's agent was still bound; nothing was posted into the missing app.
+    assert any(m == "PATCH" and "/agents/m" in u for m, u, _ in fake.calls)
+    assert not any("/engines/stack-a-ge/assistants" in u for m, u, _ in fake.calls if m != "GET")
+
+
+def test_destroy_stack_deletes_engine_datastores_including_v2(monkeypatch):
+    calls: list[tuple[str, str]] = []
+
+    def fake_call(method, url, body=None, project_id="", ignore_errors=False):
+        calls.append((method, url))
+        if method == "GET" and url.endswith("/reasoningEngines"):
+            return {"reasoningEngines": []}
+        if method == "GET" and url.endswith("/agents"):
+            return {"agents": []}
+        if method == "GET" and url.endswith("/engines/stack-a-ge"):
+            return {"name": url, "dataStoreIds": ["custom-store"]}
+        return {}
+
+    monkeypatch.setattr(deploy, "_call", fake_call)
+    summary = deploy.destroy_stack(
+        project_id="my-project", location="us-central1", service_account=OWN_SA, ge_engine_id="stack-a-ge"
+    )
+    deleted = [u for m, u in calls if m == "DELETE" and "/dataStores/" in u]
+    assert [u.rsplit("/", 1)[1] for u in deleted] == ["custom-store", "stack-a-ge-store", "stack-a-ge-store-v2"]
+    assert summary["deleted_ge_datastore"] is True
+
+
+def test_agent_patch_never_sends_immutable_state(monkeypatch):
+    """Discovery Engine rejects `state` in an agent PATCH updateMask (HTTP 400 immutable path)."""
+    mine = _adk_agent("m", "stack-a-ge", "Stack A agent", f"{RE_BASE}/mine")
+    fake = _FakeDiscoveryEngine({"stack-a-ge": [mine]})
+    _bind(fake, monkeypatch)
+    patch_url, patch_body = next((u, b) for m, u, b in fake.mutations() if m == "PATCH")
+    mask = patch_url.split("updateMask=", 1)[1].split(",")
+    assert "state" not in mask and "adkAgentDefinition" in mask
+    assert "state" not in patch_body
