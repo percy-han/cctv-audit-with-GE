@@ -76,9 +76,10 @@ logger = logging.getLogger("cctv_audit.server")
 
 app = FastAPI(title="Chagee CCTV AI Audit Worker (Zero-DB Workspace + Serverless)")
 
-from .gcp import GoogleWorkspaceGateway
+from .gcs_gateway import RoutingStorageGateway, build_gcs_console_folder_url, is_gcs_target
 from .workspace_reporter import WorkspaceReporter
-_gw = GoogleWorkspaceGateway()
+# `gs://` targets go to GcsStorageGateway (Zero-GWS mode); everything else to GoogleWorkspaceGateway.
+_gw = RoutingStorageGateway()
 audit_service = AuditService(
     ingestor=VideoIngestor(drive_reader=_gw),
     reporter=WorkspaceReporter(gateway=_gw),
@@ -284,12 +285,17 @@ async def _handle_conversation_turn(
             if len(job.completed_segments) > 0
             else ""
         )
+        output_line = (
+            f"• 稽核完成后将在 GCS 目录 `{job.folder_id}/` 内自动生成 `📁 违规证据切片_Evidence/` 与《门店稽核报告与 Token 账单》Excel（`.xlsx`）报告；期间可随时在本对话中询问「进度怎么样了」查看实时进度。"
+            if is_gcs_target(job.folder_id)
+            else "• 稽核完成后将在您的原 Google Drive 文件夹内自动生成 `📁 违规证据切片_Evidence/` 与《门店稽核报告与 Token 账单 Sheet》；期间可随时在本对话中询问「进度怎么样了」查看实时进度。"
+        )
         return (
             f"🚀 **后台 AI 稽核已正式启动（单号 `{job.job_id}`）**\n"
             f"{resume_banner}"
             f"• **生效模型版本**：`{job.active_model_version}`\n"
             f"• **生效提示词版本**：`{job.active_prompt_version}`\n"
-            f"• 稽核完成后将在您的原 Google Drive 文件夹内自动生成 `📁 违规证据切片_Evidence/` 与《门店稽核报告与 Token 账单 Sheet》；期间可随时在本对话中询问「进度怎么样了」查看实时进度。"
+            f"{output_line}"
         )
     if decision.action == TurnAction.STATUS:
         job = await audit_service.get_status(user_id, decision.job_id or None)
@@ -304,18 +310,26 @@ async def _handle_conversation_turn(
             job.preflight_report.videos if job.preflight_report is not None else None
         )
         done_segs = len(job.completed_segments)
+        gcs_job = is_gcs_target(job.folder_id)
         if job.state.value == "done":
+            report_lines = (
+                f"• 📊 **稽核报告（Excel .xlsx）**：{job.report_sheet_url}\n"
+                f"• 📁 **GCS 报告与违规证据切片目录**：[点击打开 Google Cloud Storage 目录]({build_gcs_console_folder_url(job.folder_id)})"
+                if gcs_job
+                else f"• 专属报告 Sheet：{job.report_sheet_url}"
+            )
             return (
                 f"✅ **任务 `{job.job_id}` 已完成！**\n"
                 f"• 已完成：`{done_segs}/{total_segs}` {unit}\n"
                 f"• 检出违规事件：`{job.violations_found}` 项\n"
                 f"• 累计消耗 Token：`{job.total_tokens_used:,}`\n"
-                f"• 专属报告 Sheet：{job.report_sheet_url}"
+                f"{report_lines}"
             )
         if job.state.value == "failed":
             if job.needs_operator_fix:
+                where = "GCS 存储桶权限或配置" if gcs_job else "Google Drive 权限或配置"
                 return (
-                    f"⚠️ **任务 `{job.job_id}` 暂停：Google Drive 权限或配置需要处理（已完成 `{done_segs}/{total_segs}` {unit}）**\n"
+                    f"⚠️ **任务 `{job.job_id}` 暂停：{where}需要处理（已完成 `{done_segs}/{total_segs}` {unit}）**\n"
                     f"• 需要处理：{job.error_message or '未知配置问题'}\n"
                     "• 处理好之后回复「**确认开始**」即可继续，已完成的部分不会重复消耗 Token。"
                 )
@@ -329,7 +343,9 @@ async def _handle_conversation_turn(
             f"• **稽核进度**：已完成 `{done_segs}/{total_segs}` {unit}（已消耗 `{job.total_tokens_used:,}` Tokens）\n"
             f"• **自动续跑次数**：`{job.resume_count}` 次"
         )
-    return decision.reply_summary or "请粘贴您的 Google Drive 监控视频文件夹链接以启动预检。"
+    return decision.reply_summary or (
+        "请粘贴您的 Google Drive 监控视频文件夹链接，或 GCS 目录（`gs://存储桶/目录` 或 Cloud Console Storage 链接）以启动预检。"
+    )
 
 
 class InspectRequestPayload(BaseModel):
@@ -522,7 +538,7 @@ async def http_execute(payload: ExecuteRequestPayload) -> Dict[str, Any]:
     return job.model_dump()
 
 
-_HISTORICAL_URL_RE = re.compile(r"https?://\S+")
+_HISTORICAL_URL_RE = re.compile(r"(?:https?|gs)://\S+", re.IGNORECASE)
 
 
 def _extract_adk_turn_text(inner: Dict[str, Any]) -> str:
@@ -531,7 +547,7 @@ def _extract_adk_turn_text(inner: Dict[str, Any]) -> str:
     Keeps at most the last 4 historical events, truncates each historical event to its first
     non-empty line (`<= 160` chars), and masks historical URLs (`<历史链接>`) so:
     1. Multi-kilobyte assistant markdown tables do not bloat the router prompt.
-    2. Old Drive URLs from previous turns in `events[]` cannot re-trigger `TurnAction.INSPECT`
+    2. Old Drive / `gs://` URLs from previous turns in `events[]` cannot re-trigger `TurnAction.INSPECT`
        or bypass `verify_url_verbatim` when the current user message has no URL (e.g. "确认开始").
     """
     raw_msg = inner.get("message")

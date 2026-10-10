@@ -30,6 +30,7 @@ from .agentic_auditor import (
 )
 from .config import config
 from .gcp import WorkspaceConfigError, gemini_timeout_ms_for_slice
+from .gcs_gateway import build_source_video_url, safe_storage_id_slug
 from .jobs import AuditJob, JobState, SegmentCheckpoint, UserScopedJobStore
 from .prompt_manager import PromptManager, PromptModelConfig
 from .video_ingestor import (
@@ -166,7 +167,8 @@ class AuditService:
         if gateway is None:
             return ""
         checks = [asyncio.wait_for(gateway.probe_write_access(folder_id), timeout=30.0)]
-        if config.master_prompt_sheet_id:
+        # GCS (Zero-GWS) targets never depend on Workspace: skip the SOP Sheet probe there.
+        if not folder_id.startswith("gs://") and config.master_prompt_sheet_id:
             checks.append(
                 asyncio.wait_for(
                     gateway.check_sheet_readable(config.master_prompt_sheet_id), timeout=15.0
@@ -483,7 +485,7 @@ class AuditService:
 
                     # GCS Upload Offload to bypass Gemini 256MB inline chunk limits (v1beta File API natively supports gs:// URIs)
                     if self.jobs._should_sync_live_gcs() and self.jobs._gcs_bucket:
-                        gcs_obj_name = f"jobs/media/{job.job_id}/{video_item.file_id}/seg_{idx}.mp4"
+                        gcs_obj_name = f"jobs/media/{job.job_id}/{safe_storage_id_slug(video_item.file_id)}/seg_{idx}.mp4"
                         logger.info("Offloading video slice %s to gs://%s/%s to bypass 256MB inline constraints", ckpt_key, self.jobs._gcs_bucket, gcs_obj_name)
                         
                         def _upload_media() -> None:
@@ -534,11 +536,7 @@ class AuditService:
                     # so that if a container restarts and resumes from GCS, every finding in the
                     # checkpoint already holds its permanent playable Drive video link.
                     enriched_slice_findings: List[Finding] = []
-                    source_video_url = (
-                        f"https://drive.google.com/file/d/{video_item.file_id}/view"
-                        if video_item.file_id
-                        else ""
-                    )
+                    source_video_url = build_source_video_url(video_item.file_id)
                     for f_item in win_res.findings:
                         if (
                             f_item.evidence_clip_local_path

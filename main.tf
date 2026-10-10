@@ -109,17 +109,17 @@ variable "container_image" {
 }
 
 variable "master_prompt_sheet_id" {
-  description = "Google Sheet ID (bare ID or full docs.google.com/spreadsheets URL) for the Master Prompt & Model Config Center (REQ-013)"
+  description = "Google Sheet ID (bare ID or full docs.google.com/spreadsheets URL) for the Master Prompt & Model Config Center (REQ-013). Set to \"\" for Zero-GWS / GCS fallback mode: the engine then uses the bundled V25 baseline rules and needs no Google Workspace."
   type        = string
 
   # Mirrors cctv_audit/config.py::extract_spreadsheet_id so a mis-pasted Drive *folder*
-  # link is rejected at `terraform plan`, not at cold start.
+  # link is rejected at `terraform plan`, not at cold start. "" = Zero-GWS mode.
   validation {
-    condition = can(regex(
+    condition = var.master_prompt_sheet_id == "" || can(regex(
       "^([a-zA-Z0-9_-]{15,}|https://docs\\.google\\.com/spreadsheets/(u/[0-9]+/)?d/[a-zA-Z0-9_-]{15,}.*)$",
       var.master_prompt_sheet_id
     ))
-    error_message = "master_prompt_sheet_id must be a bare Spreadsheet ID (>=15 chars) or a https://docs.google.com/spreadsheets/[u/N/]d/<ID>/... URL."
+    error_message = "master_prompt_sheet_id must be \"\" (Zero-GWS / GCS fallback mode), a bare Spreadsheet ID (>=15 chars) or a https://docs.google.com/spreadsheets/[u/N/]d/<ID>/... URL."
   }
 }
 

@@ -233,6 +233,24 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 3. Agent 先做预检（权限、视频数量/时长、切片计划、生效规则和模型版本），回复"确认开始"后任务在后台运行，可以关掉页面。
 4. 随时问"好了么"查进度；完成后回复报告 Sheet 链接（若开启了 Google Chat 通知，也会在聊天室自动 `@` 发起人并附上报告链接）。
 
+### Zero-GWS / GCS 兜底模式（没有 Google Workspace 时）
+
+没有 Google Workspace（或暂时不想配 Drive 域委派）时，可以把视频放在 GCS 里，用法几乎一样：
+
+1. **配置**：`<env>.tfvars` 里设置 `master_prompt_sheet_id = ""`，然后重新执行第 5 步部署。此时不读 SOP 总控表，直接用内置的 V25 基准规则库（日志里会打印 `MASTER_PROMPT_SHEET_ID 未配置（Zero-GWS 模式）...`）。第 6、7 步（域委派、共享 Drive 文件夹）可以跳过。
+2. **授权**：在存放视频的存储桶上，把 `roles/storage.objectAdmin` 授予 Worker 服务账号（`<p>-worker@<项目ID>.iam.gserviceaccount.com`）。只读视频要 `objectViewer`；写回 Excel 报告和证据切片要 `objectAdmin`：
+   ```bash
+   gcloud storage buckets add-iam-policy-binding gs://<视频桶> \
+     --member="serviceAccount:<p>-worker@<项目ID>.iam.gserviceaccount.com" --role="roles/storage.objectAdmin"
+   ```
+3. **使用**：在 GE 里发送 `gs://<视频桶>/<门店目录>`，或者控制台 Storage 页面的链接（`https://console.cloud.google.com/storage/browser/<视频桶>/<门店目录>`）。系统只读取该目录下直接放着的视频文件，不进子目录。
+4. **结果放在哪**（都在同一个 GCS 目录里）：
+   - `📊 AI稽核报告与Token账单.xlsx`：Excel 报告，两个工作表分别是「违规事件 3 秒复核台」和「本次视频 Token 消耗与耗时账单」，证据链接可以直接点开；
+   - `📁 违规证据切片_Evidence/`：每条违规对应的 20 秒 MP4 证据切片。
+
+   任务完成时，GE 会回复 Excel 报告链接和这个 GCS 目录的控制台链接。
+5. **不能用的目录**：本服务自己的暂存桶（`STAGING_BUCKET`）根目录，以及其中的 `jobs/`、`eval/`、`smoke/`、`agent_platform_eval/` 目录，存的是任务状态和评测文件，会被直接拒绝。请用别的目录（例如 `gs://<暂存桶>/stores/<门店>/`）或者另开一个桶。
+
 ## 7. 运行测试
 
 ```bash

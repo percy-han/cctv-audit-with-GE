@@ -899,8 +899,11 @@ def main(argv: list[str] | None = None) -> int:
     p_create.add_argument(
         "--master-prompt-sheet-id",
         default=os.environ.get("MASTER_PROMPT_SHEET_ID", ""),
-        required=not bool(os.environ.get("MASTER_PROMPT_SHEET_ID")),
-        help="Master SOP Google Sheet ID or URL",
+        required=False,
+        help=(
+            "Master SOP Google Sheet ID or URL; empty = Zero-GWS mode "
+            "(the engine uses the bundled V25 baseline rules)"
+        ),
     )
     p_create.add_argument("--staging-bucket", default=os.environ.get("STAGING_BUCKET", ""))
     p_create.add_argument("--service-account", default=os.environ.get("ENGINE_SERVICE_ACCOUNT", ""))

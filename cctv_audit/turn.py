@@ -38,16 +38,16 @@ class TurnDecision(BaseModel):
 
     action: TurnAction = Field(
         description=(
-            "本轮用户意图分类：inspect=提供新的 Google Drive 文件夹/视频链接发起预检；"
+            "本轮用户意图分类：inspect=提供新的 Google Drive 文件夹/视频链接，或 GCS 目录（gs://存储桶/目录 或 Cloud Console Storage 链接）发起预检；"
             "confirm=同意/确认启动刚才预检通过的稽核任务（如'确认开始'、'好'、'行吧那就跑'）；"
             "status=询问当前正在运行的稽核任务进度或结果；"
-            "unclear=意图不明或缺少 Drive 链接，需礼貌反问。"
+            "unclear=意图不明或缺少 Drive 链接 / GCS 目录，需礼貌反问。"
         )
     )
     drive_url: str = Field(
         default="",
         description=(
-            "当 action=inspect 时，逐字符原样提取对话中的 Google Drive 链接或文件夹 ID；"
+            "当 action=inspect 时，逐字符原样提取对话中的 Google Drive 链接或文件夹 ID，或 GCS 路径（gs://... 或 Cloud Console Storage 链接）；"
             "严禁改写或臆造。若对话中无链接则留空。"
         ),
     )
@@ -63,10 +63,10 @@ class TurnDecision(BaseModel):
 
 _ROUTER_SYSTEM_INSTRUCTION = """你是霸王茶姬 (CHAGEE) 门店视频 AI 稽核助手的会话路由器。
 本系统采用严格的两步式受控工作流：
-- 第一步 (`inspect`)：督导粘贴个人专属 Google Drive 文件夹链接，系统执行秒级 `<720P` 分辨率预检与 Token 报数；
+- 第一步 (`inspect`)：督导粘贴个人专属 Google Drive 文件夹链接，或无 Google Workspace 时粘贴 GCS 目录（`gs://存储桶/目录` 或 Cloud Console Storage 链接），系统执行秒级 `<720P` 分辨率预检与 Token 报数；
 - 第二步 (`confirm`)：督导看到预检报告后表示同意（例如说“确认开始”、“好的”、“可以，跑吧”、“开始稽核”），系统才正式启动后台消音切片与 AI 稽核；
 - 查询进度 (`status`)：督导询问“跑完了吗”、“进度如何”。
-请严格按 `TurnDecision` JSON Schema 输出分类结果。注意：`drive_url` 必须逐字符出现在用户输入中，严禁自己编造链接！"""
+请严格按 `TurnDecision` JSON Schema 输出分类结果。注意：`drive_url`（Drive 链接或 GCS 路径）必须逐字符出现在用户输入中，严禁自己编造链接！"""
 
 
 def verify_url_verbatim(decision: TurnDecision, raw_conversation_text: str) -> TurnDecision:
@@ -82,7 +82,7 @@ def verify_url_verbatim(decision: TurnDecision, raw_conversation_text: str) -> T
                 action=TurnAction.UNCLEAR,
                 drive_url="",
                 job_id="",
-                reply_summary="未在您的消息中识别到真实的 Google Drive 文件夹链接，请粘贴完整的 Google Drive 文件夹链接（如 `https://drive.google.com/drive/folders/...`）。",
+                reply_summary="未在您的消息中识别到真实的 Google Drive 文件夹链接或 GCS 目录，请粘贴完整的 Google Drive 文件夹链接（如 `https://drive.google.com/drive/folders/...`），或 GCS 目录（如 `gs://存储桶/门店目录`）。",
             )
     return decision
 
@@ -96,7 +96,7 @@ async def classify_turn_with_llm(
     if not cleaned:
         return TurnDecision(
             action=TurnAction.UNCLEAR,
-            reply_summary="请粘贴您需要稽核的 Google Drive 监控视频文件夹链接。",
+            reply_summary="请粘贴您需要稽核的 Google Drive 监控视频文件夹链接，或 GCS 目录（`gs://存储桶/门店目录`）。",
         )
 
     gen_config = types.GenerateContentConfig(

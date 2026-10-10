@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from .config import config
 from .gcp import gemini_timeout_ms_for_slice, generate_content_with_retry
+from .gcs_gateway import build_source_video_url
 from .prompt_manager import PromptModelConfig
 from .video_ingestor import VideoSliceSegment
 
@@ -647,7 +648,7 @@ class AgenticAuditor:
             ):
                 clean_f = clean_f.model_copy(
                     update={
-                        "evidence_drive_url": f"https://drive.google.com/file/d/{segment.source_file_id}/view"
+                        "evidence_drive_url": build_source_video_url(segment.source_file_id)
                     }
                 )
             clean_f = clean_f.with_segment_context(

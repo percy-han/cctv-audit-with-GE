@@ -24,7 +24,7 @@ class ChageeCctvAuditAdkAgent(BaseAgent):
             user_text = "".join(p.text or "" for p in ctx.user_content.parts).strip()
 
         user_email = getattr(ctx, "user_id", None) or os.environ.get("LOCAL_ADK_USER_ID", "local-user@example.com")
-        if "drive.google.com" in user_text:
+        if any(k in user_text for k in ("drive.google.com", "gs://", "console.cloud.google.com/storage")):
             job = await audit_service.preflight(
                 user_id=user_email,
                 drive_url=user_text,
@@ -37,7 +37,7 @@ class ChageeCctvAuditAdkAgent(BaseAgent):
             )
         else:
             reply = (
-                "请粘贴您的 Google Drive 监控视频文件夹链接（如 `https://drive.google.com/drive/folders/...`），"
+                "请粘贴您的 Google Drive 监控视频文件夹链接（如 `https://drive.google.com/drive/folders/...`）或 GCS 目录（如 `gs://存储桶/门店目录`），"
                 "系统将先执行 `<720P` 分辨率秒级预检与 Token 估算。"
             )
 

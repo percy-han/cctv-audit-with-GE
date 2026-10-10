@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from .agentic_auditor import Finding, Status, TokenLedgerRow
 from .config import config
 from .gcp import resolve_chat_user_id
+from .gcs_gateway import build_source_video_url, is_gcs_target, safe_storage_id_slug
 
 logger = logging.getLogger("cctv_audit.workspace_reporter")
 
@@ -105,9 +106,7 @@ class WorkspaceReporter:
         """Filters reportable findings (`Status.VIOLATION`) and enforces `PENDING_HUMAN_REVIEW` (`CON-007`)."""
         rows: List[ViolationSheetRow] = []
         fallback_url = (
-            f"https://drive.google.com/file/d/{source_video_file_id}/view"
-            if source_video_file_id
-            else ""
+            build_source_video_url(source_video_file_id) if source_video_file_id else ""
         )
         for f in findings:
             clean = f.sanitise()
@@ -141,7 +140,10 @@ class WorkspaceReporter:
         """Creates `Evidence/` subfolder + Dual-Tab Google Sheet inside `parent_folder_id` and notifies user."""
         sheet_title = REPORT_SHEET_TITLE
 
-        evidence_subfolder_id = f"ev_{parent_folder_id[:8]}"
+        if is_gcs_target(parent_folder_id):
+            evidence_subfolder_id = f"ev_{safe_storage_id_slug(parent_folder_id)[:12]}"
+        else:
+            evidence_subfolder_id = f"ev_{parent_folder_id[:8]}"
         if self._gateway is not None:
             evidence_subfolder_id = await asyncio.wait_for(
                 self._gateway.ensure_subfolder(

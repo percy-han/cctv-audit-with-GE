@@ -1033,12 +1033,12 @@ class PromptManager:
         # `None` => use the Terraform/Cloud Run-injected default sheet.
         # `""`   => caller deliberately opted out of Sheets; stay on the bundled baseline.
         if sheet_id is None:
-            if not config.master_prompt_sheet_id:
-                raise RuntimeError(
-                    "MASTER_PROMPT_SHEET_ID is not set: every deployment names its own Master Prompt "
-                    "Sheet (main.tf var.master_prompt_sheet_id); there is no code default."
-                )
-            target_sheet_id = config.master_prompt_sheet_id
+            if config.master_prompt_sheet_id:
+                target_sheet_id = config.master_prompt_sheet_id
+            else:
+                # Zero-GWS deployments (main.tf master_prompt_sheet_id = "") have no Sheet at all.
+                logger.info("MASTER_PROMPT_SHEET_ID 未配置（Zero-GWS 模式），将直接使用内置 V25 基准规则库。")
+                target_sheet_id = ""
         elif sheet_id.strip():
             target_sheet_id = extract_spreadsheet_id(sheet_id)
         else:
