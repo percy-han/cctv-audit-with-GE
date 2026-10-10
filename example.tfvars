@@ -19,6 +19,7 @@ workspace_impersonate_user = "<bot-user@customer-domain>" # "" = the worker SA i
 # eval_results_folder_id = "<drive-folder-id>"  # eval runs create one timestamped Sheet report here;
 #                                               # share it (Editor) with workspace_impersonate_user. "" = no report
 # eval_golden_uri       = "gs://<private-bucket>/golden/<name>.jsonl" # golden set for eval scoring (+ <name>.manifest.json); "" = repo default
+# eval_golden_sheet_id  = "<label-sheet-id>"   # OR: the customer's label Sheet with a 测评配置 tab (set only one of the two)
 # ge_company_name       = "<Company>"          # shown by the new Gemini Enterprise app
 # ge_tenant_label       = "<brand>"            # used in agent descriptions / default display names
 # ge_agent_display_name = "<agent name>"       # default: "<brand> 门店监控 AI 稽核专家 [<name_prefix>]"; keep it unique per stack

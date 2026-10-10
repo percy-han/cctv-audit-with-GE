@@ -21,8 +21,10 @@ side by side (local path or ``gs://``):
   - ``item_overrides``: ``{item_id: {"sop_category": ..., "temporal_mode": ...}}`` for frozen golden
     files that cannot be edited without changing their hash.
 
-``golden_version`` = ``<stem>@<sha256[:10]>`` over the canonicalised golden lines plus the canonical
-manifest (both define the ruler: windows, categories, clip universe, guardrail set). Recall scored on
+``golden_version`` = ``<stem>@<sha256[:10]>`` over the *scoring ruler* only (scheme ``ruler-v2``): the
+golden lines minus provenance fields, plus the ruler part of the manifest (clip universe per folder,
+item overrides, stable-baseline set). Notes, clip metadata, Drive folder / cache job IDs and source
+timestamps do not change it; full-content hashes are kept separately for audit. Recall scored on
 different golden versions is never averaged or charted together.
 """
 
@@ -68,6 +70,51 @@ def canonical_manifest_sha256(manifest: Mapping[str, Any] | None) -> str:
     return hashlib.sha256(_canonical_line(manifest).encode("utf-8")).hexdigest()
 
 
+VERSION_SCHEME = "ruler-v2"
+# Golden-line fields nothing in scoring reads (provenance only); excluded from the ruler hash.
+PROVENANCE_ITEM_FIELDS = frozenset({"source_sheet_id", "source_sha256", "outlet_no"})
+RULER_OVERRIDE_KEYS = ("sop_category", "temporal_mode", "stable_baseline")
+
+
+def ruler_golden_sha256(raw: bytes) -> str:
+    """sha256 over the golden lines minus provenance fields (``PROVENANCE_ITEM_FIELDS``): every field
+    eval/score_run.py or this module reads -- ids, split, outlet/focus, clause, label text, videos,
+    parts (OSD, descriptions), optional sop_category / temporal_mode / stable_baseline / drive_folder_id."""
+    text = raw.decode("utf-8-sig").replace("\r\n", "\n")
+    lines = []
+    for ln in text.split("\n"):
+        if ln.strip():
+            obj = {k: v for k, v in json.loads(ln).items() if k not in PROVENANCE_ITEM_FIELDS}
+            lines.append(_canonical_line(obj))
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def ruler_manifest(manifest: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The manifest fields that change scoring: clip universe per folder (group, label, file_id +
+    filename; order-free), item overrides and the stable-baseline set. Excludes the free-text note,
+    Drive folder IDs, cache job IDs and clip metadata (duration / size / resolution)."""
+    m = manifest or {}
+    out: dict[str, Any] = {}
+    if m.get("stable_baseline_items"):
+        out["stable_baseline_items"] = sorted(str(x) for x in m["stable_baseline_items"])
+    overrides = {str(k): {kk: vv for kk, vv in (v or {}).items() if kk in RULER_OVERRIDE_KEYS}
+                 for k, v in (m.get("item_overrides") or {}).items()}
+    overrides = {k: v for k, v in overrides.items() if v}
+    if overrides:
+        out["item_overrides"] = overrides
+    if m.get("folders"):
+        out["folders"] = sorted(
+            ({"group_id": str(f.get("group_id") or ""), "label": str(f.get("label") or ""),
+              "videos": sorted(({"file_id": str(v["file_id"]), "filename": str(v["filename"])}
+                                for v in f.get("videos") or []), key=lambda v: (v["filename"], v["file_id"]))}
+             for f in m["folders"]), key=lambda f: f["group_id"])
+    return out
+
+
+def ruler_manifest_sha256(manifest: Mapping[str, Any] | None) -> str:
+    return canonical_manifest_sha256(ruler_manifest(manifest))
+
+
 def compute_golden_version(stem: str, golden_sha: str, manifest_sha: str) -> str:
     combined = hashlib.sha256(f"{golden_sha}\n{manifest_sha}".encode("utf-8")).hexdigest() if manifest_sha \
         else golden_sha
@@ -107,10 +154,14 @@ class GoldenSet:
     source: str
     stem: str
     items: list[dict[str, Any]]
-    golden_sha256: str
+    golden_sha256: str  # ruler hash (feeds golden_version)
     manifest: dict[str, Any] = field(default_factory=dict)
-    manifest_sha256: str = ""
+    manifest_sha256: str = ""  # ruler hash (feeds golden_version)
     manifest_source: str = ""
+    golden_sha256_full: str = ""  # full-content hashes, audit only
+    manifest_sha256_full: str = ""
+    raw: bytes = b""  # the golden JSONL bytes this set was built from (snapshotted with every run)
+    origin: dict[str, Any] = field(default_factory=dict)  # e.g. the source label Sheet (eval/golden_sheet.py)
 
     @property
     def version(self) -> str:
@@ -152,16 +203,34 @@ class GoldenSet:
         return {
             "golden_version": self.version,
             "golden_source": self.source,
+            "golden_version_scheme": VERSION_SCHEME,
             "golden_sha256": self.golden_sha256,
+            "golden_sha256_full": self.golden_sha256_full,
             "manifest_source": self.manifest_source,
             "manifest_sha256": self.manifest_sha256,
+            "manifest_sha256_full": self.manifest_sha256_full,
             "item_count": self.item_count,
             "part_count": self.part_count,
             "split_counts": self.split_counts,
             "video_count": self.video_count,
             "stable_baseline_items": stable,
             "stable_baseline_source": stable_src,
+            **({"golden_origin": dict(self.origin)} if self.origin else {}),
         }
+
+    def write_snapshot(self, dest_dir: Path) -> Path:
+        """Writes ``<stem>.jsonl`` (+ ``<stem>.manifest.json``) to ``dest_dir``; reloading it yields the
+        same ``golden_version``. Returns the JSONL path."""
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        path = dest_dir / f"{self.stem}.jsonl"
+        path.write_bytes(self.raw)
+        if self.manifest:
+            (dest_dir / f"{self.stem}{MANIFEST_SUFFIX}").write_text(
+                json.dumps(self.manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        if self.origin:
+            (dest_dir / "golden_origin.json").write_text(
+                json.dumps(self.origin, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return path
 
 
 def _apply_overrides(items: list[dict[str, Any]], manifest: Mapping[str, Any]) -> None:
@@ -202,17 +271,25 @@ def load_golden(golden_uri: str | Path, manifest_uri: str | None = None) -> Gold
     raw = _read_bytes(src)
     if raw is None:
         raise FileNotFoundError(f"黄金集文件不存在: {src}")
-    items = [json.loads(ln) for ln in raw.decode("utf-8-sig").splitlines() if ln.strip()]
     m_src = manifest_uri or manifest_path_for(src)
     m_raw = _read_bytes(m_src)
     manifest = json.loads(m_raw.decode("utf-8")) if m_raw else {}
+    stem = re.sub(r"\.jsonl$", "", src.rstrip("/").split("/")[-1])
+    return build_golden(raw, manifest, stem=stem, source=src, manifest_source=m_src if m_raw else "")
+
+
+def build_golden(raw: bytes, manifest: Mapping[str, Any] | None, *, stem: str, source: str,
+                 manifest_source: str = "", origin: Mapping[str, Any] | None = None) -> GoldenSet:
+    """A validated GoldenSet from golden JSONL bytes + manifest dict (file loader and Sheet loader share it)."""
+    items = [json.loads(ln) for ln in raw.decode("utf-8-sig").splitlines() if ln.strip()]
+    manifest = dict(manifest or {})
     _apply_overrides(items, manifest)
     validate_items(items)
-    stem = re.sub(r"\.jsonl$", "", src.rstrip("/").split("/")[-1])
     gs = GoldenSet(
-        source=src, stem=stem, items=items, golden_sha256=canonical_golden_sha256(raw),
-        manifest=manifest, manifest_sha256=canonical_manifest_sha256(manifest),
-        manifest_source=m_src if m_raw else "",
+        source=source, stem=stem, items=items, golden_sha256=ruler_golden_sha256(raw),
+        manifest=manifest, manifest_sha256=ruler_manifest_sha256(manifest),
+        golden_sha256_full=canonical_golden_sha256(raw), manifest_sha256_full=canonical_manifest_sha256(manifest),
+        manifest_source=manifest_source, raw=raw, origin=dict(origin or {}),
     )
     gs.stable_baseline()  # validates manifest ids
     return gs

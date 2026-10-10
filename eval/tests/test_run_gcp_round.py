@@ -126,6 +126,11 @@ class RunRoundOfflineTest(unittest.TestCase):
             # Scored and recorded into the round ledger.
             score = json.loads((tmp / "results" / run_id / "score.json").read_text(encoding="utf-8"))
             self.assertNotIn("_sdk_result", score)
+            # The exact golden used is snapshotted next to the results and reloads to the same version.
+            from eval.golden_set import load_golden
+            snap = tmp / "results" / run_id / "golden_snapshot" / "golden_v1.jsonl"
+            self.assertEqual(load_golden(snap).version, score["golden"]["golden_version"])
+            self.assertTrue((snap.parent / "golden_v1.manifest.json").exists())
             self.assertEqual(score["recall"]["all"]["rows"], 19)
             manifest = json.loads((rounds / "r01" / "manifest.json").read_text(encoding="utf-8"))
             self.assertIn(run_id, [r["run_id"] for r in manifest["runs"]])

@@ -87,7 +87,12 @@ class SpecTest(unittest.TestCase):
 
     def test_tabs_and_row_counts(self):
         spec = _spec()
-        self.assertEqual([t.title for t in spec.tables], ["本次测评概览", "本次逐题结果", "历史轮次对比", "历史单跑明细"])
+        self.assertEqual([t.title for t in spec.tables], ["本次测评概览", "本次逐题结果", "历史轮次对比", "历史单跑明细", "本次黄金集快照"])
+        snapshot = spec.tables[4]
+        self.assertEqual(len(snapshot.rows) - 1, 21)
+        r11b = next(r for r in snapshot.rows if r[1] == "R11b")
+        self.assertEqual(r11b[snapshot.col("标注时间点 (OSD)")], "12:11:00")
+        self.assertEqual(r11b[snapshot.col("SOP 大类来源")], "audit_clause")  # raw golden lines, no manifest
         items = spec.tables[1]
         self.assertEqual(len(items.rows) - 1, 21)  # 19 golden items, 2 of them compound
         rounds = spec.tables[2]
@@ -151,7 +156,7 @@ class SpecTest(unittest.TestCase):
         spec = _spec()
         reqs = srp.build_structure_requests(spec, [0])
         adds = [r["addSheet"]["properties"] for r in reqs if "addSheet" in r]
-        self.assertEqual(len(adds), 4)
+        self.assertEqual(len(adds), 5)
         self.assertTrue(all(a["gridProperties"]["frozenRowCount"] == 1 for a in adds))
         self.assertIn({"deleteSheet": {"sheetId": 0}}, reqs)
         self.assertEqual(reqs[0]["updateSpreadsheetProperties"]["properties"]["timeZone"], "Asia/Singapore")

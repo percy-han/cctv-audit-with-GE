@@ -1,0 +1,84 @@
+# Read-only check / one-time config-tab setup of the customer's golden label Sheet (eval/golden_sheet.py),
+# run as the stack's worker SA so it uses exactly the Workspace identity the eval runs use (keyless DWD).
+# Every operator input is a separate, validated substitution; nothing is passed to bash unquoted.
+# Usage from `03_implementation/03_iac_and_code/` (P=project, R=region):
+#   WORKER_SA=<main.tf output worker_service_account_email>; BUCKET=<main.tf output staging_bucket_name>
+#   IMG=$(gcloud run services describe <name_prefix>-worker --project=$P --region=$R \
+#     --format='value(spec.template.spec.containers[0].image)')
+#   gcloud builds submit --project=$P --region=$R --config=eval/cloudbuild_golden_sheet.yaml \
+#     --service-account=projects/$P/serviceAccounts/$WORKER_SA \
+#     --gcs-log-dir=gs://$BUCKET/eval/cloudbuild-logs --gcs-source-staging-dir=gs://$BUCKET/eval/source \
+#     --substitutions=_IMAGE=$IMG,_WORKER_SA=$WORKER_SA,_WORKSPACE_IMPERSONATE_USER=<bot user>,\
+#   _GOLDEN_SHEET_CMD=check,_GOLDEN_SHEET_ID=$(terraform output -raw eval_golden_sheet_id) .
+# Substitutions:
+#   _GOLDEN_SHEET_CMD   check | init-config
+#   _GOLDEN_SHEET_ID    bare Spreadsheet ID
+#   _COMPARE_VERSION    (check, optional) a previous golden_version, e.g. golden_v1@9426fe9b52
+#   _BUILD_CONFIG / _MANIFEST  (init-config) eval/data/<name>.build.json / eval/data/<name>.manifest.json
+#   _LABEL_RANGE        (init-config, optional) e.g. Sheet1!A1:F40
+#   _INIT_CONFIG_FLAGS  (init-config, optional) any of: dry-run overwrite  (space- or comma-separated)
+timeout: '900s'
+
+substitutions:
+  _IMAGE: ''
+  _WORKER_SA: ''
+  _WORKSPACE_IMPERSONATE_USER: ''
+  _GOLDEN_SHEET_CMD: 'check'
+  _GOLDEN_SHEET_ID: ''
+  _COMPARE_VERSION: ''
+  _BUILD_CONFIG: ''
+  _MANIFEST: ''
+  _LABEL_RANGE: ''
+  _INIT_CONFIG_FLAGS: ''
+
+steps:
+  - id: 'golden-sheet'
+    name: '${_IMAGE}'
+    entrypoint: 'bash'
+    env:
+      - 'WORKSPACE_IMPERSONATE_USER=${_WORKSPACE_IMPERSONATE_USER}'
+      - 'WORKSPACE_DWD_SERVICE_ACCOUNT=${_WORKER_SA}'
+      - 'PYTHONPATH=/workspace'
+      - 'GS_CMD=${_GOLDEN_SHEET_CMD}'
+      - 'GS_SHEET_ID=${_GOLDEN_SHEET_ID}'
+      - 'GS_COMPARE=${_COMPARE_VERSION}'
+      - 'GS_BUILD=${_BUILD_CONFIG}'
+      - 'GS_MANIFEST=${_MANIFEST}'
+      - 'GS_RANGE=${_LABEL_RANGE}'
+      - 'GS_FLAGS=${_INIT_CONFIG_FLAGS}'
+    args:
+      - '-ceu'
+      - |
+        die() { echo "$$1" >&2; exit 2; }
+        [[ -n "${_IMAGE}" && -n "${_WORKER_SA}" ]] || die "substitutions _IMAGE and _WORKER_SA are required"
+        [[ "$$GS_SHEET_ID" =~ ^[A-Za-z0-9_-]{15,}$ ]] || die "_GOLDEN_SHEET_ID must be a bare Spreadsheet ID"
+        ARGS=("$$GS_CMD" --sheet-id "$$GS_SHEET_ID")
+        case "$$GS_CMD" in
+          check)
+            if [[ -n "$$GS_COMPARE" ]]; then
+              [[ "$$GS_COMPARE" =~ ^[A-Za-z0-9._-]+@[0-9a-f]{10}$ ]] || die "_COMPARE_VERSION must look like name@0123456789"
+              ARGS+=(--compare "$$GS_COMPARE")
+            fi
+            ;;
+          init-config)
+            [[ "$$GS_BUILD" =~ ^eval/data/[A-Za-z0-9._-]+\.build\.json$ ]] || die "_BUILD_CONFIG must be eval/data/<name>.build.json"
+            [[ "$$GS_MANIFEST" =~ ^eval/data/[A-Za-z0-9._-]+\.manifest\.json$ ]] || die "_MANIFEST must be eval/data/<name>.manifest.json"
+            ARGS+=(--from-build-config "$$GS_BUILD" --manifest "$$GS_MANIFEST")
+            if [[ -n "$$GS_RANGE" ]]; then
+              # Tab names may be quoted and non-ASCII ('第一周审核'!A1:F40); the value is one argv
+              # element (bash array), so only shape is checked: <tab>!<A1 range>, no newline, <=120 chars.
+              [[ ${#GS_RANGE} -le 120 && "$$GS_RANGE" != *$'\n'* && "$$GS_RANGE" =~ ^.+![A-Z]{1,3}[0-9]+:[A-Z]{1,3}[0-9]*$ ]] || die "_LABEL_RANGE must look like Sheet1!A1:F40 or '第一周'!A1:F40"
+              ARGS+=(--label-range "$$GS_RANGE")
+            fi
+            for f in $${GS_FLAGS//,/ }; do
+              case "$$f" in
+                dry-run|overwrite) ARGS+=("--$$f") ;;
+                *) die "_INIT_CONFIG_FLAGS: unknown flag '$$f' (allowed: dry-run overwrite)" ;;
+              esac
+            done
+            ;;
+          *) die "_GOLDEN_SHEET_CMD must be check or init-config" ;;
+        esac
+        python3 /workspace/deploy/ci_pipeline.py check-identity --expected "${_WORKER_SA}"
+        cd /workspace
+        python3 -m eval.golden_sheet "$${ARGS[@]}"

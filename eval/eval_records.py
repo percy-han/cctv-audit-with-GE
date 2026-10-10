@@ -140,6 +140,7 @@ def golden_fields(golden: dict[str, Any], recall: dict[str, Any] | None = None) 
     recall = recall or {}
     return {
         "golden_version": str(golden.get("golden_version") or GOLDEN_UNVERSIONED),
+        "golden_version_scheme": str(golden.get("golden_version_scheme") or ("legacy" if golden.get("golden_version") else "")),
         "golden_item_count": int(golden.get("item_count") or (recall.get("all") or {}).get("rows") or 0),
         "golden_part_count": int(golden.get("part_count") or 0),
         "golden_split_counts": dict(golden.get("split_counts") or {}),
@@ -370,6 +371,8 @@ def aggregate_round_monitoring_record(records_for_round: Sequence[dict[str, Any]
         "media_mode": str(last.get("media_mode") or "agentic"),
         "judge_model": str(last.get("judge_model") or ""),
         "golden_version": str(last.get("golden_version") or GOLDEN_UNVERSIONED),
+        "golden_version_scheme": str(last.get("golden_version_scheme") or ""),
+        **({"golden_version_legacy": str(last["golden_version_legacy"])} if last.get("golden_version_legacy") else {}),
         "golden_item_count": int(last.get("golden_item_count") or 0),
         "golden_part_count": int(last.get("golden_part_count") or 0),
         "golden_split_counts": dict(last.get("golden_split_counts") or {}),

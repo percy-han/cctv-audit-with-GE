@@ -15,7 +15,10 @@
 #   _STAGING_BUCKET=$BUCKET,_MASTER_PROMPT_SHEET_ID=<sheet id>,_WORKSPACE_IMPERSONATE_USER=<bot user>,\
 #   _EVAL_RESULTS_FOLDER_ID=$(terraform output -raw eval_results_folder_id),\
 #   _EVAL_REPORT_TIME_ZONE=$(terraform output -raw eval_report_time_zone),\
-#   _GOLDEN_URI=$(terraform output -raw eval_golden_uri) .
+#   _GOLDEN_URI=$(terraform output -raw eval_golden_uri),\
+#   _GOLDEN_SHEET_ID=$(terraform output -raw eval_golden_sheet_id) .
+# _GOLDEN_SHEET_ID = the customer's label Sheet with a 测评配置 tab (read live each run); set only one of
+# it and _GOLDEN_URI.
 # _GOLDEN_URI selects the golden set (gs://... or a path in the uploaded source tree; '' = the runner's
 # default). A rebuilt golden set is a new value here, not a code change.
 # Each run creates one timestamped Google Sheet report in _EVAL_RESULTS_FOLDER_ID (Terraform variable
@@ -44,6 +47,7 @@ substitutions:
   _EVAL_RESULTS_FOLDER_ID: ''     # main.tf output eval_results_folder_id ('' = no Sheet report)
   _EVAL_REPORT_TIME_ZONE: 'Asia/Singapore' # main.tf output eval_report_time_zone
   _GOLDEN_URI: ''                 # main.tf output eval_golden_uri ('' = eval/data/golden_v1.jsonl)
+  _GOLDEN_SHEET_ID: ''            # main.tf output eval_golden_sheet_id (label Sheet + 测评配置 tab)
 
 options:
   machineType: 'E2_HIGHCPU_8'
@@ -75,6 +79,7 @@ steps:
       - 'EVAL_REPORT_TIME_ZONE=${_EVAL_REPORT_TIME_ZONE}'
       # Read by eval/run_gcp_round.py (--golden default); gs:// is downloaded at start.
       - 'EVAL_GOLDEN_URI=${_GOLDEN_URI}'
+      - 'EVAL_GOLDEN_SHEET_ID=${_GOLDEN_SHEET_ID}'
       - 'PYTHONPATH=/workspace'
     args:
       - '-ce'

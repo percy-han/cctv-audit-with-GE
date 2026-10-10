@@ -248,7 +248,8 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 
 - **核心脚本**：
   - **黄金集不写死在代码里**：题目、题数、SOP 大类、门店、视频、文件夹、稳定基线题全部来自黄金集文件 `<name>.jsonl` 及可选的 `<name>.manifest.json`（格式与字段说明见 `eval/data/README.md`）。换黄金集只改配置：Terraform 变量 **`eval_golden_uri`**（`<env>.tfvars`，gs:// 或源码内路径）。**本仓库不附带黄金集**：变量为空时会去找 `eval/data/golden_v1.jsonl`，不存在就在调用任何模型之前报错退出并提示如何设置→ Cloud Build `_GOLDEN_URI=$(terraform output -raw eval_golden_uri)`。黄金集是客户私有数据，不要放进公开仓库，也不要放进 staging bucket（30 天自动删除）。
-  - 每次评测都记录 **`golden_version`**（文件名@内容哈希）和题数；不同版本黄金集的召回率不可比，按轮次取均值和 Sheet 历史对比都只在同一版本内进行。
+  - **推荐：直接读客户自己的标注表**。客户继续维护他们的「Manual Audit Result」标注页（程序不改动它），表格放在测评结果文件夹里，并加一页「测评配置」（黄金集名称、标注页范围、视频文件夹、开发集分组、复合题、逐题设置；格式见 `eval/data/README.md`）。每次评测实时读取这两页，并列出配置的 Drive 文件夹里的全部视频（包括没有标注的）。Terraform 变量 **`eval_golden_sheet_id`** → Cloud Build `_GOLDEN_SHEET_ID`；它和 `eval_golden_uri` 只能设一个。Workspace 身份需要对表格和视频文件夹至少有查看权限。自检：`python -m eval.golden_sheet check --sheet-id <ID>`；生成配置页：`python -m eval.golden_sheet init-config ...`。每次评测把实际使用的黄金集快照写到结果目录的 `golden_snapshot/`，Sheet 报告多一页「本次黄金集快照」。
+  - 每次评测都记录 **`golden_version`**（文件名@评分标尺哈希，方案 `ruler-v2`：只在题目、标注文本/时间、划分、视频清单、逐题设置、稳定基线题变化时改变；备注、视频时长/分辨率、缓存任务、来源时间戳不影响）和题数；不同版本黄金集的召回率不可比，按轮次取均值和 Sheet 历史对比都只在同一版本内进行。
   - `eval/build_dataset.py`：把客户人工稽核表冻结成黄金集 JSONL；数据集划分、复合题、来源表 ID、期望行数等都放在 `--config <name>.build.json`（配置格式与虚构示例见 `eval/data/README.md`）。
   - `eval/run_gcp_round.py`：用一个调优轮次（`eval/rounds/rNN/`）的规则跑全部验证视频、自动打分、追加写入 `eval/rounds/eval_history.jsonl` / `eval_round_averages.jsonl`，生成本次的 Google Sheet 报告（`--skip-sheet-report` 可跳过），并把结果同步到 GCS；支持通过 `eval/cloudbuild_round.yaml` 在 Cloud Build 上运行。
 

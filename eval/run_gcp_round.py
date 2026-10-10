@@ -13,8 +13,12 @@ Responsibilities:
    ``folders``, else derived from the golden items) in `agentic` video mode using
    `AgenticAuditor.analyze_segment`, reusing pre-sliced audio-stripped MP4s in GCS when
    available and falling back to Drive download + FFmpeg slice if missing.
-5. Scores the resulting folder JSONs against the golden set (``--golden`` / env ``EVAL_GOLDEN_URI``,
-   local path or gs://; Terraform ``eval_golden_uri`` -> Cloud Build ``_GOLDEN_URI``) via
+5. Scores the resulting folder JSONs against the golden set -- EITHER the customer's label Sheet +
+   ``测评配置`` tab (``--golden-sheet-id`` / env ``EVAL_GOLDEN_SHEET_ID``; Terraform ``eval_golden_sheet_id``
+   -> Cloud Build ``_GOLDEN_SHEET_ID``; eval/golden_sheet.py) OR a golden JSONL (``--golden`` / env
+   ``EVAL_GOLDEN_URI``, local path or gs://; Terraform ``eval_golden_uri`` -> ``_GOLDEN_URI``); setting
+   both fails before any model call. The materialised golden is snapshotted to
+   ``results/<run_id>/golden_snapshot/``. Scoring via
    `eval/score_run.py` (Vertex AI GenAI Eval SDK `LLMMetric` judge), updates
    `eval/rounds/<round_id>/manifest.json` + `eval/rounds/ledger.{json,md}`, and syncs
    artifacts to `gs://<staging_bucket>/eval/rounds/<round_id>/<run_id>/`.
@@ -31,7 +35,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 THIS_DIR = Path(__file__).resolve().parent
 CODE_ROOT = THIS_DIR.parent
@@ -97,11 +101,38 @@ logging.basicConfig(
 logger = logging.getLogger("eval.run_gcp_round")
 
 ENV_GOLDEN_URI = "EVAL_GOLDEN_URI"
+ENV_GOLDEN_SHEET_ID = "EVAL_GOLDEN_SHEET_ID"
 
 
 def default_golden_uri() -> str:
     """Golden location for this environment (env EVAL_GOLDEN_URI), else the repo-local default."""
     return os.environ.get(ENV_GOLDEN_URI, "").strip() or str(DEFAULT_GOLDEN_PATH)
+
+
+def resolve_golden_source(golden_arg: str | Path | None, sheet_arg: str | None,
+                          env: Mapping[str, str] | None = None) -> tuple[str, str]:
+    """("sheet", <id>) or ("file", <uri>). Both a Sheet and a file configured -> GoldenSetError
+    (no silent precedence); neither -> the repo-local default file."""
+    env = os.environ if env is None else env
+    uri = str(golden_arg or "").strip() or env.get(ENV_GOLDEN_URI, "").strip()
+    sheet = str(sheet_arg or "").strip() or env.get(ENV_GOLDEN_SHEET_ID, "").strip()
+    if uri and sheet:
+        raise GoldenSetError(
+            f"同时配置了黄金集标注表（eval_golden_sheet_id / --golden-sheet-id = {sheet}）和黄金集文件"
+            f"（eval_golden_uri / --golden = {uri}）：只能选一个，请把另一个清空")
+    if sheet:
+        return "sheet", sheet
+    return "file", uri or str(DEFAULT_GOLDEN_PATH)
+
+
+def load_golden_source(kind: str, ref: str, tmp_dir: Path) -> tuple[Path | None, GoldenSet]:
+    if kind == "sheet":
+        from eval.golden_sheet import default_services, load_golden_from_sheet
+
+        sheets, drive = default_services()
+        return None, load_golden_from_sheet(ref, sheets=sheets, drive=drive)
+    local = materialize_golden(ref, tmp_dir)
+    return local, load_golden(local)
 
 
 def folder_specs_from_golden(golden: GoldenSet) -> list[dict[str, Any]]:
@@ -539,14 +570,16 @@ async def run_round_async(args: argparse.Namespace) -> int:
 
     preloaded = getattr(args, "preloaded_golden", None)
     if preloaded is not None:
-        golden_local, golden = preloaded
+        _, golden = preloaded
     else:
-        golden_local = materialize_golden(str(args.golden), args.results_dir / f".golden_{run_id}")
-        golden = load_golden(golden_local)
+        kind, ref = resolve_golden_source(args.golden, getattr(args, "golden_sheet_id", None), env={})
+        _, golden = load_golden_source(kind, ref, args.results_dir / f".golden_{run_id}")
+    # Traceability: the exact golden this run is scored on travels with its results (uploaded to GCS).
+    golden_local = golden.write_snapshot(args.results_dir / run_id / "golden_snapshot")
     folder_specs = folder_specs_from_golden(golden)
     logger.info("Golden set %s: %d items / %d parts, %d folders / %d clips (%s)", golden.version,
                 golden.item_count, golden.part_count, len(folder_specs),
-                sum(len(s["videos"]) for s in folder_specs), args.golden)
+                sum(len(s["videos"]) for s in folder_specs), golden.source)
     sem = asyncio.Semaphore(max(1, int(args.folder_concurrency)))
 
     ckpt = ClipCheckpointStore(
@@ -592,6 +625,8 @@ async def run_round_async(args: argparse.Namespace) -> int:
         judge_model=args.judge_model,
     )
     sdk_res = score_doc.pop("_sdk_result", None)
+    if golden.origin:
+        score_doc.setdefault("golden", {}).update(golden_source=golden.source, golden_origin=dict(golden.origin))
     score_md = render_markdown(run_id, score_doc)
 
     res_dir = args.results_dir / run_id
@@ -718,9 +753,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--run-id", default=None, help="Optional explicit run ID (default: <round>_<MMDD_HHMM>)")
     parser.add_argument("--rounds-dir", type=Path, default=DEFAULT_ROUNDS_DIR)
     parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
-    parser.add_argument("--golden", default=default_golden_uri(),
+    parser.add_argument("--golden", default=None,
                         help="Golden JSONL, local path or gs:// (default: env EVAL_GOLDEN_URI, else the repo copy); "
                              "its <stem>.manifest.json sidecar is read from the same place")
+    parser.add_argument("--golden-sheet-id", default=None,
+                        help="Customer label Sheet with a 测评配置 tab (default: env EVAL_GOLDEN_SHEET_ID); "
+                             "mutually exclusive with --golden / EVAL_GOLDEN_URI")
     parser.add_argument("--judge-model", default=None, help="Optional judge model override (default: newest Pro)")
     parser.add_argument("--folder-concurrency", type=int, default=2, help="Max concurrent folders (default: 2)")
     parser.add_argument("--sync-sop-tab", action="store_true", help="Archive Prompt_v2.6_rNN tab to Master SOP Sheet")
@@ -731,11 +769,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="Keep per-clip checkpoints in this local dir instead of GCS (tests/local runs)")
     args = parser.parse_args(argv)
     # Golden first: no model / judge / Drive call happens before the ruler is known to be loadable.
+    ref = str(args.golden or args.golden_sheet_id or "")
     try:
-        golden_local = materialize_golden(str(args.golden), Path(tempfile.mkdtemp(prefix="golden_")))
-        args.preloaded_golden = (golden_local, load_golden(golden_local))
-    except (FileNotFoundError, GoldenSetError) as exc:
-        print(golden_setup_message(str(args.golden), exc), file=sys.stderr)
+        kind, ref = resolve_golden_source(args.golden, args.golden_sheet_id)
+        args.preloaded_golden = load_golden_source(kind, ref, Path(tempfile.mkdtemp(prefix="golden_")))
+    except Exception as exc:  # noqa: BLE001 - any failure here is reported before spend, without traceback
+        print(golden_setup_message(ref or str(DEFAULT_GOLDEN_PATH), exc), file=sys.stderr)
         return 2
     return asyncio.run(run_round_async(args))
 
@@ -743,8 +782,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 def golden_setup_message(golden_uri: str, exc: BaseException) -> str:
     """Operator-facing explanation when the golden set is missing or malformed (printed, no traceback)."""
     return (
-        f"无法加载黄金集（标准答案）：{golden_uri}\n  原因：{exc}\n"
+        f"无法加载黄金集（标准答案）：{golden_uri}\n  原因：{type(exc).__name__}: {exc}\n"
         "  本仓库不附带客户的黄金集数据。请任选其一：\n"
+        "  - 客户标注表：Terraform 设置 eval_golden_sheet_id = \"<标注表 ID>\"（表里需要「测评配置」页，"
+        "Workspace 身份对表格和视频文件夹至少有查看权限），Cloud Build 传 _GOLDEN_SHEET_ID；"
+        "先用 python -m eval.golden_sheet check --sheet-id <ID> 自检\n"
         "  - Terraform：在 <env>.tfvars 设置 eval_golden_uri = \"gs://<私有桶>/<路径>/<name>.jsonl\"，"
         "apply 后 Cloud Build 传 _GOLDEN_URI=$(terraform output -raw eval_golden_uri)\n"
         "  - 本地：python eval/run_gcp_round.py --golden <路径或 gs://...> ...\n"

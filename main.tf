@@ -237,6 +237,25 @@ variable "eval_golden_uri" {
   }
 }
 
+variable "eval_golden_sheet_id" {
+  description = <<-EOT
+    The customer's own label Sheet (bare Spreadsheet ID) the prompt-tuning eval reads its golden set
+    from, live, on every run: the customer-maintained label tab plus a "测评配置" (eval config) tab that
+    names the golden, the label range and the Drive folders holding the clips (eval/golden_sheet.py;
+    format in eval/data/README.md). Keep it in the eval_results_folder_id folder. The Workspace
+    identity (output workspace_identity) needs at least Viewer on the Sheet and on every video folder
+    the config tab lists. Mutually exclusive with eval_golden_uri. Read only by the eval Cloud Build
+    job (output eval_golden_sheet_id -> _GOLDEN_SHEET_ID). Empty = use eval_golden_uri / the default file.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.eval_golden_sheet_id == "" || can(regex("^[a-zA-Z0-9_-]{15,}$", var.eval_golden_sheet_id))
+    error_message = "eval_golden_sheet_id must be empty or a bare Spreadsheet ID (>= 15 chars of [a-zA-Z0-9_-]), not a URL."
+  }
+}
+
 variable "enable_google_chat_notification" {
   description = "Deployment-time switch to enable or disable sending job completion notifications (with @-mention of the initiating supervisor) to the Google Chat space."
   type        = bool
@@ -701,7 +720,8 @@ output "gemini_enterprise_console_url" {
 # Consumed by the eval Cloud Build job (eval/cloudbuild_round.yaml), not by the runtime:
 #   --substitutions=...,_EVAL_RESULTS_FOLDER_ID=$(terraform output -raw eval_results_folder_id),\
 #     _EVAL_REPORT_TIME_ZONE=$(terraform output -raw eval_report_time_zone),\
-#     _GOLDEN_URI=$(terraform output -raw eval_golden_uri)
+#     _GOLDEN_URI=$(terraform output -raw eval_golden_uri),\
+#     _GOLDEN_SHEET_ID=$(terraform output -raw eval_golden_sheet_id)
 output "eval_results_folder_id" {
   description = "Drive folder in which every eval run creates its own timestamped Google Sheet report (empty = report skipped)"
   value       = var.eval_results_folder_id
@@ -714,6 +734,16 @@ output "eval_golden_uri" {
   precondition {
     condition     = !startswith(var.eval_golden_uri, "gs://${local.staging_bucket_name}/")
     error_message = "eval_golden_uri must not point into the staging bucket: its lifecycle rule deletes objects after 30 days."
+  }
+}
+
+output "eval_golden_sheet_id" {
+  description = "Customer label Sheet (+ 测评配置 tab) the eval Cloud Build job reads its golden set from (_GOLDEN_SHEET_ID)"
+  value       = var.eval_golden_sheet_id
+
+  precondition {
+    condition     = var.eval_golden_sheet_id == "" || var.eval_golden_uri == ""
+    error_message = "Set only one of eval_golden_sheet_id and eval_golden_uri: the eval refuses to guess which golden set to use."
   }
 }
 

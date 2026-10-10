@@ -158,6 +158,43 @@ def build_items(
     return items
 
 
+class GoldenBuildError(ValueError):
+    """The label sheet + build settings do not produce a valid golden set (message is user-facing)."""
+
+
+def build_golden_records(
+    raw: list[list[str]],
+    filename_index: dict[str, str],
+    *,
+    source_sheet_id: str,
+    source_sha256: str,
+    dev_groups: set[tuple[str, str]] | frozenset[tuple[str, str]] = frozenset(),
+    text_compound_parts: dict[int, list[str]] | None = None,
+    item_fields: dict[str, dict[str, Any]] | None = None,
+    expected_rows: int | None = None,
+) -> list[dict[str, Any]]:
+    """Golden JSONL records (dicts, in sheet order) -- shared by this CLI and eval/golden_sheet.py."""
+    items = build_items(raw, filename_index, dev_groups=dev_groups, text_compound_parts=text_compound_parts)
+    if expected_rows is not None and len(items) != int(expected_rows):
+        raise GoldenBuildError(f"expected {expected_rows} rows, got {len(items)}")
+    item_fields = item_fields or {}
+    unknown = sorted(set(item_fields) - {i.item_id for i in items})
+    if unknown:
+        raise GoldenBuildError(f"item_fields for unknown item_id(s): {unknown}")
+    records = []
+    for it in items:
+        rec = dataclasses.asdict(it)
+        rec.update(item_fields.get(it.item_id) or {})
+        rec["source_sheet_id"] = source_sheet_id
+        rec["source_sha256"] = source_sha256
+        records.append(rec)
+    return records
+
+
+def records_to_jsonl(records: list[dict[str, Any]]) -> str:
+    return "".join(json.dumps(rec, ensure_ascii=False) + "\n" for rec in records)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--manual-json", required=True)
@@ -187,25 +224,19 @@ def main(argv: list[str] | None = None) -> int:
     for path in args.job:
         with open(path, encoding="utf-8") as fh:
             jobs.append(json.load(fh))
-    items = build_items(raw, build_filename_index(jobs), dev_groups=dev_groups,
-                        text_compound_parts=compound)
-    if expected_rows is not None and len(items) != int(expected_rows):
-        print(f"expected {expected_rows} rows, got {len(items)}", file=sys.stderr)
+    try:
+        records = build_golden_records(
+            raw, build_filename_index(jobs), source_sheet_id=source_sheet_id,
+            source_sha256=hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+            dev_groups=dev_groups, text_compound_parts=compound, item_fields=item_fields,
+            expected_rows=expected_rows)
+    except GoldenBuildError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
-    unknown = sorted(set(item_fields) - {i.item_id for i in items})
-    if unknown:
-        print(f"item_fields for unknown item_id(s): {unknown}", file=sys.stderr)
-        return 1
-    source_sha = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
     with open(args.out, "w", encoding="utf-8") as fh:
-        for it in items:
-            rec = dataclasses.asdict(it)
-            rec.update(item_fields.get(it.item_id) or {})
-            rec["source_sheet_id"] = source_sheet_id
-            rec["source_sha256"] = source_sha
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    dev = sum(1 for i in items if i.split == "dev")
-    print(f"wrote {len(items)} items ({dev} dev / {len(items) - dev} holdout) -> {args.out}")
+        fh.write(records_to_jsonl(records))
+    dev = sum(1 for r in records if r["split"] == "dev")
+    print(f"wrote {len(records)} items ({dev} dev / {len(records) - dev} holdout) -> {args.out}")
     return 0
 
 

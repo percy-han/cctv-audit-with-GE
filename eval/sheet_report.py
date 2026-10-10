@@ -62,8 +62,9 @@ TAB_OVERVIEW = "本次测评概览"
 TAB_ITEMS = "本次逐题结果"
 TAB_ROUNDS = "历史轮次对比"
 TAB_RUNS = "历史单跑明细"
+TAB_GOLDEN = "本次黄金集快照"
 # Fixed sheet IDs so the pure layer can address every tab; the spreadsheet's default sheet is deleted.
-SHEET_IDS = {TAB_OVERVIEW: 101, TAB_ITEMS: 102, TAB_ROUNDS: 103, TAB_RUNS: 104}
+SHEET_IDS = {TAB_OVERVIEW: 101, TAB_ITEMS: 102, TAB_ROUNDS: 103, TAB_RUNS: 104, TAB_GOLDEN: 105}
 
 PERCENT = {"type": "PERCENT", "pattern": "0.0%"}
 USD = {"type": "NUMBER", "pattern": "$0.0000"}
@@ -201,7 +202,11 @@ def build_overview_table(
     add("SOP / 提示词版本 (sop_version)", run_record.get("sop_version"))
     add("视频理解模式 (media_mode)", run_record.get("media_mode"))
     add("黄金集版本 (golden_version)", run_record.get("golden_version") or golden.get("golden_version"),
-        "文件名@内容哈希；不同版本的召回率不可比")
+        "文件名@评分标尺哈希（ruler-v2）；不同版本的召回率不可比")
+    origin = golden.get("golden_origin") or {}
+    add("黄金集来源", origin.get("sheet_url") or golden.get("golden_source") or "",
+        (f"{origin.get('sheet_name', '')}（{origin.get('label_range', '')} + 「{origin.get('config_tab', '')}」页，"
+         f"读取时表格修改时间 {origin.get('sheet_modified_time', '')}）") if origin else "黄金集文件")
     add("黄金集题数 / 标注点数", f"{n_items} 题 / {run_record.get('golden_part_count') or golden.get('part_count') or ''} 个标注点",
         "；".join(f"{k} {v} 题" for k, v in splits.items()))
     add("裁判模型 (judge_model)", run_record.get("judge_model") or score_doc.get("judge_model"),
@@ -299,6 +304,28 @@ def build_items_table(
             ])
     t = Table(TAB_ITEMS, rows)
     t.wide_cols = {t.col("人工标注原文"): 320, t.col("匹配的 AI 告警"): 420, t.col("裁判理由"): 420}
+    return t
+
+
+def build_golden_snapshot_table(golden_items: Sequence[Mapping[str, Any]], stable_ids: Sequence[str] = ()) -> Table:
+    """One row per golden part exactly as this run used it (category / time mode with their source)."""
+    from eval.score_run import sop_category_and_source, temporal_mode_and_source
+
+    header = ["题号", "part_id", "门店", "稽核重点", "数据集划分", "稽核条款", "人工标注原文", "标注时间点 (OSD)",
+              "视频文件名", "SOP 大类", "SOP 大类来源", "时间判定模式", "时间模式来源", "稳定基线题"]
+    rows: list[list[Any]] = [header]
+    for it in golden_items:
+        cat, cat_src = sop_category_and_source(dict(it))
+        for p in it.get("parts") or []:
+            mode, mode_src = temporal_mode_and_source(dict(it), dict(p))
+            rows.append([
+                it.get("item_id", ""), p.get("part_id", ""), it.get("outlet_name", ""), it.get("focus", ""),
+                it.get("split", ""), it.get("audit_clause", ""), p.get("description") or it.get("finding_verbatim", ""),
+                ", ".join(p.get("osd_times") or []), "\n".join(it.get("video_filenames") or []),
+                cat, cat_src, mode, mode_src, "是" if it.get("stable_baseline") or it.get("item_id") in stable_ids else "",
+            ])
+    t = Table(TAB_GOLDEN, rows)
+    t.wide_cols = {t.col("人工标注原文"): 360, t.col("视频文件名"): 320}
     return t
 
 
@@ -471,7 +498,8 @@ def build_report_spec(
         title=build_report_title(str(run_record.get("round_id") or ""), run_id, now, tz),
         time_zone=tz.key,
         created_at_local=created_local,
-        tables=[overview, items, rounds, runs],
+        tables=[overview, items, rounds, runs, build_golden_snapshot_table(
+            golden_items, (score_doc.get("golden") or {}).get("stable_baseline_items") or [])],
         chart_requests=build_chart_requests(rounds, cats, ofs, runs),
     )
 
