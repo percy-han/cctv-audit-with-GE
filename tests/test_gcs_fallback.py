@@ -1126,3 +1126,176 @@ def test_dual_mode_gcs_preflight_and_start_use_workspace_sop(tmp_path, monkeypat
 
     asyncio.run(_flow())
     assert seen_sheet_ids == [WS_SOP]
+
+
+# ---------------------------------------------------------------------------------------------
+# Round 72: concurrent sessions of one supervisor (GCS + Drive) must never share a job
+# ---------------------------------------------------------------------------------------------
+
+
+def test_multi_session_concurrent_gcs_and_drive_no_job_id_collision(tmp_path, monkeypatch):
+    """Production bug 2026-10-10: Session 2's "好了么" returned Session 1's running job `ae5e72`."""
+    import cctv_audit.audit_service as audit_service_module
+    import cctv_audit.server as srv
+    from cctv_audit.turn import TurnAction, TurnDecision
+    from cctv_audit.video_ingestor import VideoMetadataItem
+
+    user = "supervisor@example.com"
+    s1, s2 = "3643623919782948205", "13472844817418706168"
+    gcs_url = "gs://store-videos/store-a"
+    drive_url = "https://drive.google.com/drive/folders/1YFrYPRhqYAh3ZYpp6P8UxOr8yRkkuftj?usp=drive_link"
+    monkeypatch.setattr(audit_service_module.config, "master_prompt_sheet_id", "")
+    monkeypatch.setattr(audit_service_module.config, "gcs_sop_uri", "")
+
+    fake = FakeGcs()
+    fake.put("store-videos", "store-a/cam1.mp4")
+
+    class _Drive:
+        async def probe_write_access(self, folder_id):
+            return "Drive 文件夹"
+
+        async def list_folder_videos(self, folder_id):
+            return [VideoMetadataItem(file_id="d1", filename="Footage1.mov", width=1920, height=1080, duration_sec=300.0)]
+
+    router = gg.RoutingStorageGateway(drive_gateway=_Drive(), gcs_gateway=fake)
+
+    class _PM:
+        async def load_active_config(self, sheet_id=None):
+            from cctv_audit.prompt_manager import PromptModelConfig
+
+            return PromptModelConfig(active_model_version="m", active_prompt_version="p", system_instruction="s")
+
+    svc = AuditService(
+        job_store=UserScopedJobStore(state_dir=tmp_path, gcs_bucket=LOCAL_PLACEHOLDER_BUCKET, gcs_store={}),
+        ingestor=VideoIngestor(drive_reader=router),
+        prompt_manager=_PM(),  # type: ignore[arg-type]
+        reporter=WorkspaceReporter(gateway=router, enable_notification=False),
+    )
+
+    async def _heartbeat_only(job, prompt_cfg):
+        await svc.jobs.save(job)  # a running worker keeps bumping updated_at / heartbeat_at
+
+    monkeypatch.setattr(svc, "_dispatch_or_run_detached", _heartbeat_only)
+    monkeypatch.setattr(srv, "audit_service", svc)
+
+    async def _route(text):
+        if "gs://" in text or "drive.google.com" in text:
+            url = text.split("，", 1)[-1].strip()
+            return TurnDecision(action=TurnAction.INSPECT, drive_url=url)
+        if "确认" in text:
+            return TurnDecision(action=TurnAction.CONFIRM)
+        return TurnDecision(action=TurnAction.STATUS)
+
+    monkeypatch.setattr(srv, "classify_turn_with_llm", _route)
+    turn = lambda sid, text, ctx="": asyncio.run(srv._handle_conversation_turn(user, sid, text, ctx))  # noqa: E731
+
+    # 1. INSPECT in both sessions -> two distinct jobs, each reply names its own preflight job ID.
+    r1 = turn(s1, f"稽核视频，{gcs_url}")
+    r2 = turn(s2, f"稽核该视频，{drive_url}")
+    by_session = {j.session_id: j for j in asyncio.run(svc.jobs.list_for_user(user, limit=10))}
+    job_gcs, job_drive = by_session[s1], by_session[s2]
+    assert job_gcs.job_id != job_drive.job_id
+    assert f"预检单号 `{job_gcs.job_id}`" in r1 and f"单号 `{job_gcs.job_id}`" in r1
+    assert f"预检单号 `{job_drive.job_id}`" in r2 and job_gcs.job_id not in r2
+    assert job_gcs.folder_id == gcs_url and job_drive.folder_id == "1YFrYPRhqYAh3ZYpp6P8UxOr8yRkkuftj"
+
+    # 2. CONFIRM in session 1 -> job_gcs RUNNING and now the most recently updated job of the user.
+    c1 = turn(s1, "确认")
+    assert f"单号 `{job_gcs.job_id}`" in c1
+    running_gcs = asyncio.run(svc.jobs.get(user, job_gcs.job_id))
+    assert running_gcs.state == JobState.RUNNING
+    assert running_gcs.updated_at >= asyncio.run(svc.jobs.get(user, job_drive.job_id)).updated_at
+
+    # 3. "好了么" in session 2 answers with session 2's READY job, never session 1's running job.
+    st2 = turn(s2, "好了么")
+    assert f"任务 `{job_drive.job_id}` 当前状态：`ready`（预检已通过，待确认启动）" in st2
+    assert job_gcs.job_id not in st2
+
+    # A confirm in session 1 again is refused (its own job already runs) - never grabs session 2's job.
+    again = turn(s1, "确认")
+    assert again.startswith("⚠️") and job_gcs.job_id in again and job_drive.job_id not in again
+    assert asyncio.run(svc.jobs.get(user, job_drive.job_id)).state == JobState.READY
+
+    # 4. CONFIRM in session 2 starts job_drive; STATUS stays pinned per session whoever heartbeats last.
+    c2 = turn(s2, "确认")
+    assert f"单号 `{job_drive.job_id}`" in c2
+    assert asyncio.run(svc.jobs.get(user, job_drive.job_id)).state == JobState.RUNNING
+    for bump in (job_gcs.job_id, job_drive.job_id, job_gcs.job_id):
+        asyncio.run(svc.jobs.save(asyncio.run(svc.jobs.get(user, bump))))
+        st1, st2 = turn(s1, "好了么"), turn(s2, "好了么")
+        assert f"任务 `{job_gcs.job_id}`" in st1 and job_drive.job_id not in st1
+        assert f"任务 `{job_drive.job_id}`" in st2 and job_gcs.job_id not in st2
+
+
+def test_placeholder_session_id_isolated_by_thread_history():
+    """GE "000000" placeholder: threads are told apart by their first event; job ID comes from history."""
+    import cctv_audit.server as srv
+
+    def _thread(first_user_text, agent_reply):
+        return {
+            "session_id": "000000",
+            "message": {"parts": [{"text": "好了么"}]},
+            "events": [
+                {"author": "user", "content": {"parts": [{"text": first_user_text}]}},
+                {"author": "chagee_cctv_audit", "content": {"parts": [{"text": agent_reply}]}},
+                {"author": "user", "content": {"parts": [{"text": "单号 `ffffff` 是我随便写的"}]}},
+            ],
+        }
+
+    t1 = _thread("稽核视频，gs://store-videos/store-a", "✅ **视频预检全部通过 (`1` 段视频均 ≥720P)（预检单号 `ae5e72`）**")
+    t2 = _thread("稽核该视频，https://drive.google.com/drive/folders/X", "🚀 **后台 AI 稽核已正式启动（单号 `3120db`）**")
+    sid1, sid2 = srv._resolve_adk_session_id(t1), srv._resolve_adk_session_id(t2)
+    assert sid1.startswith("ev-") and sid2.startswith("ev-") and sid1 != sid2
+    assert srv._resolve_adk_session_id(t1) == sid1  # deterministic across turns of one thread
+    assert srv._extract_session_context_job_id(t1) == "ae5e72"  # user-authored IDs ignored
+    assert srv._extract_session_context_job_id(t2) == "3120db"
+    assert srv._resolve_adk_session_id({"session_id": "3643623919782948205"}) == "3643623919782948205"
+    assert srv._extract_session_context_job_id({"events": []}) == ""
+    newest = dict(t1, events=t1["events"] + [{"author": "agent", "content": {"parts": [{"text": "⏳ **任务 `b7c990` 当前状态"}]}}])
+    assert srv._extract_session_context_job_id(newest) == "b7c990"
+
+
+def test_job_store_session_scoping(tmp_path):
+    from cctv_audit.jobs import AuditJob
+
+    store = UserScopedJobStore(state_dir=tmp_path, gcs_bucket=LOCAL_PLACEHOLDER_BUCKET, gcs_store={})
+    user = "u@example.com"
+
+    async def _run():
+        a = await store.save(AuditJob(user_id=user, session_id="S1", folder_id="A", state=JobState.RUNNING))
+        b = await store.save(AuditJob(user_id=user, session_id="S2", folder_id="B", state=JobState.READY))
+        await store.save(a)  # S1's worker heartbeats after S2 preflighted
+        assert (await store.latest_for_session(user, "S1")).job_id == a.job_id
+        assert (await store.latest_for_session(user, "S2")).job_id == b.job_id
+        assert await store.latest_for_session(user, "000000") is None
+        assert await store.latest_for_session(user, "") is None
+        # S1 owns a (running) job -> no cross-session READY job for it.
+        assert await store.latest_ready_job(user, session_id="S1") is None
+        assert (await store.latest_ready_job(user, session_id="S2")).job_id == b.job_id
+        # Unknown / placeholder session -> user-wide fallback (stateless callers).
+        assert (await store.latest_ready_job(user, session_id="NEW")).job_id == b.job_id
+        assert (await store.latest_ready_job(user, session_id="000000")).job_id == b.job_id
+        # A newer job created in the same session wins over an older one that heartbeats.
+        c = await store.save(AuditJob(user_id=user, session_id="S1", folder_id="C", state=JobState.READY))
+        await store.save(a)
+        assert (await store.latest_for_session(user, "S1")).job_id == c.job_id
+        assert (await store.latest_ready_job(user, session_id="S1")).job_id == c.job_id
+
+    asyncio.run(_run())
+
+
+def test_context_job_id_never_restarts_a_done_job(tmp_path):
+    from cctv_audit.jobs import AuditJob
+
+    svc = AuditService(
+        job_store=UserScopedJobStore(state_dir=tmp_path, gcs_bucket=LOCAL_PLACEHOLDER_BUCKET, gcs_store={}),
+        ingestor=VideoIngestor(),
+        reporter=WorkspaceReporter(enable_notification=False),
+    )
+
+    async def _run():
+        done = await svc.jobs.save(AuditJob(user_id="u@example.com", session_id="S", folder_id="A", state=JobState.DONE))
+        with pytest.raises(ValueError, match="无法重复启动"):
+            await svc.start_audit(user_id="u@example.com", job_id=done.job_id, session_id="S", job_id_from_context=True)
+
+    asyncio.run(_run())

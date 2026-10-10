@@ -133,7 +133,7 @@ class AuditService:
                 rejected_videos=[],
                 videos=[],
                 message_to_user=(
-                    f"❌ 预检未通过（本次 0 Token 消耗）：{setup_problem}\n"
+                    f"❌ 预检未通过（预检单号 `{job.job_id}`，本次 0 Token 消耗）：{setup_problem}\n"
                     "• 处理好之后，重新发送一次这个文件夹链接即可（视频不用重新上传）。"
                 ),
             )
@@ -143,7 +143,7 @@ class AuditService:
             return await self.jobs.save(job)
 
         inspect_res = await self.ingestor.inspect_drive_videos(
-            drive_url, preloaded_items=preloaded_items
+            drive_url, preloaded_items=preloaded_items, job_id=job.job_id
         )
         new_state = JobState.READY if inspect_res.passed else JobState.REJECTED
         job = job.model_copy(
@@ -191,6 +191,7 @@ class AuditService:
         job_id: Optional[str] = None,
         session_id: str = "",
         wait_for_completion: bool = False,
+        job_id_from_context: bool = False,
     ) -> AuditJob:
         """Step 2 (`/execute`): Confirms a `READY` job (or resumes a `FAILED` / stale `RUNNING` job)
         and dispatches execution so GE returns immediately.
@@ -200,21 +201,42 @@ class AuditService:
         else:
             job = await self.jobs.latest_ready_job(user_id, session_id=session_id)
             if job is None:
-                recent_list = await self.jobs.list_for_user(user_id, limit=5)
-                for candidate in recent_list:
-                    if candidate.state == JobState.FAILED or (
-                        candidate.state == JobState.RUNNING
-                        and (time.time() - candidate.heartbeat_at) > STALE_WORKER_HEARTBEAT_SEC
+                # A session that already owns a job only ever acts on its own job (concurrent
+                # sessions of one supervisor must never confirm/resume each other's jobs).
+                session_job = await self.jobs.latest_for_session(user_id, session_id)
+                if session_job is not None:
+                    if session_job.state == JobState.FAILED or (
+                        session_job.state == JobState.RUNNING
+                        and (time.time() - session_job.heartbeat_at) > STALE_WORKER_HEARTBEAT_SEC
                     ):
-                        job = candidate
-                        break
+                        job = session_job
+                    elif session_job.state == JobState.RUNNING:
+                        raise ValueError(
+                            f"当前会话的任务 `{session_job.job_id}` 已在后台运行中，无需重复确认；"
+                            "请直接询问「进度怎么样了」查看实时进度。"
+                        )
+                    else:
+                        raise ValueError(
+                            f"当前任务 `{session_job.job_id}` 状态为 `{session_job.state.value}`，无法重复启动。"
+                        )
+                else:
+                    recent_list = await self.jobs.list_for_user(user_id, limit=5)
+                    for candidate in recent_list:
+                        if candidate.state == JobState.FAILED or (
+                            candidate.state == JobState.RUNNING
+                            and (time.time() - candidate.heartbeat_at) > STALE_WORKER_HEARTBEAT_SEC
+                        ):
+                            job = candidate
+                            break
 
         if job is None:
             raise ValueError(
                 "未找到待确认的预检任务（或可断点续跑的中断任务），请先发送 Google Drive 监控视频文件夹链接进行预检。"
             )
+        # Re-running a DONE job needs the supervisor to name it; a job ID merely recovered from the
+        # thread history ("确认开始" after completion) must not silently restart a finished audit.
         if job.state not in (JobState.READY, JobState.FAILED, JobState.RUNNING) and not (
-            job_id and job.state == JobState.DONE
+            job_id and not job_id_from_context and job.state == JobState.DONE
         ):
             raise ValueError(
                 f"当前任务 `{job.job_id}` 状态为 `{job.state.value}`，无法重复启动。"
@@ -725,14 +747,20 @@ class AuditService:
         user_id: str,
         job_id: Optional[str] = None,
         *,
+        session_id: str = "",
         auto_resume_stale: bool = True,
         stale_timeout_sec: float = STALE_WORKER_HEARTBEAT_SEC,
     ) -> Optional[AuditJob]:
         if job_id:
             job = await self.jobs.get(user_id, job_id)
         else:
-            recent = await self.jobs.list_for_user(user_id, limit=1)
-            job = recent[0] if recent else None
+            # This session's own newest job first; the user-wide most recently updated job is only a
+            # fallback for sessions that never created one (another session's heartbeating job must
+            # not answer this session's "好了么").
+            job = await self.jobs.latest_for_session(user_id, session_id)
+            if job is None:
+                recent = await self.jobs.list_for_user(user_id, limit=1)
+                job = recent[0] if recent else None
 
         if job is None:
             return None

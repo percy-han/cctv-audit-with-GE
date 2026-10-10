@@ -1987,7 +1987,7 @@ def test_tc017_ge_stream_heartbeat_and_turn_latency_optimizations() -> None:
                 return PromptModelConfig(system_instruction="warmed")
 
         class _FakeIngestor:
-            async def inspect_drive_videos(self, drive_url: str, preloaded_items=None):
+            async def inspect_drive_videos(self, drive_url: str, preloaded_items=None, job_id=""):
                 from cctv_audit.video_ingestor import InspectFolderResponse
 
                 return InspectFolderResponse(

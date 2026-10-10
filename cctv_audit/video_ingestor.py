@@ -216,9 +216,15 @@ class VideoIngestor:
         self,
         drive_url_or_id: str,
         preloaded_items: Optional[List[VideoMetadataItem]] = None,
+        job_id: str = "",
     ) -> InspectFolderResponse:
-        """Step 1 (`/inspect`): Verifies `>= 720P` resolution and calculates segments & token budget."""
+        """Step 1 (`/inspect`): Verifies `>= 720P` resolution and calculates segments & token budget.
+
+        `job_id` (the preflight job) is shown in every reply so the supervisor can tell concurrent
+        sessions' jobs apart and the next turn can reference it.
+        """
         folder_id = extract_drive_id(drive_url_or_id)
+        job_tag = f"（预检单号 `{job_id}`）" if job_id else ""
         if preloaded_items is not None:
             items = list(preloaded_items)
         elif self._drive_reader is not None:
@@ -244,11 +250,11 @@ class VideoIngestor:
                 rejected_videos=[],
                 videos=[],
                 message_to_user=(
-                    f"❌ 预检未通过：GCS 目录 `{folder_id}/` 下未找到任何可读取的 `.mp4` 监控视频文件"
+                    f"❌ 预检未通过{job_tag}：GCS 目录 `{folder_id}/` 下未找到任何可读取的 `.mp4` 监控视频文件"
                     "（只读取该目录的直接子文件，不含子目录）。请确认路径正确，且 Worker 服务账号在该存储桶上拥有 "
                     "`roles/storage.objectViewer`（读取视频）与 `roles/storage.objectAdmin`（写入 Excel 报告与证据切片）。"
                     if folder_id.startswith("gs://")
-                    else f"❌ 预检未通过：文件夹 `{folder_id}` 中未找到任何可读取的 `.mp4` 监控视频文件。"
+                    else f"❌ 预检未通过{job_tag}：文件夹 `{folder_id}` 中未找到任何可读取的 `.mp4` 监控视频文件。"
                 ),
             )
 
@@ -273,7 +279,7 @@ class VideoIngestor:
 
         if rejected:
             msg = (
-                f"❌ **视频预检拦截 (`REJECTED_LOW_RESOLUTION`)**：\n"
+                f"❌ **视频预检拦截 (`REJECTED_LOW_RESOLUTION`)**{job_tag}：\n"
                 f"以下视频分辨率低于 `720P` 硬门禁（无法看清糖度计刻度与 20 秒搓手细节，本次 0 Token 消耗）：\n"
                 + "\n".join(f"  • `{r}`" for r in rejected)
                 + "\n请更换 `≥720P` 高清原片后重新发送链接。"
@@ -319,11 +325,11 @@ class VideoIngestor:
         else:
             report_noun, report_place, report_kind = "报告 Sheet", "您的原文件夹内", " Sheet"
         msg = (
-            f"✅ **视频预检全部通过 (`{len(items)}` 段视频均 ≥720P)**\n"
+            f"✅ **视频预检全部通过 (`{len(items)}` 段视频均 ≥720P){job_tag}**\n"
             f"  • **总时长**：`{total_minutes:.1f} 分钟`\n"
             f"{plan_line}"
             f"  • **预计耗时**：约 **`{est_wall_minutes}` 分钟**（按 1080P 每 5 分钟视频平均 {sec_per_5min} 秒顺序接力推算；实际耗时与 Token 消耗将在稽核完成后写入{report_noun}的 `Tab 2 真实账单`）\n\n"
-            f"👉 **请回复「确认开始」，系统将在后台自动完成去音处理、AI 稽核并在{report_place}生成《稽核报告与 Token 账单{report_kind}》！**"
+            f"👉 **请回复「确认开始」{('（单号 `' + job_id + '`）') if job_id else ''}，系统将在后台自动完成去音处理、AI 稽核并在{report_place}生成《稽核报告与 Token 账单{report_kind}》！**"
         )
 
         return InspectFolderResponse(

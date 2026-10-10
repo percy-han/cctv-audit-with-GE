@@ -54,6 +54,17 @@ def new_job_id() -> str:
     return uuid.uuid4().hex[:6]
 
 
+# Gemini Enterprise sends this placeholder when it has no real session ID (adk_agent.py fallback);
+# it must never be used to correlate turns, or every such conversation would share one "session".
+PLACEHOLDER_SESSION_ID = "000000"
+
+
+def _normalize_session_id(session_id: str) -> str:
+    """'' for a missing / placeholder session ID, else the stripped ID."""
+    sid = (session_id or "").strip()
+    return "" if not sid or sid == PLACEHOLDER_SESSION_ID else sid
+
+
 def _user_bucket_slug(user_id: str) -> str:
     """Deterministic, path-safe tenant directory slug from supervisor email."""
     norm = user_id.strip().lower()
@@ -346,16 +357,41 @@ class UserScopedJobStore:
         await asyncio.to_thread(self._sync_from_local, user_id)
         return self._by_user.get(user_id.lower(), {}).get(job_id)
 
+    async def latest_for_session(self, user_id: str, session_id: str) -> Optional[AuditJob]:
+        """Newest job (by creation) created in `session_id`; None for a missing/placeholder session.
+
+        Ordered by `created_at`, not `updated_at`: a running job's heartbeat keeps bumping
+        `updated_at`, which must not let an older job shadow the one the user just preflighted.
+        """
+        sid = _normalize_session_id(session_id)
+        if not user_id or not sid:
+            return None
+        await asyncio.to_thread(self._sync_from_local, user_id)
+        matches = [j for j in self._by_user.get(user_id.lower(), {}).values() if j.session_id == sid]
+        if not matches:
+            return None
+        matches.sort(key=lambda j: (j.created_at, j.updated_at), reverse=True)
+        return matches[0]
+
     async def latest_ready_job(self, user_id: str, session_id: str = "") -> Optional[AuditJob]:
-        """Finds the most recent `READY` job awaiting confirmation for `user_id`."""
+        """Most recent `READY` job awaiting confirmation for `user_id`.
+
+        With a real `session_id` that already owns jobs, only that session's jobs are considered
+        (never another concurrent session's READY job). The user-wide fallback applies only when
+        the session is missing/placeholder or has created no job of its own.
+        """
+        sid = _normalize_session_id(session_id)
         await asyncio.to_thread(self._sync_from_local, user_id)
         user_jobs = list(self._by_user.get(user_id.lower(), {}).values())
-        ready_jobs = [
-            j
-            for j in user_jobs
-            if j.state == JobState.READY
-            and (not session_id or j.session_id == session_id)
-        ]
+        if sid:
+            session_jobs = [j for j in user_jobs if j.session_id == sid]
+            if session_jobs:
+                ready = [j for j in session_jobs if j.state == JobState.READY]
+                if not ready:
+                    return None
+                ready.sort(key=lambda j: (j.created_at, j.updated_at), reverse=True)
+                return ready[0]
+        ready_jobs = [j for j in user_jobs if j.state == JobState.READY]
         if not ready_jobs:
             return None
         ready_jobs.sort(key=lambda j: j.updated_at, reverse=True)

@@ -31,6 +31,7 @@ Tenant identity (`REQ-008`) precedence, strongest evidence first:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -251,6 +252,7 @@ async def _handle_conversation_turn(
     user_id: str,
     session_id: str,
     message_text: str,
+    context_job_id: str = "",
 ) -> str:
     """Unified turn handler shared by both `POST /api/stream_reasoning_engine` (ADK) and `POST /a2a` (A2A).
 
@@ -272,12 +274,15 @@ async def _handle_conversation_turn(
             else f"预检单号 `{job.job_id}` 状态：{job.state.value}"
         )
     if decision.action == TurnAction.CONFIRM:
+        start_kwargs: Dict[str, Any] = {
+            "user_id": user_id,
+            "job_id": decision.job_id or context_job_id or None,
+            "session_id": session_id,
+        }
+        if not decision.job_id and context_job_id:
+            start_kwargs["job_id_from_context"] = True
         try:
-            job = await audit_service.start_audit(
-                user_id=user_id,
-                job_id=decision.job_id or None,
-                session_id=session_id,
-            )
+            job = await audit_service.start_audit(**start_kwargs)
         except ValueError as exc:
             logger.info("start_audit rejected turn for %s: %s", user_id, exc)
             return f"⚠️ {exc}"
@@ -299,7 +304,11 @@ async def _handle_conversation_turn(
             f"{output_line}"
         )
     if decision.action == TurnAction.STATUS:
-        job = await audit_service.get_status(user_id, decision.job_id or None)
+        target_job_id = decision.job_id or context_job_id or None
+        try:
+            job = await audit_service.get_status(user_id, target_job_id, session_id=session_id)
+        except TypeError:  # legacy two-argument get_status (tests / older service doubles)
+            job = await audit_service.get_status(user_id, target_job_id)
         if job is None:
             return "您名下暂无正在运行或已完成的稽核任务。"
         total_segs = (
@@ -312,6 +321,12 @@ async def _handle_conversation_turn(
         )
         done_segs = len(job.completed_segments)
         gcs_job = is_gcs_target(job.folder_id)
+        if job.state.value == "ready":
+            return (
+                f"⏳ **任务 `{job.job_id}` 当前状态：`ready`（预检已通过，待确认启动）**\n"
+                f"• **待稽核规模**：共 `{total_segs}` {unit}（已消耗 `0` Tokens）\n"
+                f"• 尚未启动后台 AI 稽核，请直接回复「**确认开始**」立即启动（单号 `{job.job_id}`）。"
+            )
         if job.state.value == "done":
             report_lines = (
                 f"• 📊 **稽核报告（Excel .xlsx）**：{job.report_sheet_url}\n"
@@ -540,6 +555,48 @@ async def http_execute(payload: ExecuteRequestPayload) -> Dict[str, Any]:
 
 
 _HISTORICAL_URL_RE = re.compile(r"(?:https?|gs)://\S+", re.IGNORECASE)
+# Job IDs this agent printed earlier in the thread ("预检单号 `ae5e72`", "单号 `ae5e72`", "任务 `ae5e72`").
+_JOB_ID_IN_HISTORY_RE = re.compile(r"(?:单号|任务)\s*`([0-9a-f]{6})`")
+_PLACEHOLDER_SESSION_ID = "000000"
+
+
+def _extract_session_context_job_id(inner: Dict[str, Any]) -> str:
+    """Newest job ID the agent itself mentioned in this thread's `events[]` ('' if none).
+
+    Pins CONFIRM / STATUS turns to the job this conversation created, even when two sessions of the
+    same supervisor run concurrently. User-authored events are ignored (only our own replies count).
+    """
+    events = inner.get("events")
+    if not isinstance(events, list):
+        return ""
+    for ev in reversed(events):
+        if not isinstance(ev, dict) or ev.get("author") == "user":
+            continue
+        content = ev.get("content")
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if not isinstance(parts, list):
+            continue
+        text = " ".join(str(p.get("text") or "") for p in parts if isinstance(p, dict))
+        match = _JOB_ID_IN_HISTORY_RE.search(text)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _resolve_adk_session_id(inner: Dict[str, Any]) -> str:
+    """Stable per-conversation session ID for the ADK channel.
+
+    Gemini Enterprise may send its "000000" placeholder; then the thread's first event (identical on
+    every turn of one conversation, different across conversations) yields a deterministic ID.
+    """
+    raw = str(inner.get("session_id") or inner.get("sessionId") or "").strip()
+    if raw and raw != _PLACEHOLDER_SESSION_ID:
+        return raw
+    events = inner.get("events")
+    if isinstance(events, list) and events:
+        digest = hashlib.sha256(json.dumps(events[0], sort_keys=True, default=str).encode("utf-8"))
+        return "ev-" + digest.hexdigest()[:12]
+    return uuid.uuid4().hex[:8]
 
 
 def _extract_adk_turn_text(inner: Dict[str, Any]) -> str:
@@ -632,7 +689,8 @@ async def ge_stream_endpoint(request: Request) -> StreamingResponse:
         body_identity=str(inner.get("user_id") or inner.get("user_email") or "").strip(),
         channel="adk",
     )
-    session_id = str(inner.get("session_id") or uuid.uuid4().hex[:8])
+    session_id = _resolve_adk_session_id(inner)
+    context_job_id = _extract_session_context_job_id(inner)
     message_text = _extract_adk_turn_text(inner)
     invocation_id = uuid.uuid4().hex[:8]
 
@@ -642,6 +700,7 @@ async def ge_stream_endpoint(request: Request) -> StreamingResponse:
                 user_id=user_id,
                 session_id=session_id,
                 message_text=message_text,
+                context_job_id=context_job_id,
             )
         )
         try:
@@ -697,6 +756,7 @@ async def ge_unary_endpoint(request: Request) -> Dict[str, Any]:
         job = await audit_service.get_status(
             user_id=user_id,
             job_id=str(payload.get("job_id") or "") or None,
+            session_id=session_id,
         )
         return {"output": job.model_dump() if job else {"error": "no such job"}}
     return {"output": {"error": f"unknown method: {method}"}}
