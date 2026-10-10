@@ -37,11 +37,11 @@ from xml.sax.saxutils import escape as _xml_escape
 
 from .config import config
 from .gcp import WorkspaceAccessError
-from .video_ingestor import VideoMetadataItem, natural_video_sort_key, normalize_gcs_target
+from .gcs_uri import GCS_SCHEME, is_gcs_target, normalize_gcs_target
+from .video_ingestor import VideoMetadataItem, natural_video_sort_key
 
 logger = logging.getLogger("cctv_audit.gcs_gateway")
 
-GCS_SCHEME = "gs://"
 INTERNAL_STATE_PREFIXES: Tuple[str, ...] = ("jobs", "eval", "smoke", "agent_platform_eval")
 EVIDENCE_DIR_MARKER = "违规证据切片_Evidence"
 WRITE_PROBE_OBJECT = ".cctv_audit_write_probe"
@@ -59,10 +59,6 @@ _META_W, _META_H, _META_DUR = "cctv_width", "cctv_height", "cctv_duration_sec"
 # --------------------------------------------------------------------------------------------
 # Identifier helpers (pure functions; safe to import anywhere above gcp.py in the import graph)
 # --------------------------------------------------------------------------------------------
-
-
-def is_gcs_target(target_id: str) -> bool:
-    return (target_id or "").strip()[:5].lower() == GCS_SCHEME
 
 
 def parse_gcs_uri(uri: str) -> Tuple[str, str]:
@@ -443,29 +439,137 @@ def build_dual_tab_xlsx_bytes(tab1_rows: Sequence[Any], tab2_rows: Sequence[Any]
     )
 
 
+_CELL_REF_RE = re.compile(r"^([A-Za-z]+)(\d*)$")
+# Hard limits for customer-supplied SOP workbooks (zip-bomb / oversized-object guard).
+SOP_MAX_BYTES = 20 * 1024 * 1024
+_XLSX_MAX_MEMBER_BYTES = 20 * 1024 * 1024
+_XLSX_MAX_TOTAL_UNCOMPRESSED = 40 * 1024 * 1024
+
+
+def _safe_xml(xml_bytes: bytes) -> ET.Element:
+    """ET.fromstring after refusing DTDs, so entity-expansion (Billion Laughs) input never parses."""
+    if b"<!doctype" in xml_bytes[:4096].lower() or b"<!entity" in xml_bytes.lower():
+        raise ValueError("Refusing XML with DOCTYPE/ENTITY declarations")
+    return ET.fromstring(xml_bytes)
+
+
+def _col_index(letters: str) -> int:
+    """`A` -> 0, `D` -> 3, `AA` -> 26."""
+    idx = 0
+    for ch in letters.upper():
+        idx = idx * 26 + (ord(ch) - 64)
+    return idx - 1
+
+
+def _rich_text(node: ET.Element) -> str:
+    """Text of an `<si>` / `<is>` node: direct `<t>` plus rich-text runs `<r><t>` (phonetic `<rPh>` skipped)."""
+    parts: List[str] = []
+    for child in node:
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "t":
+            parts.append(child.text or "")
+        elif tag == "r":
+            parts.extend(t.text or "" for t in child.iter(f"{{{_NS_MAIN}}}t"))
+    return "".join(parts)
+
+
+def _zip_part(target: str) -> str:
+    """Workbook-rels `Target` -> zip member: `worksheets/s.xml`, `xl/worksheets/s.xml`, `/xl/worksheets/s.xml`."""
+    t = target.replace("\\", "/")
+    if t.startswith("/"):
+        return t.lstrip("/")
+    if t.startswith("xl/"):
+        return t
+    return posixpath.normpath(posixpath.join("xl", t))
+
+
 def read_xlsx_sheets(data: bytes) -> Dict[str, List[List[str]]]:
-    """{sheet name: rows of cell text} for workbooks produced by `build_xlsx_bytes` (tests / checks)."""
+    """{sheet name: rows of cell text} for `.xlsx` written by this module, Excel, WPS or LibreOffice.
+
+    Handles inline strings, shared strings (`xl/sharedStrings.xml`, `t="s"`), booleans (`t="b"` ->
+    `TRUE`/`FALSE`), and sparse rows/cells: Excel omits empty cells and rows, so cells are placed by
+    their `r="D2"` reference and missing cells / rows are padded with `""` / `[]`.
+    """
+    if len(data) > SOP_MAX_BYTES:
+        raise ValueError(f"xlsx is {len(data)} bytes, above the {SOP_MAX_BYTES // (1024 * 1024)} MiB limit")
     ns = {"m": _NS_MAIN, "r": _NS_REL, "p": _NS_PKG_REL}
     out: Dict[str, List[List[str]]] = {}
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        wb = ET.fromstring(zf.read("xl/workbook.xml"))
-        rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
-        targets = {r.get("Id"): r.get("Target") for r in rels.findall("p:Relationship", ns)}
+        infos = zf.infolist()
+        if any(i.file_size > _XLSX_MAX_MEMBER_BYTES for i in infos) or (
+            sum(i.file_size for i in infos) > _XLSX_MAX_TOTAL_UNCOMPRESSED
+        ):
+            raise ValueError("xlsx uncompressed size exceeds the 20 MiB per-part / 40 MiB total limit")
+        names = set(zf.namelist())
+
+        def _xml(name: str) -> ET.Element:
+            return _safe_xml(zf.read(name))
+
+        shared: List[str] = []
+        if "xl/sharedStrings.xml" in names:
+            sst = _xml("xl/sharedStrings.xml")
+            shared = [_rich_text(si) for si in sst.findall("m:si", ns)]
+        wb = _xml("xl/workbook.xml")
+        rels = _xml("xl/_rels/workbook.xml.rels")
+        targets = {r.get("Id"): str(r.get("Target") or "") for r in rels.findall("p:Relationship", ns)}
         for sheet in wb.findall("m:sheets/m:sheet", ns):
             rid = sheet.get(f"{{{_NS_REL}}}id")
-            ws = ET.fromstring(zf.read(f"xl/{targets[rid]}"))
+            ws = _xml(_zip_part(targets[rid]))
             rows: List[List[str]] = []
             for row in ws.findall("m:sheetData/m:row", ns):
+                r_attr = row.get("r")
+                if r_attr and r_attr.isdigit():
+                    while len(rows) < int(r_attr) - 1:
+                        rows.append([])
                 vals: List[str] = []
                 for c in row.findall("m:c", ns):
-                    if c.get("t") == "inlineStr":
-                        vals.append("".join(t.text or "" for t in c.iter(f"{{{_NS_MAIN}}}t")))
+                    m = _CELL_REF_RE.match(c.get("r") or "")
+                    if m:
+                        col = _col_index(m.group(1))
+                        if col > len(vals):
+                            vals.extend([""] * (col - len(vals)))
+                    t = c.get("t")
+                    v = c.find("m:v", ns)
+                    raw = v.text if v is not None and v.text is not None else ""
+                    if t == "inlineStr":
+                        is_node = c.find("m:is", ns)
+                        text = _rich_text(is_node) if is_node is not None else ""
+                    elif t == "s":
+                        text = shared[int(raw)] if raw.strip().isdigit() and int(raw) < len(shared) else ""
+                    elif t == "b":
+                        text = "TRUE" if raw.strip().lower() in ("1", "true") else "FALSE"
                     else:
-                        v = c.find("m:v", ns)
-                        vals.append(v.text if v is not None and v.text is not None else "")
+                        text = raw
+                    vals.append(text)
                 rows.append(vals)
             out[str(sheet.get("name"))] = rows
     return out
+
+
+SOP_TAB0_TITLE = "Tab0_版本总控与回滚开关"
+
+
+def load_gcs_sop_tabs(raw: bytes, source_uri: str) -> Dict[str, List[List[str]]]:
+    """{tab title: rows} from a Master SOP workbook: `.json` snapshot (`{"tabs": [{title, values}]}`) or `.xlsx`.
+
+    Raises ValueError (with the source URI) when the bytes are not a readable workbook.
+    """
+    if len(raw) > SOP_MAX_BYTES:
+        raise ValueError(f"文件大小 {len(raw)} 字节超过 {SOP_MAX_BYTES // (1024 * 1024)} MiB 上限")
+    try:
+        if source_uri.lower().endswith(".json"):
+            doc = json.loads(raw.decode("utf-8-sig"))
+            tabs = doc.get("tabs") if isinstance(doc, dict) else None
+            if not isinstance(tabs, list):
+                raise ValueError("缺少 `tabs` 列表")
+            return {
+                str(t.get("title")): [[str(c) for c in row] for row in (t.get("values") or [])]
+                for t in tabs
+                if isinstance(t, dict) and t.get("title")
+            }
+        return read_xlsx_sheets(raw)
+    except (ValueError, KeyError, zipfile.BadZipFile, ET.ParseError, UnicodeDecodeError) as exc:
+        raise ValueError(f"无法解析 SOP 配置文件 `{source_uri}`：{exc}") from exc
 
 
 # --------------------------------------------------------------------------------------------
@@ -636,9 +740,92 @@ class GcsStorageGateway:
 
         return await asyncio.to_thread(_probe)
 
+    def _object_path(self, gcs_uri: str) -> Tuple[str, str]:
+        bucket, obj = parse_gcs_uri(gcs_uri)
+        _assert_not_internal_state_prefix(bucket, obj)
+        if not obj:
+            raise WorkspaceAccessError(
+                "GCS SOP 配置路径必须指向具体的 .xlsx 或 .json 文件对象（如 gs://bucket/sop/master_sheet.xlsx）"
+            )
+        return bucket, obj
+
+    def download_object_bytes(self, gcs_uri: str, max_bytes: int = SOP_MAX_BYTES) -> bytes:
+        """Bytes of one GCS object, at most `max_bytes` (blocking; wrap in `asyncio.to_thread`).
+
+        The object's `size` is checked from metadata before downloading, and the body length again
+        after, so an oversized (or swapped-in) object is refused instead of filling memory.
+        """
+        bucket, obj = self._object_path(gcs_uri)
+        too_big = WorkspaceAccessError(
+            f"SOP 配置文件 `gs://{bucket}/{obj}` 超过 {max_bytes // (1024 * 1024)} MiB 上限：请只保留 Tab0 与规则页签后重新上传"
+        )
+        status, body = self._request("GET", self._object_url(bucket, obj) + "?fields=size", timeout=15.0)
+        if status < 400:
+            try:
+                size = int(json.loads(body.decode("utf-8") or "{}").get("size") or 0)
+            except (ValueError, AttributeError):
+                size = 0
+            if size > max_bytes:
+                raise too_big
+            status, body = self._request("GET", self._media_url(bucket, obj), timeout=30.0)
+        if status in (401, 403, 404):
+            who = self._principal()
+            shown = f"gs://{bucket}/{obj}"
+            if status == 404:
+                raise WorkspaceAccessError(
+                    f"找不到 SOP 配置文件 `{shown}`（HTTP 404）：请先运行 "
+                    f"`python3 scripts/init_sop_sheet.py --gcs-uri {shown} --tfvars <env>.tfvars` 上传，"
+                    f"或确认路径正确且运行身份 `{who}` 有 `roles/storage.objectViewer` 权限"
+                )
+            raise WorkspaceAccessError(
+                f"运行身份 `{who}` 无权读取 SOP 配置文件 `{shown}`（HTTP {status}）：请在存储桶 `gs://{bucket}` 上为它授予 "
+                "`roles/storage.objectViewer`（或 `roles/storage.objectAdmin`）"
+            )
+        self._check(status, body, bucket, obj, "读取")
+        if len(body) > max_bytes:
+            raise too_big
+        return body
+
+    def upload_object_bytes(self, gcs_uri: str, data: bytes, content_type: str) -> str:
+        """Uploads `data` to one GCS object (blocking); returns its Cloud Console URL."""
+        bucket, obj = self._object_path(gcs_uri)
+        status, body = self._request(
+            "POST",
+            self._upload_url(bucket, obj),
+            body=data,
+            content_type=content_type,
+            content_length=len(data),
+            timeout=60.0,
+        )
+        self._check(status, body, bucket, obj, "写入")
+        return build_gcs_console_object_url(f"gs://{bucket}/{obj}")
+
     async def check_sheet_readable(self, sheet_id: str) -> str:
-        """GCS mode has no Sheets dependency: the bundled V25 rules are used when no Sheet is set."""
-        return ""
+        """'' when no SOP workbook is configured or the GCS `.xlsx` / `.json` has a readable Tab 0.
+
+        Raises WorkspaceAccessError (an operator-fixable setup problem, same contract as the Drive
+        gateway) when the object is missing, not readable by the identity, not a workbook, or has no
+        `Tab0_版本总控与回滚开关` -- otherwise every audit would silently fall back to the built-in rules.
+        """
+        if not (sheet_id or "").strip():
+            return ""
+
+        def _check() -> str:
+            raw = self.download_object_bytes(sheet_id)
+            try:
+                tabs = load_gcs_sop_tabs(raw, sheet_id)
+            except ValueError as exc:
+                raise WorkspaceAccessError(
+                    f"{exc}：请用 Excel / WPS 另存为 .xlsx（或使用 init_sop_sheet.py 导出的 .json），重新上传"
+                ) from exc
+            if SOP_TAB0_TITLE not in tabs:
+                raise WorkspaceAccessError(
+                    f"SOP 配置文件 `{sheet_id}` 中缺少总控页签「{SOP_TAB0_TITLE}」（现有页签：{', '.join(tabs) or '无'}）："
+                    "请勿重命名该页签，可重新运行 `scripts/init_sop_sheet.py --gcs-uri ...` 生成标准模板"
+                )
+            return ""
+
+        return await asyncio.to_thread(_check)
 
     def _object_dims(self, bucket: str, item: Dict[str, Any]) -> Tuple[int, int, float]:
         meta = item.get("metadata") or {}
@@ -835,6 +1022,8 @@ class RoutingStorageGateway:
     async def check_sheet_readable(self, sheet_id: str) -> str:
         if not (sheet_id or "").strip():
             return ""
+        if is_gcs_target(sheet_id):
+            return await self._gcs().check_sheet_readable(sheet_id)
         return await self._drive().check_sheet_readable(sheet_id)
 
     async def list_folder_videos(self, folder_id: str) -> List[VideoMetadataItem]:

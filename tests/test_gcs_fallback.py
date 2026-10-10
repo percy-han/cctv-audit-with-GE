@@ -96,7 +96,9 @@ class FakeGcs(gg.GcsStorageGateway):
             if method == "PATCH":
                 obj["metadata"].update(json.loads(body)["metadata"])
                 return 200, b"{}"
-            return 200, json.dumps({"name": name}).encode()
+            if qs.get("alt") == ["media"]:
+                return 200, obj["data"]
+            return 200, json.dumps({"name": name, "size": str(len(obj["data"]))}).encode()
         # list
         prefix = qs.get("prefix", [""])[0]
         delim = qs.get("delimiter", [""])[0]
@@ -397,16 +399,16 @@ def test_routing_dispatches_drive_ids_to_workspace_gateway():
     assert seen == ["probe:1AbCDefGhIjKlMnOpQrStUvWxYz", "sheet:SHEET1"]
 
 
-def test_gcs_preflight_skips_sop_sheet_probe(tmp_path, monkeypatch):
+def test_gcs_preflight_skips_sop_check_in_builtin_rules_mode(tmp_path, monkeypatch):
     import cctv_audit.audit_service as audit_service_module
 
-    monkeypatch.setattr(audit_service_module.config, "master_prompt_sheet_id", "SOP1234567890ABCDEF")
+    monkeypatch.setattr(audit_service_module.config, "master_prompt_sheet_id", "")
     fake = FakeGcs()
     fake.put("store-videos", "s/cam.mp4")
 
     class _Drive:
         async def check_sheet_readable(self, sheet_id):
-            raise AssertionError("SOP Sheet must not be probed for gs:// targets")
+            raise AssertionError("no SOP source configured: nothing must be probed")
 
     router = gg.RoutingStorageGateway(drive_gateway=_Drive(), gcs_gateway=fake)
     svc = AuditService(
@@ -504,3 +506,373 @@ def test_server_done_and_confirm_messages_for_gcs_jobs(monkeypatch):
     monkeypatch.setattr(srv.audit_service, "start_audit", _start)
     msg = asyncio.run(srv._handle_conversation_turn("u@example.com", "s", "确认开始"))
     assert "GCS 目录" in msg and ".xlsx" in msg and "Google Drive" not in msg
+
+
+# ---------------------------------------------------------------------------------------------
+# Round 70: GCS-hosted Master SOP workbook (gs://<bucket>/sop/master_sheet.xlsx | .json)
+# ---------------------------------------------------------------------------------------------
+
+import importlib.util  # noqa: E402
+
+from cctv_audit.config import extract_spreadsheet_id  # noqa: E402
+import cctv_audit.prompt_manager as pm_module  # noqa: E402
+from cctv_audit.prompt_manager import GoogleSheetsConfigClient  # noqa: E402
+
+_ROOT = Path(__file__).resolve().parent.parent
+SOP_URI = "gs://store-videos/sop/master_sheet.xlsx"
+
+
+def _load_init_script():
+    spec = importlib.util.spec_from_file_location("init_sop_sheet_r70", _ROOT / "scripts" / "init_sop_sheet.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture(autouse=True)
+def _clear_gcs_workbook_cache():
+    pm_module._GCS_WORKBOOK_CACHE.clear()
+    yield
+    pm_module._GCS_WORKBOOK_CACHE.clear()
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("gs://store-videos/sop/master_sheet.xlsx", "gs://store-videos/sop/master_sheet.xlsx"),
+        ("  gs://Store-Videos/sop/Master.XLSX ", "gs://store-videos/sop/Master.XLSX"),
+        ("gs://store-videos/sop/master_sheet.json", "gs://store-videos/sop/master_sheet.json"),
+        (
+            "https://console.cloud.google.com/storage/browser/_details/store-videos/sop/master_sheet.xlsx;tab=live_object?project=p",
+            "gs://store-videos/sop/master_sheet.xlsx",
+        ),
+        ("https://storage.cloud.google.com/store-videos/sop/master_sheet.json", "gs://store-videos/sop/master_sheet.json"),
+        # Google Sheet handling unchanged
+        ("https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz/edit#gid=0", "1AbCdEfGhIjKlMnOpQrStUvWxYz"),
+        ("1AbCdEfGhIjKlMnOpQrStUvWxYz", "1AbCdEfGhIjKlMnOpQrStUvWxYz"),
+    ],
+)
+def test_extract_spreadsheet_id_accepts_gcs_sop_workbook(raw, expected):
+    assert extract_spreadsheet_id(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "gs://store-videos",
+        "gs://store-videos/",
+        "gs://store-videos/sop/",
+        "gs://store-videos/sop/master_sheet.csv",
+        "https://console.cloud.google.com/storage/browser/store-videos/sop",
+        "https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOpQrStUvWxYz",
+    ],
+)
+def test_extract_spreadsheet_id_rejects_non_workbook_gcs(bad):
+    with pytest.raises(ValueError):
+        extract_spreadsheet_id(bad)
+
+
+def _excel_style_xlsx() -> bytes:
+    """Workbook shaped like Microsoft Excel / WPS output: sharedStrings, sparse cells/rows, abs Target."""
+    ns = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+    rns = 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+    pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
+    rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    sst = (
+        f'<sst {ns} count="5" uniqueCount="5">'
+        "<si><t>Config_Key</t></si><si><t>Active_Prompt_Version</t></si>"
+        '<si><r><t>Prompt_</t></r><r><rPr><b/></rPr><t xml:space="preserve">v9 </t></r><rPh><t>ignored</t></rPh></si>'
+        "<si><t>右侧说明</t></si><si><t>I列</t></si></sst>"
+    )
+    sheet = (
+        f"<worksheet {ns}><sheetData>"
+        '<row r="1"><c r="A1" t="s"><v>0</v></c></row>'
+        '<row r="2"><c r="A2" t="s"><v>1</v></c><c r="C2" t="s"><v>2</v></c><c r="D2" t="s"><v>3</v></c></row>'
+        '<row r="5"><c r="B5" t="b"><v>1</v></c><c r="C5"><v>42</v></c><c r="E5" t="inlineStr"><is><t>内联</t></is></c>'
+        '<c r="I5" t="s"><v>4</v></c></row>'
+        '<row r="6"><c r="AA6" t="b"><v>0</v></c></row>'
+        "</sheetData></worksheet>"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "xl/workbook.xml",
+            f'<workbook {ns} {rns}><sheets><sheet name="Tab0_版本总控与回滚开关" sheetId="1" r:id="rId3"/></sheets></workbook>',
+        )
+        zf.writestr(
+            "xl/_rels/workbook.xml.rels",
+            f'<Relationships xmlns="{pkg}"><Relationship Id="rId3" Type="{rel}/worksheet" '
+            'Target="/xl/worksheets/sheet7.xml"/></Relationships>',
+        )
+        zf.writestr("xl/sharedStrings.xml", sst)
+        zf.writestr("xl/worksheets/sheet7.xml", sheet)
+    return buf.getvalue()
+
+
+def test_read_xlsx_sheets_excel_shared_strings_and_sparse_cells():
+    rows = gg.read_xlsx_sheets(_excel_style_xlsx())["Tab0_版本总控与回滚开关"]
+    assert rows[0] == ["Config_Key"]
+    assert rows[1] == ["Active_Prompt_Version", "", "Prompt_v9 ", "右侧说明"]  # C2 lands in column C
+    assert rows[2] == [] and rows[3] == []  # rows 3-4 omitted by Excel
+    assert rows[4] == ["", "TRUE", "42", "", "内联", "", "", "", "I列"]  # B5 / E5 / I5 aligned
+    assert len(rows[5]) == 27 and rows[5][26] == "FALSE"  # AA -> index 26
+    # inlineStr workbooks written by this module still round-trip
+    data = gg.build_xlsx_bytes([{"name": "T", "rows": [["a", "b"], ["", "c"]]}])
+    assert gg.read_xlsx_sheets(data) == {"T": [["a", "b"], ["", "c"]]}
+
+
+@pytest.mark.parametrize("target", ["worksheets/sheet1.xml", "xl/worksheets/sheet1.xml", "/xl/worksheets/sheet1.xml"])
+def test_read_xlsx_sheets_accepts_all_target_forms(target):
+    data = gg.build_xlsx_bytes([{"name": "T", "rows": [["x"]]}])
+    src = zipfile.ZipFile(io.BytesIO(data))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for n in src.namelist():
+            body = src.read(n)
+            if n == "xl/_rels/workbook.xml.rels":
+                body = body.replace(b'Target="worksheets/sheet1.xml"', f'Target="{target}"'.encode())
+            zf.writestr(n, body)
+    assert gg.read_xlsx_sheets(buf.getvalue()) == {"T": [["x"]]}
+
+
+def _edit_workbook(raw: bytes, edit) -> bytes:
+    """Simulates a customer editing the downloaded .xlsx in Excel and re-uploading it."""
+    tabs = gg.read_xlsx_sheets(raw)
+    edit(tabs)
+    return gg.build_xlsx_bytes([{"name": k, "rows": v} for k, v in tabs.items()])
+
+
+def test_init_script_upload_then_prompt_manager_reads_gcs_workbook(tmp_path, monkeypatch):
+    mod = _load_init_script()
+    xlsx_path = tmp_path / "master_sheet.xlsx"
+    assert mod.main(["--export-xlsx", str(xlsx_path)]) == 0
+
+    fake = FakeGcs()
+    monkeypatch.setattr(mod, "make_gcs_gateway", lambda sa="": fake)
+    console = "https://console.cloud.google.com/storage/browser/_details/store-videos/sop/master_sheet.xlsx"
+    assert mod.main(["--gcs-uri", console]) == 0  # Console URL accepted, read-back verified
+    stored = fake.objects[("store-videos", "sop/master_sheet.xlsx")]
+    assert stored["contentType"] == gg.XLSX_CONTENT_TYPE
+    assert gg.read_xlsx_sheets(stored["data"]) == gg.read_xlsx_sheets(xlsx_path.read_bytes())
+    assert mod.main(["--sheet-id", SOP_URI, "--dry-run"]) == 0  # gs:// via --sheet-id is detected too
+    with pytest.raises(ValueError):
+        mod.main(["--gcs-uri", "gs://store-videos/sop/master_sheet.json"])
+
+    client = GoogleSheetsConfigClient(gcs_gateway=fake)
+    pm = PromptManager(sheet_client=client, known_valid_models={"gemini-3.8-flash", "gemini-2.5-flash"})
+
+    async def _load():
+        return await pm.load_active_config(SOP_URI)
+
+    downloads_before = sum(1 for m, u in fake.calls if "alt=media" in u)
+    cfg = asyncio.run(_load())
+    assert cfg.active_prompt_version == "Prompt_v2.5_V10全量17条标准版"
+    assert cfg.active_model_version == "gemini-3.8-flash"
+    assert len(cfg.rules) == 24 and cfg.rules[0].rule_id == "A1"
+    assert sum(1 for m, u in fake.calls if "alt=media" in u) == downloads_before + 1  # Tab0 + rules: one download
+    original_a1 = cfg.rules[0].check_instruction
+
+    # Customer edits in Excel: rewrite A1, drop (disable) the D2 row, switch the model pointer.
+    def _edit(tabs):
+        rules = tabs["Prompt_v2.5_V10全量17条标准版"]
+        rules[1][6] = "【已修改】A1 新的检查要求"
+        tabs["Prompt_v2.5_V10全量17条标准版"] = [r for r in rules if not r or r[0] != "D2"]
+        for row in tabs["Tab0_版本总控与回滚开关"]:
+            if row and row[0] == "Active_Model_Version":
+                row[1] = "gemini-2.5-flash"
+
+    stored["data"] = _edit_workbook(stored["data"], _edit)
+    cached = asyncio.run(_load())  # within the 60s TTL: still the old workbook
+    assert cached.rules[0].check_instruction == original_a1
+    pm_module._GCS_WORKBOOK_CACHE.clear()  # TTL elapsed
+    cfg2 = asyncio.run(_load())
+    assert cfg2.rules[0].check_instruction == "【已修改】A1 新的检查要求"
+    assert len(cfg2.rules) == 23 and "D2" not in {r.rule_id for r in cfg2.rules}
+    assert cfg2.active_model_version == "gemini-2.5-flash"
+    assert "【已修改】A1 新的检查要求" in cfg2.system_instruction
+
+    # Runtime never writes to a customer-owned GCS workbook.
+    n_calls = len(fake.calls)
+    asyncio.run(client.append_available_models(SOP_URI, ["gemini-9-flash"]))
+    assert len(fake.calls) == n_calls
+
+
+def test_json_snapshot_workbook_and_default_config_path(monkeypatch):
+    fake = FakeGcs()
+    snapshot = (_ROOT / "sop" / "master_sheet.json").read_bytes()
+    fake.put("store-videos", "sop/master_sheet.json", snapshot, ctype="application/json")
+    monkeypatch.setattr(pm_module.config, "master_prompt_sheet_id", "gs://store-videos/sop/master_sheet.json")
+    pm = PromptManager(sheet_client=GoogleSheetsConfigClient(gcs_gateway=fake), known_valid_models={"gemini-3.8-flash"})
+    cfg = asyncio.run(pm.load_active_config())
+    assert cfg.active_prompt_version == "Prompt_v2.5_V10全量17条标准版" and len(cfg.rules) == 24
+
+
+def test_gcs_sop_object_guardrails():
+    gw = FakeGcs()
+    with pytest.raises(WorkspaceAccessError, match="具体的 .xlsx 或 .json"):
+        gw.download_object_bytes("gs://store-videos")
+    with pytest.raises(WorkspaceAccessError, match="内部暂存"):
+        gw.download_object_bytes(f"gs://{STAGING}/jobs/master_sheet.xlsx")
+    with pytest.raises(WorkspaceAccessError, match="内部暂存"):
+        gw.upload_object_bytes(f"gs://{STAGING}/eval/x.xlsx", b"x", gg.XLSX_CONTENT_TYPE)
+    # The staging bucket's own sop/ prefix is allowed.
+    url = gw.upload_object_bytes(f"gs://{STAGING}/sop/master_sheet.xlsx", b"x", gg.XLSX_CONTENT_TYPE)
+    assert url.endswith(f"/_details/{STAGING}/sop/master_sheet.xlsx")
+    assert gw.download_object_bytes(f"gs://{STAGING}/sop/master_sheet.xlsx") == b"x"
+    with pytest.raises(WorkspaceAccessError, match="init_sop_sheet.py --gcs-uri"):
+        gw.download_object_bytes("gs://store-videos/sop/missing.xlsx")
+    with pytest.raises(WorkspaceAccessError, match="roles/storage.objectViewer"):
+        FakeGcs(forbidden=("locked",)).download_object_bytes("gs://locked/sop/master_sheet.xlsx")
+
+
+def _preflight_service(tmp_path, router):
+    return AuditService(
+        job_store=UserScopedJobStore(state_dir=tmp_path, gcs_bucket=LOCAL_PLACEHOLDER_BUCKET, gcs_store={}),
+        ingestor=VideoIngestor(drive_reader=router),
+        reporter=WorkspaceReporter(gateway=router, enable_notification=False),
+    )
+
+
+def test_gcs_preflight_verifies_gcs_sop_workbook(tmp_path, monkeypatch):
+    import cctv_audit.audit_service as audit_service_module
+
+    mod = _load_init_script()
+    fake = FakeGcs()
+    fake.put("store-videos", "store1/cam.mp4")
+    monkeypatch.setattr(audit_service_module.config, "master_prompt_sheet_id", SOP_URI)
+    router = gg.RoutingStorageGateway(drive_gateway=_ExplodingDrive(), gcs_gateway=fake)
+    svc = _preflight_service(tmp_path / "a", router)
+
+    # 1. SOP workbook not uploaded yet -> preflight rejected with the fix-it hint, no listing done.
+    job = asyncio.run(svc.preflight(user_id="u@example.com", drive_url="gs://store-videos/store1"))
+    assert job.state == JobState.REJECTED
+    assert "init_sop_sheet.py --gcs-uri" in job.preflight_report.message_to_user
+    assert job.preflight_report.total_videos == 0
+
+    # 2. Workbook without the Tab0 pointer tab -> rejected.
+    fake.put("store-videos", "sop/master_sheet.xlsx", gg.build_xlsx_bytes([{"name": "Sheet1", "rows": [["x"]]}]))
+    job = asyncio.run(svc.preflight(user_id="u@example.com", drive_url="gs://store-videos/store1"))
+    assert job.state == JobState.REJECTED and "Tab0_版本总控与回滚开关" in job.preflight_report.message_to_user
+
+    # 3. Not a workbook at all -> rejected.
+    fake.put("store-videos", "sop/master_sheet.xlsx", b"not a zip")
+    job = asyncio.run(svc.preflight(user_id="u@example.com", drive_url="gs://store-videos/store1"))
+    assert job.state == JobState.REJECTED and "无法解析" in job.preflight_report.message_to_user
+
+    # 4. Proper workbook -> READY.
+    fake.put("store-videos", "sop/master_sheet.xlsx", mod.build_xlsx_bytes(mod.load_snapshot(mod.DEFAULT_SNAPSHOT)))
+    job = asyncio.run(svc.preflight(user_id="u@example.com", drive_url="gs://store-videos/store1"))
+    assert job.state == JobState.READY, job.preflight_report.message_to_user
+
+
+def test_hybrid_gcs_videos_with_google_sheet_sop(tmp_path, monkeypatch):
+    """Videos in gs://, SOP in a Google Sheet: write probe -> GCS, Sheet readability -> Drive gateway."""
+    import cctv_audit.audit_service as audit_service_module
+    from cctv_audit.gcp import WorkspaceAccessError as WAE
+
+    fake = FakeGcs()
+    fake.put("store-videos", "store1/cam.mp4")
+    seen: List[str] = []
+
+    class _Drive:
+        def __init__(self, fail: bool) -> None:
+            self.fail = fail
+
+        async def check_sheet_readable(self, sheet_id):
+            seen.append(sheet_id)
+            if self.fail:
+                raise WAE(f"读不到 SOP 总控表 `{sheet_id}`：请共享给机器人账号")
+            return "SOP"
+
+        async def probe_write_access(self, folder_id):
+            raise AssertionError("gs:// write probe must go to GCS")
+
+    monkeypatch.setattr(audit_service_module.config, "master_prompt_sheet_id", "SOP1234567890ABCDEF")
+    ok = gg.RoutingStorageGateway(drive_gateway=_Drive(fail=False), gcs_gateway=fake)
+    job = asyncio.run(
+        _preflight_service(tmp_path / "b", ok).preflight(user_id="u@example.com", drive_url="gs://store-videos/store1")
+    )
+    assert job.state == JobState.READY and seen == ["SOP1234567890ABCDEF"]
+    assert any(m == "POST" and "cctv_audit_write_probe" in u for m, u in fake.calls)  # GCS write probe ran
+
+    bad = gg.RoutingStorageGateway(drive_gateway=_Drive(fail=True), gcs_gateway=fake)
+    job = asyncio.run(
+        _preflight_service(tmp_path / "c", bad).preflight(user_id="u@example.com", drive_url="gs://store-videos/store1")
+    )
+    assert job.state == JobState.REJECTED and "读不到 SOP 总控表" in job.preflight_report.message_to_user
+
+    # The router sends a gs:// SOP id to GCS, never to Drive.
+    router = gg.RoutingStorageGateway(drive_gateway=_ExplodingDrive(), gcs_gateway=fake)
+    assert asyncio.run(router.check_sheet_readable("")) == ""
+    with pytest.raises(WorkspaceAccessError):
+        asyncio.run(router.check_sheet_readable(SOP_URI))  # missing object -> GCS gateway, not Drive
+
+
+def _billion_laughs_xlsx() -> bytes:
+    data = gg.build_xlsx_bytes([{"name": "Tab0_版本总控与回滚开关", "rows": [["k", "v"]]}])
+    src = zipfile.ZipFile(io.BytesIO(data))
+    bomb = (
+        b'<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;&lol;&lol;">]>'
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+        b'<row r="1"><c r="A1" t="inlineStr"><is><t>&lol2;</t></is></c></row></sheetData></worksheet>'
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for n in src.namelist():
+            zf.writestr(n, bomb if n == "xl/worksheets/sheet1.xml" else src.read(n))
+    return buf.getvalue()
+
+
+def test_xml_entity_and_zip_bomb_guards():
+    with pytest.raises(ValueError, match="DOCTYPE/ENTITY"):
+        gg.read_xlsx_sheets(_billion_laughs_xlsx())
+    with pytest.raises(ValueError, match="limit"):
+        gg.read_xlsx_sheets(b"x" * (gg.SOP_MAX_BYTES + 1))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:  # tiny on disk, 21 MiB uncompressed
+        zf.writestr("xl/workbook.xml", b"\0" * (21 * 1024 * 1024))
+    assert len(buf.getvalue()) < 1024 * 1024
+    with pytest.raises(ValueError, match="uncompressed"):
+        gg.read_xlsx_sheets(buf.getvalue())
+    with pytest.raises(ValueError, match="无法解析"):
+        gg.load_gcs_sop_tabs(_billion_laughs_xlsx(), SOP_URI)
+
+
+def test_hostile_or_oversized_sop_rejected_by_check_and_preflight(tmp_path, monkeypatch):
+    import cctv_audit.audit_service as audit_service_module
+
+    fake = FakeGcs()
+    fake.put("store-videos", "store1/cam.mp4")
+    fake.put("store-videos", "sop/master_sheet.xlsx", _billion_laughs_xlsx())
+    with pytest.raises(WorkspaceAccessError, match="DOCTYPE/ENTITY"):
+        asyncio.run(fake.check_sheet_readable(SOP_URI))
+
+    fake.put("store-videos", "sop/master_sheet.xlsx", b"x" * (gg.SOP_MAX_BYTES + 1))
+    media_before = sum(1 for _, u in fake.calls if "alt=media" in u)
+    with pytest.raises(WorkspaceAccessError, match="20 MiB"):
+        asyncio.run(fake.check_sheet_readable(SOP_URI))
+    assert sum(1 for _, u in fake.calls if "alt=media" in u) == media_before  # refused from metadata size
+    with pytest.raises(WorkspaceAccessError, match="1 MiB"):
+        fake.put("store-videos", "sop/small.xlsx", b"y" * (2 * 1024 * 1024))
+        fake.download_object_bytes("gs://store-videos/sop/small.xlsx", max_bytes=1024 * 1024)
+
+    monkeypatch.setattr(audit_service_module.config, "master_prompt_sheet_id", SOP_URI)
+    router = gg.RoutingStorageGateway(drive_gateway=_ExplodingDrive(), gcs_gateway=fake)
+    job = asyncio.run(
+        _preflight_service(tmp_path, router).preflight(user_id="u@example.com", drive_url="gs://store-videos/store1")
+    )
+    assert job.state == JobState.REJECTED and "20 MiB" in job.preflight_report.message_to_user
+
+
+def test_download_size_cap_applies_when_metadata_size_missing():
+    class _NoSizeMeta(FakeGcs):
+        def _request(self, method, url, **kw):
+            status, body = super()._request(method, url, **kw)
+            if "fields=size" in url and status == 200:
+                return 200, b"{}"
+            return status, body
+
+    gw = _NoSizeMeta()
+    gw.put("store-videos", "sop/master_sheet.xlsx", b"z" * 2048)
+    with pytest.raises(WorkspaceAccessError, match="上限"):
+        gw.download_object_bytes(SOP_URI, max_bytes=1024)

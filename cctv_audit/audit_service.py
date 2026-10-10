@@ -167,12 +167,13 @@ class AuditService:
         if gateway is None:
             return ""
         checks = [asyncio.wait_for(gateway.probe_write_access(folder_id), timeout=30.0)]
-        # GCS (Zero-GWS) targets never depend on Workspace: skip the SOP Sheet probe there.
-        if not folder_id.startswith("gs://") and config.master_prompt_sheet_id:
+        # Any configured SOP source is verified before spend; the routing gateway sends a
+        # `gs://.../master_sheet.xlsx|.json` to GCS and a Google Sheet ID to Workspace (also for
+        # hybrid deployments with videos in GCS). "" = Zero-GWS built-in rules, nothing to check.
+        sop_id = (config.master_prompt_sheet_id or "").strip()
+        if sop_id:
             checks.append(
-                asyncio.wait_for(
-                    gateway.check_sheet_readable(config.master_prompt_sheet_id), timeout=15.0
-                )
+                asyncio.wait_for(gateway.check_sheet_readable(sop_id), timeout=15.0)
             )
         results = await asyncio.gather(*checks, return_exceptions=True)
         for res in results:

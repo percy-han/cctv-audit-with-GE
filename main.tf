@@ -109,17 +109,21 @@ variable "container_image" {
 }
 
 variable "master_prompt_sheet_id" {
-  description = "Google Sheet ID (bare ID or full docs.google.com/spreadsheets URL) for the Master Prompt & Model Config Center (REQ-013). Set to \"\" for Zero-GWS / GCS fallback mode: the engine then uses the bundled V25 baseline rules and needs no Google Workspace."
+  description = "Google Sheet ID (bare ID or full docs.google.com/spreadsheets URL) for the Master Prompt & Model Config Center (REQ-013). Zero-GWS / GCS fallback mode: either a GCS-hosted SOP workbook (gs://<bucket>/sop/master_sheet.xlsx or .json, or its Cloud Console / storage URL; see scripts/init_sop_sheet.py --gcs-uri), or \"\" for the bundled V25 baseline rules. Neither needs Google Workspace."
   type        = string
 
   # Mirrors cctv_audit/config.py::extract_spreadsheet_id so a mis-pasted Drive *folder*
-  # link is rejected at `terraform plan`, not at cold start. "" = Zero-GWS mode.
+  # link is rejected at `terraform plan`, not at cold start. "" = Zero-GWS built-in rules;
+  # gs://.../*.xlsx|*.json (or its Console / storage URL) = Zero-GWS GCS-hosted SOP workbook.
   validation {
     condition = var.master_prompt_sheet_id == "" || can(regex(
       "^([a-zA-Z0-9_-]{15,}|https://docs\\.google\\.com/spreadsheets/(u/[0-9]+/)?d/[a-zA-Z0-9_-]{15,}.*)$",
       var.master_prompt_sheet_id
+      )) || can(regex(
+      "^(gs://|https://console\\.cloud\\.google\\.com/storage/browser/(_details/)?|https://storage\\.(cloud\\.google|googleapis)\\.com/)[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]/[^?#;]*\\.(?i:xlsx|json)([;?#].*)?$",
+      var.master_prompt_sheet_id
     ))
-    error_message = "master_prompt_sheet_id must be \"\" (Zero-GWS / GCS fallback mode), a bare Spreadsheet ID (>=15 chars) or a https://docs.google.com/spreadsheets/[u/N/]d/<ID>/... URL."
+    error_message = "master_prompt_sheet_id must be \"\" (Zero-GWS built-in rules), a gs://<bucket>/<path>.xlsx|.json SOP workbook (or its Cloud Console / storage URL), a bare Spreadsheet ID (>=15 chars) or a https://docs.google.com/spreadsheets/[u/N/]d/<ID>/... URL."
   }
 }
 

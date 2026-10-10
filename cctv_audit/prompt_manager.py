@@ -40,6 +40,10 @@ BUNDLED_SOP_YAML_PATH = Path(__file__).resolve().parent / "sop_rules.chagee-stor
 # Global TTL Cache to prevent Google Sheets 429 Quota Exhaustion (user limit: 60 RPM)
 _SHEET_RANGE_CACHE: dict[str, tuple[float, list[list[str]]]] = {}
 _SHEET_RANGE_CACHE_TTL_SEC = 300.0  # 5 minutes
+# GCS-hosted Master SOP workbook (`gs://.../master_sheet.xlsx|.json`): one download serves both the
+# Tab 0 pointer read and the rules-tab read of a turn; a re-uploaded file is picked up within 60s.
+_GCS_WORKBOOK_CACHE: dict[str, tuple[float, dict[str, list[list[str]]]]] = {}
+_GCS_WORKBOOK_CACHE_TTL_SEC = 60.0
 
 
 class VisualScanTarget(BaseModel):
@@ -880,6 +884,29 @@ class GoogleSheetsConfigClient:
 
     TAB0_TITLE = "Tab0_版本总控与回滚开关"
 
+    def __init__(self, gcs_gateway: Optional[object] = None) -> None:
+        # Zero-GWS: `gs://` sheet IDs are read from GCS (`GcsStorageGateway.download_object_bytes`).
+        self._gcs_gateway = gcs_gateway
+
+    def _gcs(self):
+        if self._gcs_gateway is None:
+            from .gcs_gateway import GcsStorageGateway
+
+            self._gcs_gateway = GcsStorageGateway()
+        return self._gcs_gateway
+
+    async def _read_gcs_workbook_tabs(self, sheet_id: str) -> dict[str, list[list[str]]]:
+        """All tabs of a GCS `.xlsx` / `.json` SOP workbook (TTL-cached per URI)."""
+        hit = _GCS_WORKBOOK_CACHE.get(sheet_id)
+        if hit is not None and time.monotonic() - hit[0] < _GCS_WORKBOOK_CACHE_TTL_SEC:
+            return hit[1]
+        from .gcs_gateway import load_gcs_sop_tabs
+
+        raw = await asyncio.to_thread(self._gcs().download_object_bytes, sheet_id)
+        tabs = load_gcs_sop_tabs(raw, sheet_id)
+        _GCS_WORKBOOK_CACHE[sheet_id] = (time.monotonic(), tabs)
+        return tabs
+
     @staticmethod
     def _sheets_service():
         from googleapiclient.discovery import build
@@ -918,7 +945,13 @@ class GoogleSheetsConfigClient:
         name is handled by `PromptManager.resolve_and_probe_model`, which probes it and falls
         back to the configured fallback model with a warning shown to the supervisor.
         """
-        rows = await self._read_range(sheet_id, f"{self.TAB0_TITLE}!A1:D15")
+        if sheet_id.startswith("gs://"):
+            tabs = await self._read_gcs_workbook_tabs(sheet_id)
+            if self.TAB0_TITLE not in tabs:
+                raise ValueError(f"SOP workbook {sheet_id} has no tab {self.TAB0_TITLE!r}")
+            rows = tabs[self.TAB0_TITLE]
+        else:
+            rows = await self._read_range(sheet_id, f"{self.TAB0_TITLE}!A1:D15")
         pointers: dict[str, str] = {}
         for row in rows[1:]:
             if len(row) >= 2 and row[0].strip():
@@ -926,13 +959,16 @@ class GoogleSheetsConfigClient:
         return pointers
 
     async def read_prompt_tab_rules(self, sheet_id: str, tab_name: str) -> List[SopRuleItem]:
-        rows = await self._read_range(sheet_id, f"{tab_name}!A1:I100")
+        if sheet_id.startswith("gs://"):
+            rows = (await self._read_gcs_workbook_tabs(sheet_id)).get(tab_name, [])
+        else:
+            rows = await self._read_range(sheet_id, f"{tab_name}!A1:I100")
         return parse_rules_from_sheet_rows(rows)
 
     async def append_available_models(self, sheet_id: str, new_models: List[str]) -> None:
         """Appends newly discovered models to Tab 0's candidate row; never switches the active model."""
-        if not new_models:
-            return
+        if not new_models or sheet_id.startswith("gs://"):
+            return  # a GCS workbook is customer-owned and read-only for the runtime
         catalog_note = " | ".join(f"{m} (🆕 新模型可用待测试)" for m in new_models)
 
         def _append() -> None:
