@@ -463,20 +463,6 @@ resource "google_storage_bucket_iam_member" "workspace_bucket_meta_reader" {
   member = "serviceAccount:${data.google_service_account.audit_worker_sa.email}"
 }
 
-# Seeds the default SOP workbook (generated from sop/master_sheet.json by
-# `scripts/init_sop_sheet.py --export-xlsx sop/master_sheet.xlsx`) once, when the bucket is created.
-# Later customer edits (Excel / WPS re-upload or `init_sop_sheet.py --gcs-uri`) are never overwritten.
-resource "google_storage_bucket_object" "default_sop_workbook" {
-  bucket       = google_storage_bucket.workspace_bucket.name
-  name         = "sop/master_sheet.xlsx"
-  source       = "${path.module}/sop/master_sheet.xlsx"
-  content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-
-  lifecycle {
-    ignore_changes = [source, content, source_md5hash, metadata]
-  }
-}
-
 # 3. Reasoning Engine Service Agent Pull Permission on the image repository
 # Mandatory for Vertex AI Agent Engine (`ReasoningEngine` BYOC `containerSpec`) so the deployed agent
 # appears directly in the Gemini Enterprise Console -> `Agents` dropdown menu!
@@ -702,7 +688,7 @@ resource "terraform_data" "vertex_reasoning_engine" {
     google_artifact_registry_repository_iam_member.reasoning_engine_image_puller,
     google_storage_bucket_iam_member.staging_bucket_rw,
     google_storage_bucket_iam_member.workspace_bucket_rw,
-    google_storage_bucket_object.default_sop_workbook,
+    terraform_data.seed_sop_workbook,
     google_cloud_run_v2_service.cctv_audit_worker,
     google_cloud_run_v2_service_iam_member.reasoning_engine_worker_invoker,
   ]
@@ -739,6 +725,45 @@ resource "terraform_data" "stack_teardown" {
     google_project_service.required,
     google_storage_bucket_iam_member.staging_bucket_rw,
   ]
+}
+
+# Seeds the default SOP workbook (generated from sop/master_sheet.json by
+# `scripts/init_sop_sheet.py --export-xlsx sop/master_sheet.xlsx`) into the workspace bucket ONCE.
+# It is a conditional upload (`ifGenerationMatch=0`): if gs://<workspace>/sop/master_sheet.xlsx already
+# exists it is left untouched, so customer edits (Excel / WPS re-upload, `init_sop_sheet.py --gcs-uri`)
+# are never overwritten. A `google_storage_bucket_object` cannot do this: the google provider plans an
+# in-place re-upload whenever the live object's MD5 differs from the local file, even with
+# `ignore_changes` on source/content/md5 (Round 72b).
+resource "terraform_data" "seed_sop_workbook" {
+  triggers_replace = [
+    google_storage_bucket.workspace_bucket.name,
+    "sop/master_sheet.xlsx",
+  ]
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      python3 ${path.module}/deploy/deploy_reasoning_engine.py \
+        --project-id "${var.project_id}" \
+        --location "${var.reasoning_engine_location}" \
+        seed-object \
+        --bucket "${google_storage_bucket.workspace_bucket.name}" \
+        --name "sop/master_sheet.xlsx" \
+        --source "${path.module}/sop/master_sheet.xlsx" \
+        --content-type "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    EOT
+  }
+
+  depends_on = [google_storage_bucket_iam_member.workspace_bucket_rw]
+}
+
+# The seed used to be a managed google_storage_bucket_object; forget it without deleting the live
+# object (which may already hold the customer's edited SOP).
+removed {
+  from = google_storage_bucket_object.default_sop_workbook
+
+  lifecycle {
+    destroy = false
+  }
 }
 
 # 5. Unattended Watchdog (Cloud Scheduler -> POST /internal/jobs/sweep every 2 minutes)

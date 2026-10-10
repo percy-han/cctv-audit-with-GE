@@ -30,6 +30,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any, Callable
 
 import google.auth
@@ -697,6 +698,33 @@ def empty_gcs_bucket(bucket: str, *, project_id: str) -> int:
     return deleted
 
 
+def seed_gcs_object(bucket: str, name: str, source: str, content_type: str) -> str:
+    """Uploads `source` to gs://`bucket`/`name` only if no live object exists (`ifGenerationMatch=0`).
+
+    Returns "created" or "exists" (HTTP 412: the object is already there and is left untouched, e.g. a
+    customer-edited SOP workbook). Any other failure is fatal.
+    """
+    data = Path(source).read_bytes()
+    url = (
+        "https://storage.googleapis.com/upload/storage/v1/b/"
+        f"{urllib.parse.quote(bucket, safe='')}/o?uploadType=media"
+        f"&name={urllib.parse.quote(name, safe='')}&ifGenerationMatch=0"
+    )
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Authorization", f"Bearer {_get_access_token()}")
+    req.add_header("Content-Type", content_type)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            gen = json.loads(resp.read() or b"{}").get("generation", "")
+        print(f"🌱 Seeded gs://{bucket}/{name} from {source} (generation {gen}).")
+        return "created"
+    except urllib.error.HTTPError as exc:
+        if exc.code == 412:
+            print(f"✅ gs://{bucket}/{name} already exists; left untouched.")
+            return "exists"
+        raise SystemExit(f"Seeding gs://{bucket}/{name} failed: HTTP {exc.code} {exc.read().decode(errors='replace')}")
+
+
 def destroy_stack(
     *,
     project_id: str,
@@ -1016,6 +1044,15 @@ def main(argv: list[str] | None = None) -> int:
     p_destroy.add_argument("--gcp-location", default="", help="Optional stack region override")
     p_destroy.add_argument("--image-uri", default="", help="Optional container image URI to infer region")
 
+    p_seed = sub.add_parser(
+        "seed-object",
+        help="Upload a file to GCS only if the object does not exist yet (never overwrites; e.g. the default SOP)",
+    )
+    p_seed.add_argument("--bucket", required=True)
+    p_seed.add_argument("--name", required=True)
+    p_seed.add_argument("--source", required=True)
+    p_seed.add_argument("--content-type", default="application/octet-stream")
+
     args = parser.parse_args(argv)
     host = (
         "aiplatform.googleapis.com"
@@ -1099,6 +1136,8 @@ def main(argv: list[str] | None = None) -> int:
             image_uri=args.image_uri,
         )
         print(json.dumps(res, indent=2))
+    elif args.cmd == "seed-object":
+        seed_gcs_object(args.bucket, args.name, args.source, args.content_type)
     return 0
 
 

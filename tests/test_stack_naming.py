@@ -667,11 +667,14 @@ def test_workspace_bucket_versioned_seeded_and_wired():
         blk = main[s: main.index("\n}\n", s)]
         assert "bucket = google_storage_bucket.workspace_bucket.name" in blk
         assert 'member = "serviceAccount:${data.google_service_account.audit_worker_sa.email}"' in blk
-    s = main.index('resource "google_storage_bucket_object" "default_sop_workbook"')
-    obj = main[s: main.index("\n}\n", s)]
-    assert 'name         = "sop/master_sheet.xlsx"' in obj
-    assert 'source       = "${path.module}/sop/master_sheet.xlsx"' in obj
-    assert "ignore_changes = [source, content, source_md5hash, metadata]" in obj
+    s = main.index('resource "terraform_data" "seed_sop_workbook"')
+    seed = main[s: main.index("\n}\n", s)]
+    assert 'seed-object' in seed and '--name "sop/master_sheet.xlsx"' in seed
+    assert '--source "${path.module}/sop/master_sheet.xlsx"' in seed
+    assert "google_storage_bucket.workspace_bucket.name" in seed.split("provisioner")[0]
+    assert 'resource "google_storage_bucket_object" "default_sop_workbook"' not in main
+    rm = main[main.index("removed {\n  from = google_storage_bucket_object.default_sop_workbook"):]
+    assert "destroy = false" in rm[: rm.index("\n}\n")]
     assert (ROOT / "sop" / "master_sheet.xlsx").is_file()
     sop = 'gs://${google_storage_bucket.workspace_bucket.name}/sop/master_sheet.xlsx'
     assert f'name  = "GCS_SOP_URI"\n        value = "{sop}"' in main
@@ -679,7 +682,7 @@ def test_workspace_bucket_versioned_seeded_and_wired():
     dep = main[main.index("depends_on = [", main.index('resource "terraform_data" "vertex_reasoning_engine"')):]
     dep = dep[: dep.index("]")]
     assert "google_storage_bucket_iam_member.workspace_bucket_rw" in dep
-    assert "google_storage_bucket_object.default_sop_workbook" in dep
+    assert "terraform_data.seed_sop_workbook" in dep
     assert 'output "workspace_bucket_name"' in main and 'output "gcs_sop_uri"' in main
 
 
@@ -853,3 +856,42 @@ def test_agent_patch_never_sends_immutable_state(monkeypatch):
     mask = patch_url.split("updateMask=", 1)[1].split(",")
     assert "state" not in mask and "adkAgentDefinition" in mask
     assert "state" not in patch_body
+
+
+
+def test_seed_object_never_overwrites_an_existing_object(tmp_path, monkeypatch, capsys):
+    """Round 72b: the default SOP seed is a create-only upload (`ifGenerationMatch=0`)."""
+    import io as _io
+    import urllib.error as _ue
+
+    src = tmp_path / "master_sheet.xlsx"
+    src.write_bytes(b"PK-seed")
+    seen: list[Any] = []
+
+    class _Resp(_io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=0):
+        seen.append(req)
+        if len(seen) == 1:
+            return _Resp(b'{"generation": "123"}')
+        raise _ue.HTTPError(req.full_url, 412, "Precondition Failed", {}, _io.BytesIO(b"{}"))
+
+    monkeypatch.setattr(deploy, "_get_access_token", lambda: "tok")
+    monkeypatch.setattr(deploy.urllib.request, "urlopen", fake_urlopen)
+    assert deploy.seed_gcs_object("bkt", "sop/master_sheet.xlsx", str(src), "application/x") == "created"
+    assert deploy.seed_gcs_object("bkt", "sop/master_sheet.xlsx", str(src), "application/x") == "exists"
+    assert all("ifGenerationMatch=0" in r.full_url for r in seen)
+    assert "name=sop%2Fmaster_sheet.xlsx" in seen[0].full_url and seen[0].data == b"PK-seed"
+    assert "left untouched" in capsys.readouterr().out
+
+    def boom(req, timeout=0):
+        raise _ue.HTTPError(req.full_url, 403, "Forbidden", {}, _io.BytesIO(b"denied"))
+
+    monkeypatch.setattr(deploy.urllib.request, "urlopen", boom)
+    with pytest.raises(SystemExit, match="HTTP 403"):
+        deploy.seed_gcs_object("bkt", "sop/master_sheet.xlsx", str(src), "application/x")
