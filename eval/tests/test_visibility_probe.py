@@ -19,7 +19,7 @@ THIS_DIR = Path(__file__).resolve().parent.parent
 
 class ProbeSpecsTest(unittest.TestCase):
     def test_probe_specs_cover_all_target_items_and_valid_files(self) -> None:
-        frozen_specs = rgr.load_frozen_folder_specs()
+        frozen_specs = rgr.load_folder_specs()
         known_file_ids = {
             str(v["file_id"]) for fspec in frozen_specs for v in fspec["videos"]
         }

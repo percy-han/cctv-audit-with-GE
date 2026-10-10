@@ -16,7 +16,7 @@ def rows_for(rep: dict) -> list[list[str]]:
     r, ad = rep["recall"], rep["alert_density"]
     out = [
         [f"尺子打分：{rep['run_label']}"],
-        [f"加权召回（19 行）= {r['all']['points']:g} / {r['all']['rows']} = {r['all']['recall']:.1%}",
+        [f"加权召回（{r['all']['rows']} 行）= {r['all']['points']:g} / {r['all']['rows']} = {r['all']['recall']:.1%}",
          f"开卷 dev = {r['dev']['points']:g} / {r['dev']['rows']} = {r['dev']['recall']:.1%}",
          f"检查 holdout = {r['holdout']['points']:g} / {r['holdout']['rows']} = {r['holdout']['recall']:.1%}",
          f"告警密度 = 平均 {ad['mean_per_clip']:.1f} 条/段，最多 {ad['max_per_clip']} 条/段（{ad['findings']} 条 / {ad['clips']} 段）"],

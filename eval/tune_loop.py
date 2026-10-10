@@ -13,13 +13,15 @@ Enforces:
 3. Immutable append-only round snapshots under `eval/rounds/rNN/` + Master SOP Sheet tab archival
    (`Prompt_v2.6_rNN`) without ever mutating Tab 0 (`Tab0_版本总控与回滚开关`) active pointer.
 4. Selection rule & guardrails:
-   - Guardrails first: mean alert density <= 8.0 per 5-min clip AND zero regressions on the 6
-     stable baseline items (`R08, R09, R12, R13, R14, R19`).
-   - Highest weighted recall (`all`, out of 19).
+   - Guardrails first: mean alert density <= 8.0 per 5-min clip AND zero regressions on the stable
+     baseline items configured for the golden set (`stable_baseline_items` in its manifest or
+     `stable_baseline: true` per item; see eval/golden_set.py). Not configured -> reported as
+     `not_configured`, never silently passed or failed.
+   - Highest weighted recall (`all`, over every golden item).
    - Tie-breakers in order: higher `holdout` recall -> lower alert density (`mean_per_clip`) ->
      shorter prompt (`len(system_instruction)`).
 5. Budget & convergence:
-   - Target: weighted `all` recall >= 85% (16.15 / 19).
+   - Target: weighted `all` recall >= 85% of the golden items.
    - Max 10 candidate rounds (`r01..r10`).
    - Early stop after 2 consecutive candidate rounds with no gain on `all` recall (revert to best).
    - Variance confirmation: re-run winning round until it has 3 total runs and report mean recall.
@@ -51,14 +53,15 @@ from cctv_audit.prompt_manager import (  # noqa: E402
 
 DEFAULT_ROUNDS_DIR = THIS_DIR / "rounds"
 DEFAULT_RESULTS_DIR = THIS_DIR / "results"
+# Local default only; every environment sets its own golden location (env EVAL_GOLDEN_URI, Terraform
+# variable eval_golden_uri -> eval/cloudbuild_round.yaml _GOLDEN_URI). Nothing derives content from it.
 DEFAULT_GOLDEN_PATH = THIS_DIR / "data" / "golden_v1.jsonl"
 
-TARGET_RECALL: float = 0.85  # 16.15 / 19.0
+TARGET_RECALL: float = 0.85  # fraction of the golden set's weighted points
 MAX_CANDIDATE_ROUNDS: int = 10
 NO_GAIN_PATIENCE: int = 2
 VARIANCE_CONFIRM_RUNS: int = 3
 MAX_MEAN_ALERT_DENSITY: float = 8.0
-STABLE_BASELINE_ITEMS: tuple[str, ...] = ("R08", "R09", "R12", "R13", "R14", "R19")
 
 MAX_RULE_CHARS: int = 3200
 MAX_TOTAL_RULE_CHARS: int = 32000
@@ -366,23 +369,35 @@ def _extract_item_rows(score_doc: dict[str, Any]) -> list[dict[str, Any]]:
 
 def evaluate_run_guardrails(
     score_doc: dict[str, Any],
-    stable_items: Sequence[str] = STABLE_BASELINE_ITEMS,
+    stable_items: Sequence[str] | None = None,
     max_density: float = MAX_MEAN_ALERT_DENSITY,
 ) -> dict[str, Any]:
-    """Checks alert density <= 8.0 and zero regressions on the 6 stable baseline items."""
+    """Checks alert density <= ``max_density`` and zero regressions on the stable baseline items.
+
+    ``stable_items`` defaults to the golden set's configured list recorded in the score doc
+    (``score_doc["golden"]["stable_baseline_items"]``, written by eval/score_run.py). An empty /
+    missing list sets ``stable_guardrail = "not_configured"``: that check is skipped and says so;
+    ``passed`` then reflects the density check only.
+    """
     density = score_doc.get("alert_density") or {}
     mean_per_clip = float(density.get("mean_per_clip", 0.0))
     density_ok = mean_per_clip <= max_density + 1e-9
 
+    if stable_items is None:
+        stable_items = list((score_doc.get("golden") or {}).get("stable_baseline_items") or [])
     row_scores: dict[str, float] = {
         r["item_id"]: r["score"] for r in _extract_item_rows(score_doc)
     }
-    regressed_items: list[str] = []
-    for rid in stable_items:
-        if row_scores.get(rid, 0.0) < 1.0 - 1e-9:
-            regressed_items.append(rid)
+    missing = [rid for rid in stable_items if rid not in row_scores]
+    if missing:
+        raise ValueError(f"stable baseline items not in this score doc: {missing}")
+    regressed_items = [rid for rid in stable_items if row_scores[rid] < 1.0 - 1e-9]
+    if not stable_items:
+        stable_guardrail = "not_configured"
+    else:
+        stable_guardrail = "fail" if regressed_items else "pass"
 
-    passed = density_ok and (len(regressed_items) == 0)
+    passed = density_ok and stable_guardrail != "fail"
     return {
         "passed": passed,
         "density_ok": density_ok,
@@ -390,10 +405,11 @@ def evaluate_run_guardrails(
         "max_allowed_density": max_density,
         "regressed_stable_items": regressed_items,
         "stable_items_checked": list(stable_items),
+        "stable_guardrail": stable_guardrail,
     }
 
 
-def _extract_split_metrics(split_dict: dict[str, Any], default_n: int) -> tuple[float, float, int]:
+def _extract_split_metrics(split_dict: dict[str, Any], default_n: int = 0) -> tuple[float, float, int]:
     hits = float(
         split_dict.get("points")
         if "points" in split_dict
@@ -411,9 +427,9 @@ def _extract_split_metrics(split_dict: dict[str, Any], default_n: int) -> tuple[
 def summarize_score_doc(score_doc: dict[str, Any]) -> dict[str, Any]:
     """Extracts a compact run summary from a `score.json` document."""
     rec = score_doc.get("recall") or {}
-    all_recall, all_hits, all_total = _extract_split_metrics(rec.get("all") or {}, 19)
-    dev_recall, dev_hits, dev_total = _extract_split_metrics(rec.get("dev") or {}, 6)
-    hold_recall, hold_hits, hold_total = _extract_split_metrics(rec.get("holdout") or {}, 13)
+    all_recall, all_hits, all_total = _extract_split_metrics(rec.get("all") or {})
+    dev_recall, dev_hits, dev_total = _extract_split_metrics(rec.get("dev") or {})
+    hold_recall, hold_hits, hold_total = _extract_split_metrics(rec.get("holdout") or {})
     guardrails = evaluate_run_guardrails(score_doc)
 
     norm_rows = _extract_item_rows(score_doc)
@@ -438,6 +454,7 @@ def summarize_score_doc(score_doc: dict[str, Any]) -> dict[str, Any]:
     return {
         "run_id": str(score_doc.get("run_id", "")),
         "judge_model": str(score_doc.get("judge_model", "")),
+        "golden_version": str((score_doc.get("golden") or {}).get("golden_version") or ""),
         "all_recall": all_recall,
         "all_weighted_hits": all_hits,
         "all_total": all_total,
@@ -490,6 +507,10 @@ def recompute_manifest_aggregates(manifest: dict[str, Any]) -> dict[str, Any]:
         "primary_holdout_recall": round(float(primary_run["holdout_recall"]), 4),
         "primary_mean_per_clip": round(float(primary_run["mean_per_clip"]), 4),
         "primary_guardrails_passed": primary_guardrails_passed,
+        "all_total": int(primary_run.get("all_total") or 0),
+        "dev_total": int(primary_run.get("dev_total") or 0),
+        "holdout_total": int(primary_run.get("holdout_total") or 0),
+        "golden_versions": sorted({str(r.get("golden_version") or "") for r in runs} - {""}),
         "mean_all_recall": round(mean_all, 4),
         "mean_all_weighted_hits": round(mean_all_hits, 4),
         "mean_dev_recall": round(mean_dev, 4),
@@ -815,12 +836,17 @@ def evaluate_loop_state(rounds_dir: Path) -> dict[str, Any]:
     }
 
 
+def _total(agg: dict[str, Any], run: dict[str, Any], split: str) -> Any:
+    """Item count of ``split`` from the recorded data (aggregate, else first run), never a constant."""
+    return agg.get(f"{split}_total") or run.get(f"{split}_total") or "?"
+
+
 def render_ledger_markdown(state: dict[str, Any]) -> str:
     lines: list[str] = [
         "# Chagee CCTV AI 稽核 — 第二步提示词自动调优账本 (Prompt Tuning Ledger)",
         "",
         f"- **当前状态 (`status`)**: `{state['status']}`",
-        f"- **目标召回率 (`target_recall`)**: `>= {state['target_recall']:.0%}` (`16.15 / 19`)",
+        f"- **目标召回率 (`target_recall`)**: `>= {state['target_recall']:.0%}`（按黄金集加权总分计）",
         f"- **当前最优轮次 (`best_round_id`)**: `{state['best_round_id']}`",
         f"- **已评估候选轮数**: `{state['candidate_rounds_evaluated']} / {state['max_candidate_rounds']}`",
         f"- **连续无增益轮数 (`consecutive_no_gain`)**: `{state['consecutive_no_gain']} / {state['no_gain_patience']}`",
@@ -828,8 +854,8 @@ def render_ledger_markdown(state: dict[str, Any]) -> str:
         "",
         "## 轮次汇总表",
         "",
-        "| 轮次 | 父轮次 | 修改层 | SOP Sheet Tab | 运行次数 | 开卷 (Dev, 6) | 闭卷 (Holdout, 13) | 总召回率 (All, 19) | 场均告警密度 (<=8.0) | 护栏通过 (6项稳定基线零退化) | 提示词总长 | 状态 |",
-        "| :--- | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |",
+        f"| 轮次 | 父轮次 | 修改层 | SOP Sheet Tab | 运行次数 | 开卷 (Dev) | 闭卷 (Holdout) | 总召回率 (All) | 场均告警密度 (<={MAX_MEAN_ALERT_DENSITY:.1f}) | 护栏通过 (稳定基线零退化) | 提示词总长 | 黄金集版本 | 状态 |",
+        "| :--- | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- | :--- |",
     ]
 
     for m in state.get("rounds", []):
@@ -841,16 +867,21 @@ def render_ledger_markdown(state: dict[str, Any]) -> str:
         agg = m.get("aggregates")
         if not agg:
             lines.append(
-                f"| `{rid}` | `{parent}` | `{layer}` | `{tab}` | 0 | — | — | — | — | — | {char_len} | `PENDING_EXECUTION` |"
+                f"| `{rid}` | `{parent}` | `{layer}` | `{tab}` | 0 | — | — | — | — | — | {char_len} | — | `PENDING_EXECUTION` |"
             )
             continue
         guard_str = "✅ PASS" if agg.get("all_runs_pass_guardrails") else "❌ FAIL"
+        runs0 = (m.get("runs") or [{}])[0]
+        n_dev = _total(agg, runs0, "dev")
+        n_hold = _total(agg, runs0, "holdout")
+        n_all = _total(agg, runs0, "all")
+        versions = ", ".join(agg.get("golden_versions") or []) or "未记录"
         lines.append(
             f"| `{rid}` | `{parent}` | `{layer}` | `{tab}` | {agg['num_runs']} | "
-            f"{agg['mean_dev_weighted_hits']:.2f}/6 ({agg['mean_dev_recall']:.1%}) | "
-            f"{agg['mean_holdout_weighted_hits']:.2f}/13 ({agg['mean_holdout_recall']:.1%}) | "
-            f"**{agg['mean_all_weighted_hits']:.2f}/19 ({agg['mean_all_recall']:.1%})** | "
-            f"{agg['mean_per_clip']:.2f} | {guard_str} | {char_len} | `{m['status']}` |"
+            f"{agg['mean_dev_weighted_hits']:.2f}/{n_dev} ({agg['mean_dev_recall']:.1%}) | "
+            f"{agg['mean_holdout_weighted_hits']:.2f}/{n_hold} ({agg['mean_holdout_recall']:.1%}) | "
+            f"**{agg['mean_all_weighted_hits']:.2f}/{n_all} ({agg['mean_all_recall']:.1%})** | "
+            f"{agg['mean_per_clip']:.2f} | {guard_str} | {char_len} | {versions} | `{m['status']}` |"
         )
 
     lines.append("")
@@ -864,9 +895,9 @@ def render_ledger_markdown(state: dict[str, Any]) -> str:
         for r in m.get("runs", []):
             g = r.get("guardrails") or {}
             lines.append(
-                f"  - Run `{r['run_id']}`: All={r['all_weighted_hits']:.2f}/19 ({r['all_recall']:.1%}), "
-                f"Dev={r['dev_weighted_hits']:.2f}/6 ({r['dev_recall']:.1%}), "
-                f"Holdout={r['holdout_weighted_hits']:.2f}/13 ({r['holdout_recall']:.1%}), "
+                f"  - Run `{r['run_id']}`: All={r['all_weighted_hits']:.2f}/{r.get('all_total', '?')} ({r['all_recall']:.1%}), "
+                f"Dev={r['dev_weighted_hits']:.2f}/{r.get('dev_total', '?')} ({r['dev_recall']:.1%}), "
+                f"Holdout={r['holdout_weighted_hits']:.2f}/{r.get('holdout_total', '?')} ({r['holdout_recall']:.1%}), "
                 f"Density={r['mean_per_clip']:.2f}/clip, "
                 f"Guardrails={'PASS' if g.get('passed') else 'FAIL'} "
                 f"(Regressed={g.get('regressed_stable_items')}, DevMisses={r.get('dev_misses')})"

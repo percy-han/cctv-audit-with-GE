@@ -28,10 +28,17 @@ NEEDS_PRIVATE_DATA = {
 }
 
 
+# Whole modules that replay recorded private runs (eval/rounds/eval_history.jsonl + eval/results/).
+NEEDS_PRIVATE_DATA_MODULES = {"test_sheet_report.py"}
+HISTORY = DATA_DIR.parent / "rounds" / "eval_history.jsonl"
+
+
 def pytest_collection_modifyitems(config, items):
-    if GOLDEN.is_file() and BASELINE_RUN.is_dir():
-        return
-    skip = pytest.mark.skip(reason=f"private golden dataset not present under {DATA_DIR}")
+    have_golden = GOLDEN.is_file() and BASELINE_RUN.is_dir()
+    have_history = HISTORY.is_file()
+    skip = pytest.mark.skip(reason=f"private golden dataset / run history not present under {DATA_DIR.parent}")
     for item in items:
-        if item.name in NEEDS_PRIVATE_DATA:
+        if not have_golden and item.name in NEEDS_PRIVATE_DATA:
+            item.add_marker(skip)
+        elif not (have_golden and have_history) and Path(str(item.fspath)).name in NEEDS_PRIVATE_DATA_MODULES:
             item.add_marker(skip)

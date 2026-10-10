@@ -15,7 +15,7 @@
 # (trigger below) or running output manual_deploy_command.
 #
 # Project whose image repository and worker SA were created by ../main.tf before this root existed
-# (study-project-496907). Once, with owner credentials, before the first pipeline run:
+# (the first environment). Once, with owner credentials, before the first pipeline run:
 #   1. here: adopt_existing = true in <project_id>.tfvars, then the three commands above. The repo
 #      and the worker SA are imported, not re-created; IAM grants that already exist are merged.
 #   2. in ..: terraform init -migrate-state -force-copy -backend-config=<project_id>.gcs.tfbackend
@@ -68,7 +68,7 @@ variable "display_label" {
 }
 
 # ---- Name overrides. Empty = derived from name_prefix. Only for adopting names that existed before
-# ---- name_prefix did (see study-project-496907.tfvars); new stacks leave them empty.
+# ---- name_prefix did (see the first environment's <env>.tfvars); new stacks leave them empty.
 
 variable "artifact_repository_id" {
   description = "Image repository ID; must equal artifact_repository_id in ../<env>.tfvars. Empty = <name_prefix>-images."
@@ -191,7 +191,6 @@ locals {
     "roles/aiplatform.user",                # ReasoningEngine create/update/delete
     "roles/discoveryengine.admin",          # Gemini Enterprise engine + agent binding
     "roles/logging.logWriter",              # build logs (cloudbuild.yaml: CLOUD_LOGGING_ONLY)
-    "roles/monitoring.editor",              # google_monitoring_dashboard (Eval & Ops Dashboard)
   ])
 }
 
@@ -264,13 +263,6 @@ resource "google_service_account_iam_member" "worker_self_token_creator" {
 resource "google_project_iam_member" "worker_vertex_ai_user" {
   project = var.project_id
   role    = "roles/aiplatform.user"
-  member  = "serviceAccount:${google_service_account.worker.email}"
-}
-
-# Evaluation custom metrics (custom.googleapis.com/cctv_audit/eval/*) pushed by eval/run_gcp_round.py.
-resource "google_project_iam_member" "worker_monitoring_metric_writer" {
-  project = var.project_id
-  role    = "roles/monitoring.metricWriter"
   member  = "serviceAccount:${google_service_account.worker.email}"
 }
 

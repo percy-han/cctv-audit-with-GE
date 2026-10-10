@@ -15,7 +15,10 @@ workspace_impersonate_user = "<bot-user@customer-domain>" # "" = the worker SA i
 
 # Optional
 # vertex_model_location = "global"
-# scheduler_time_zone   = "Etc/UTC"
+# scheduler_time_zone   = "Etc/UTC"            # also the timestamp zone of eval report Sheet names
+# eval_results_folder_id = "<drive-folder-id>"  # eval runs create one timestamped Sheet report here;
+#                                               # share it (Editor) with workspace_impersonate_user. "" = no report
+# eval_golden_uri       = "gs://<private-bucket>/golden/<name>.jsonl" # golden set for eval scoring (+ <name>.manifest.json); "" = repo default
 # ge_company_name       = "<Company>"          # shown by the new Gemini Enterprise app
 # ge_tenant_label       = "<brand>"            # used in agent descriptions / default display names
 # ge_agent_display_name = "<agent name>"       # default: "<brand> 门店监控 AI 稽核专家 [<name_prefix>]"; keep it unique per stack

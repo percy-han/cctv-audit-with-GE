@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
-"""GCP Cloud Monitoring custom metric publisher & history archiver for CCTV AI Audit evaluations.
+"""Per-run evaluation records, history ledger and round averages for CCTV AI Audit evaluations.
 
-Publishes evaluation metrics under ``custom.googleapis.com/cctv_audit/eval/*`` with full
-version lineage labels (``model_version``, ``sop_version``, ``media_mode``, ``round_id``,
-``run_id``) and dimensional drill-downs (``sop_category``, ``outlet_focus``, ``video_name``),
-so that the GCP Cloud Monitoring Dashboard (provisioned via Terraform ``google_monitoring_dashboard``)
-can compare Recall, Confirmed-Only Recall, Alert Density, Hit Rate, Point-Action Timestamp Drift
-(``POINT`` ±20s rules only; ``WINDOW`` ±60s process rules exempt), Regressions, Flip Rate,
-Token Cost, and Latency across models and SOP versions over the 24-month Cloud Monitoring
-retention window.
+The numbers here are derived only from the local scorer's output (``eval/score_run.py`` ->
+``score.json``) plus the run's folder job JSONs (token ledger, latency); nothing is re-scored.
+
+- ``build_eval_monitoring_record``: one structured record per run (recall overall / holdout / dev /
+  confirmed-only, hit rate, alert density, POINT-rule timestamp drift, regressions, flip rate,
+  cost, latency, tokens, SOP-category / outlet x focus / per-video breakdowns).
+- Every record carries ``golden_version`` (eval/golden_set.py) plus item/part counts; recall scored on
+  different golden versions is never averaged together.
+- ``append_eval_history_jsonl`` / ``write_round_averages_jsonl``: the run ledger
+  ``eval/rounds/eval_history.jsonl`` and its per-(round, model, SOP, media mode, golden version) averages
+  ``eval/rounds/eval_round_averages.jsonl``; both feed the per-run Google Sheet report
+  (``eval/sheet_report.py``).
+- ``publish_agent_platform_evaluation``: per-question drill-down in Agent Platform Evaluation.
+
+Eval metrics are no longer published to Cloud Monitoring or Vertex AI Experiments (Round 67).
 """
 
 from __future__ import annotations
@@ -22,16 +29,9 @@ from typing import Any, Sequence
 
 from eval.tune_loop import evaluate_run_guardrails
 
-logger = logging.getLogger("eval.monitoring_publisher")
+logger = logging.getLogger("eval.eval_records")
 
-METRIC_PREFIX = "custom.googleapis.com/cctv_audit/eval"
-ROUND_METRIC_PREFIX = "custom.googleapis.com/cctv_audit/eval_round"
-MAX_TIMESERIES_PER_BATCH = 200
-
-DEFAULT_EXPERIMENT_LOCATION = "asia-southeast1"
 DEFAULT_AGENT_EVAL_LOCATION = "us-central1"
-DEFAULT_ROUND_EXPERIMENT_NAME = "chagee-cctv-audit-eval"
-DEFAULT_RUNS_EXPERIMENT_NAME = "chagee-cctv-audit-eval-runs"
 
 
 def extract_run_resource_summary(job_docs: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -132,6 +132,21 @@ def compute_round_flip_rate(
     return round(flipped / len(all_item_ids), 6)
 
 
+GOLDEN_UNVERSIONED = "golden (unversioned)"
+
+
+def golden_fields(golden: dict[str, Any], recall: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Golden lineage fields of a run record, from ``score_doc["golden"]`` (eval/score_run.py)."""
+    recall = recall or {}
+    return {
+        "golden_version": str(golden.get("golden_version") or GOLDEN_UNVERSIONED),
+        "golden_item_count": int(golden.get("item_count") or (recall.get("all") or {}).get("rows") or 0),
+        "golden_part_count": int(golden.get("part_count") or 0),
+        "golden_split_counts": dict(golden.get("split_counts") or {}),
+        "stable_baseline_items": list(golden.get("stable_baseline_items") or []),
+    }
+
+
 def build_eval_monitoring_record(
     *,
     project_id: str,
@@ -175,6 +190,7 @@ def build_eval_monitoring_record(
     max_point_drift = qm.get("max_point_timestamp_drift_sec")
 
     guardrails = evaluate_run_guardrails(score_doc)
+    golden = score_doc.get("golden") or {}
     regressed_count = len(guardrails.get("regressed_stable_items") or [])
 
     row_scores = {
@@ -201,6 +217,7 @@ def build_eval_monitoring_record(
         "sop_version": resolved_sop,
         "media_mode": resolved_media,
         "judge_model": str(score_doc.get("judge_model") or ""),
+        **golden_fields(golden, rec),
         "metrics": {
             "overall_recall": round(all_rec, 6),
             "holdout_recall": round(holdout_rec, 6),
@@ -211,6 +228,7 @@ def build_eval_monitoring_record(
             "hit_rate": round(hit_rate, 6),
             "regressed_stable_items": regressed_count,
             "guardrails_passed": bool(guardrails.get("passed", False)),
+            "stable_guardrail": str(guardrails.get("stable_guardrail") or "not_configured"),
             "flip_rate": round(flip_rate, 6),
             "mean_point_timestamp_drift_sec": (
                 round(float(mean_point_drift), 3) if mean_point_drift is not None else None
@@ -231,223 +249,6 @@ def build_eval_monitoring_record(
         "video_breakdown": score_doc.get("video_breakdown") or {},
     }
 
-
-def _make_gauge_series(
-    *,
-    project_id: str,
-    metric_name: str,
-    labels: dict[str, str],
-    end_time: str,
-    double_value: float | None = None,
-    int64_value: int | None = None,
-    metric_prefix: str = METRIC_PREFIX,
-) -> dict[str, Any]:
-    if int64_value is not None:
-        value_type = "INT64"
-        point_val: dict[str, Any] = {"int64Value": str(int(int64_value))}
-    else:
-        value_type = "DOUBLE"
-        point_val = {"doubleValue": float(double_value or 0.0)}
-
-    clean_labels = {k: str(v)[:100] for k, v in labels.items() if v is not None}
-    return {
-        "metric": {
-            "type": f"{metric_prefix}/{metric_name}",
-            "labels": clean_labels,
-        },
-        "resource": {
-            "type": "global",
-            "labels": {"project_id": project_id},
-        },
-        "metricKind": "GAUGE",
-        "valueType": value_type,
-        "points": [
-            {
-                "interval": {"endTime": end_time},
-                "value": point_val,
-            }
-        ],
-    }
-
-
-def _build_timeseries_with_prefix(
-    record: dict[str, Any],
-    *,
-    metric_prefix: str,
-    base_labels: dict[str, str],
-    emit_timestamp: str | None = None,
-) -> list[dict[str, Any]]:
-    project_id = str(record["project_id"])
-    end_time = emit_timestamp or datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
-        "+00:00", "Z"
-    )
-    m = record.get("metrics") or {}
-    series: list[dict[str, Any]] = []
-
-    double_metrics = (
-        "overall_recall",
-        "holdout_recall",
-        "dev_recall",
-        "confirmed_only_recall",
-        "findings_per_clip",
-        "hit_rate",
-        "flip_rate",
-        "cost_per_clip_usd",
-        "mean_clip_latency_sec",
-    )
-    for name in double_metrics:
-        if m.get(name) is not None:
-            series.append(
-                _make_gauge_series(
-                    project_id=project_id,
-                    metric_name=name,
-                    labels=base_labels,
-                    end_time=end_time,
-                    double_value=float(m[name]),
-                    metric_prefix=metric_prefix,
-                )
-            )
-
-    if m.get("mean_point_timestamp_drift_sec") is not None:
-        series.append(
-            _make_gauge_series(
-                project_id=project_id,
-                metric_name="mean_point_timestamp_drift_sec",
-                labels=base_labels,
-                end_time=end_time,
-                double_value=float(m["mean_point_timestamp_drift_sec"]),
-                metric_prefix=metric_prefix,
-            )
-        )
-
-    series.append(
-        _make_gauge_series(
-            project_id=project_id,
-            metric_name="regressed_stable_items",
-            labels=base_labels,
-            end_time=end_time,
-            int64_value=int(m.get("regressed_stable_items") or 0),
-            metric_prefix=metric_prefix,
-        )
-    )
-
-    for sop_cat, cat_obj in sorted((record.get("sop_category_recall") or {}).items()):
-        series.append(
-            _make_gauge_series(
-                project_id=project_id,
-                metric_name="sop_category_recall",
-                labels={**base_labels, "sop_category": str(sop_cat)},
-                end_time=end_time,
-                double_value=float(cat_obj.get("recall", 0.0)),
-                metric_prefix=metric_prefix,
-            )
-        )
-
-    for of_key, of_obj in sorted((record.get("outlet_focus_recall") or {}).items()):
-        series.append(
-            _make_gauge_series(
-                project_id=project_id,
-                metric_name="outlet_focus_recall",
-                labels={
-                    **base_labels,
-                    "outlet_focus": str(of_key),
-                    "outlet_name": str(of_obj.get("outlet_name") or ""),
-                    "focus": str(of_obj.get("focus") or ""),
-                },
-                end_time=end_time,
-                double_value=float(of_obj.get("recall", 0.0)),
-                metric_prefix=metric_prefix,
-            )
-        )
-
-    for vname, v_obj in sorted((record.get("video_breakdown") or {}).items()):
-        short_vname = vname.split("_")[0] if "_" in vname else vname
-        v_labels = {
-            **base_labels,
-            "video_name": short_vname,
-            "video_filename": vname[:100],
-        }
-        series.append(
-            _make_gauge_series(
-                project_id=project_id,
-                metric_name="video_recall",
-                labels=v_labels,
-                end_time=end_time,
-                double_value=float(v_obj.get("recall", 0.0)),
-                metric_prefix=metric_prefix,
-            )
-        )
-        if metric_prefix == ROUND_METRIC_PREFIX:
-            series.append(
-                _make_gauge_series(
-                    project_id=project_id,
-                    metric_name="video_findings_count",
-                    labels=v_labels,
-                    end_time=end_time,
-                    double_value=float(v_obj.get("findings_count") or 0.0),
-                    metric_prefix=metric_prefix,
-                )
-            )
-        else:
-            series.append(
-                _make_gauge_series(
-                    project_id=project_id,
-                    metric_name="video_findings_count",
-                    labels=v_labels,
-                    end_time=end_time,
-                    int64_value=int(round(float(v_obj.get("findings_count") or 0))),
-                    metric_prefix=metric_prefix,
-                )
-            )
-
-    return series
-
-
-def build_cloud_monitoring_timeseries(
-    record: dict[str, Any],
-    *,
-    emit_timestamp: str | None = None,
-) -> list[dict[str, Any]]:
-    """Build per-run GCP Cloud Monitoring v3 ``TimeSeries`` objects under ``eval/*``."""
-    base_labels = {
-        "model_version": str(record.get("model_version") or "unknown"),
-        "sop_version": str(record.get("sop_version") or "unknown"),
-        "media_mode": str(record.get("media_mode") or "agentic"),
-        "round_id": str(record.get("round_id") or "r00"),
-        "run_id": str(record.get("run_id") or "unknown"),
-    }
-    return _build_timeseries_with_prefix(
-        record,
-        metric_prefix=METRIC_PREFIX,
-        base_labels=base_labels,
-        emit_timestamp=emit_timestamp,
-    )
-
-
-def build_round_monitoring_timeseries(
-    round_record: dict[str, Any],
-    *,
-    emit_timestamp: str | None = None,
-) -> list[dict[str, Any]]:
-    """Build round-averaged GCP Cloud Monitoring v3 ``TimeSeries`` objects under ``eval_round/*``.
-
-    Each ``(round_id, model_version, sop_version, media_mode)`` combination emits exactly ONE
-    averaged point per metric so trend charts show a single representative point per round
-    without duplicate same-round run dots.
-    """
-    base_labels = {
-        "model_version": str(round_record.get("model_version") or "unknown"),
-        "sop_version": str(round_record.get("sop_version") or "unknown"),
-        "media_mode": str(round_record.get("media_mode") or "agentic"),
-        "round_id": str(round_record.get("round_id") or "r00"),
-        "runs_count": str(int(round_record.get("runs_count") or 1)),
-    }
-    return _build_timeseries_with_prefix(
-        round_record,
-        metric_prefix=ROUND_METRIC_PREFIX,
-        base_labels=base_labels,
-        emit_timestamp=emit_timestamp,
-    )
 
 
 def aggregate_round_monitoring_record(records_for_round: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -484,6 +285,10 @@ def aggregate_round_monitoring_record(records_for_round: Sequence[dict[str, Any]
     avg_metrics["regressed_stable_items"] = max(reg_vals) if reg_vals else 0
     avg_metrics["guardrails_passed"] = all(
         bool((r.get("metrics") or {}).get("guardrails_passed", False)) for r in records_for_round
+    )
+    stable_states = {str((r.get("metrics") or {}).get("stable_guardrail") or "") for r in records_for_round}
+    avg_metrics["stable_guardrail"] = (
+        "fail" if "fail" in stable_states else "pass" if stable_states == {"pass"} else "not_configured"
     )
 
     flip_vals = [float((r.get("metrics") or {}).get("flip_rate") or 0.0) for r in records_for_round]
@@ -564,6 +369,10 @@ def aggregate_round_monitoring_record(records_for_round: Sequence[dict[str, Any]
         "sop_version": str(last.get("sop_version") or "unknown"),
         "media_mode": str(last.get("media_mode") or "agentic"),
         "judge_model": str(last.get("judge_model") or ""),
+        "golden_version": str(last.get("golden_version") or GOLDEN_UNVERSIONED),
+        "golden_item_count": int(last.get("golden_item_count") or 0),
+        "golden_part_count": int(last.get("golden_part_count") or 0),
+        "golden_split_counts": dict(last.get("golden_split_counts") or {}),
         "metrics": avg_metrics,
         "sop_category_recall": avg_sop_cat,
         "outlet_focus_recall": avg_of,
@@ -572,14 +381,16 @@ def aggregate_round_monitoring_record(records_for_round: Sequence[dict[str, Any]
 
 
 def compute_all_round_averages(history_records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Group ``history_records`` by ``(round_id, model_version, sop_version, media_mode)`` in order and average."""
-    groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    """Group ``history_records`` by ``(round_id, model_version, sop_version, media_mode, golden_version)``
+    in order and average. Runs scored on different golden versions are never averaged together."""
+    groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
     for rec in history_records:
         key = (
             str(rec.get("round_id") or "r00"),
             str(rec.get("model_version") or "unknown"),
             str(rec.get("sop_version") or "unknown"),
             str(rec.get("media_mode") or "agentic"),
+            str(rec.get("golden_version") or GOLDEN_UNVERSIONED),
         )
         groups.setdefault(key, []).append(rec)
     return [aggregate_round_monitoring_record(recs) for recs in groups.values()]
@@ -626,43 +437,6 @@ def append_eval_history_jsonl(record: dict[str, Any], history_path: Path) -> Non
     )
 
 
-def publish_eval_timeseries(
-    project_id: str,
-    time_series: Sequence[dict[str, Any]],
-    credentials: Any = None,
-) -> int:
-    """Publish ``time_series`` to Cloud Monitoring REST API v3 in batches of <= 200."""
-    if not project_id or not time_series:
-        return 0
-
-    import google.auth
-    from google.auth.transport.requests import AuthorizedSession
-
-    if credentials is None:
-        credentials, _ = google.auth.default(
-            scopes=["https://www.googleapis.com/auth/monitoring.write"]
-        )
-    authed_session = AuthorizedSession(credentials)
-    url = f"https://monitoring.googleapis.com/v3/projects/{project_id}/timeSeries"
-
-    written = 0
-    for start in range(0, len(time_series), MAX_TIMESERIES_PER_BATCH):
-        chunk = list(time_series[start : start + MAX_TIMESERIES_PER_BATCH])
-        resp = authed_session.post(url, json={"timeSeries": chunk}, timeout=30)
-        if resp.status_code >= 300:
-            raise RuntimeError(
-                f"Cloud Monitoring timeSeries.create failed (HTTP {resp.status_code}): {resp.text[:500]}"
-            )
-        written += len(chunk)
-
-    logger.info(
-        "Published %d evaluation TimeSeries points to Cloud Monitoring (project=%s)",
-        written,
-        project_id,
-    )
-    return written
-
-
 def slugify_experiment_id(raw: str, max_len: int = 60) -> str:
     """Convert an arbitrary identifier into a valid Vertex AI Metadata resource ID.
 
@@ -677,155 +451,6 @@ def slugify_experiment_id(raw: str, max_len: int = 60) -> str:
     if len(cleaned) < 2:
         cleaned = f"{cleaned}-0"
     return cleaned
-
-
-def build_vertex_experiment_run_payload(
-    record: dict[str, Any],
-    *,
-    is_round_average: bool = False,
-) -> dict[str, Any]:
-    """Build ``{"run_name": str, "params": dict, "metrics": dict}`` for Vertex AI / Agent Platform Experiments."""
-    round_id = str(record.get("round_id") or "r00")
-    model_version = str(record.get("model_version") or "unknown")
-    sop_version = str(record.get("sop_version") or "unknown")
-    media_mode = str(record.get("media_mode") or "agentic")
-    judge_model = str(record.get("judge_model") or "")
-    timestamp_iso = str(record.get("timestamp") or "")
-    m = record.get("metrics") or {}
-
-    if is_round_average:
-        raw_name = f"{round_id}-{sop_version}-{model_version}"
-        runs_count = int(record.get("runs_count") or 1)
-        run_ids_str = ",".join(str(x) for x in (record.get("run_ids") or []))
-    else:
-        run_id = str(record.get("run_id") or "run")
-        raw_name = f"{round_id}-{run_id}-{sop_version}"
-        runs_count = 1
-        run_ids_str = run_id
-
-    run_name = slugify_experiment_id(raw_name, max_len=60)
-    params: dict[str, float | int | str] = {
-        "round_id": round_id,
-        "sop_version": sop_version,
-        "model_version": model_version,
-        "media_mode": media_mode,
-        "judge_model": judge_model,
-        "runs_count": runs_count,
-        "run_ids": run_ids_str[:120],
-        "guardrails_passed": "true" if m.get("guardrails_passed") else "false",
-        "point_window_sec": int(m.get("point_window_sec", 20)),
-        "window_sec": int(m.get("window_sec", 60)),
-        "evaluated_at": timestamp_iso,
-    }
-
-    metrics: dict[str, float | int | str] = {
-        "overall_recall": round(float(m.get("overall_recall", 0.0)), 6),
-        "holdout_recall": round(float(m.get("holdout_recall", 0.0)), 6),
-        "dev_recall": round(float(m.get("dev_recall", 0.0)), 6),
-        "confirmed_only_recall": round(float(m.get("confirmed_only_recall", 0.0)), 6),
-        "hit_rate": round(float(m.get("hit_rate", 0.0)), 6),
-        "findings_per_clip": round(float(m.get("findings_per_clip", 0.0)), 6),
-        "total_findings": round(float(m.get("total_findings", 0.0)), 2),
-        "flip_rate": round(float(m.get("flip_rate", 0.0)), 6),
-        "regressed_stable_items": int(m.get("regressed_stable_items", 0)),
-        "cost_per_clip_usd": round(float(m.get("cost_per_clip_usd", 0.0)), 6),
-        "total_cost_usd": round(float(m.get("total_cost_usd", 0.0)), 6),
-        "mean_clip_latency_sec": round(float(m.get("mean_clip_latency_sec", 0.0)), 3),
-        "max_clip_latency_sec": round(float(m.get("max_clip_latency_sec", 0.0)), 3),
-        "total_token_count": int(m.get("total_token_count", 0)),
-    }
-    if m.get("mean_point_timestamp_drift_sec") is not None:
-        metrics["mean_point_timestamp_drift_sec"] = round(
-            float(m["mean_point_timestamp_drift_sec"]), 3
-        )
-    if m.get("max_point_timestamp_drift_sec") is not None:
-        metrics["max_point_timestamp_drift_sec"] = int(m["max_point_timestamp_drift_sec"])
-
-    for sop_cat, cat_obj in sorted((record.get("sop_category_recall") or {}).items()):
-        safe_cat = re.sub(r"[^a-zA-Z0-9_]+", "_", str(sop_cat)).strip("_")
-        metrics[f"recall_sop_{safe_cat}"] = round(float(cat_obj.get("recall", 0.0)), 6)
-
-    for of_key, of_obj in sorted((record.get("outlet_focus_recall") or {}).items()):
-        safe_of = re.sub(r"[^a-zA-Z0-9_]+", "_", str(of_key)).strip("_")
-        metrics[f"recall_store_{safe_of}"] = round(float(of_obj.get("recall", 0.0)), 6)
-
-    return {
-        "run_name": run_name,
-        "params": params,
-        "metrics": metrics,
-    }
-
-
-def publish_vertex_experiment_records(
-    project_id: str,
-    records: Sequence[dict[str, Any]],
-    *,
-    location: str = DEFAULT_EXPERIMENT_LOCATION,
-    experiment_name: str = DEFAULT_ROUND_EXPERIMENT_NAME,
-    experiment_description: str = (
-        "CHAGEE CCTV AI Audit MLOps Evaluation (Model x SOP Version x Round Comparison)"
-    ),
-    is_round_average: bool = False,
-    credentials: Any = None,
-) -> list[str]:
-    """Log evaluation records as runs in Vertex AI / Agent Platform Experiments."""
-    if not project_id or not records:
-        return []
-
-    try:
-        from google.cloud import aiplatform
-    except ImportError as exc:
-        logger.warning(
-            "google-cloud-aiplatform is not installed; skipping Vertex AI Experiment logging: %s",
-            exc,
-        )
-        return []
-
-    exp_slug = slugify_experiment_id(experiment_name, max_len=60)
-    aiplatform.init(
-        project=project_id,
-        location=location,
-        experiment=exp_slug,
-        experiment_description=experiment_description,
-        experiment_tensorboard=False,
-        credentials=credentials,
-    )
-
-    logged_runs: list[str] = []
-    for rec in records:
-        payload = build_vertex_experiment_run_payload(
-            rec, is_round_average=is_round_average
-        )
-        run_name = payload["run_name"]
-        try:
-            try:
-                aiplatform.start_run(run=run_name, resume=True)
-            except Exception:
-                aiplatform.start_run(run=run_name, resume=False)
-            try:
-                aiplatform.log_params(payload["params"])
-                aiplatform.log_metrics(payload["metrics"])
-            finally:
-                aiplatform.end_run()
-            logged_runs.append(run_name)
-        except Exception as exc:
-            logger.warning(
-                "Failed to log run '%s' to Vertex AI Experiment '%s': %s",
-                run_name,
-                exp_slug,
-                exc,
-            )
-
-    logger.info(
-        "Logged %d/%d evaluation runs to Vertex AI Experiment '%s' (%s/%s): %s",
-        len(logged_runs),
-        len(records),
-        exp_slug,
-        project_id,
-        location,
-        logged_runs,
-    )
-    return logged_runs
 
 
 def build_agent_platform_evaluation_items(
@@ -1125,60 +750,3 @@ def publish_agent_platform_evaluation(
         "evaluation_set_name": str(eval_set.name),
         "evaluation_run_name": str(eval_run.name),
     }
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Publish a CCTV AI Audit evaluation monitoring_record.json to GCP Cloud Monitoring & Vertex AI Experiments"
-    )
-    parser.add_argument("--project-id", required=True, help="Target GCP project ID")
-    parser.add_argument(
-        "--record-json",
-        type=Path,
-        required=True,
-        help="Path to monitoring_record.json produced by eval/run_gcp_round.py",
-    )
-    parser.add_argument(
-        "--emit-timestamp",
-        default=None,
-        help="Optional RFC3339 UTC timestamp override (defaults to current UTC time when original timestamp is >24h old)",
-    )
-    parser.add_argument(
-        "--experiment-location",
-        default=DEFAULT_EXPERIMENT_LOCATION,
-        help="Vertex AI / Agent Platform Experiment region (default: asia-southeast1)",
-    )
-    parser.add_argument(
-        "--skip-experiments",
-        action="store_true",
-        help="Skip logging to Vertex AI / Agent Platform Experiments",
-    )
-    args = parser.parse_args(argv)
-    record = json.loads(args.record_json.read_text(encoding="utf-8"))
-    ts = build_cloud_monitoring_timeseries(record, emit_timestamp=args.emit_timestamp)
-    count = publish_eval_timeseries(args.project_id, ts)
-    print(f"Published {count} TimeSeries points for run_id={record.get('run_id')} to {args.project_id}.")
-    if not args.skip_experiments:
-        try:
-            runs = publish_vertex_experiment_records(
-                args.project_id,
-                [record],
-                location=args.experiment_location,
-                experiment_name=DEFAULT_RUNS_EXPERIMENT_NAME,
-                experiment_description="CHAGEE CCTV AI Audit Per-Run Detailed Evaluation Ledger",
-                is_round_average=False,
-            )
-            print(f"Logged Vertex AI Experiment run(s): {runs}")
-        except Exception as exc:
-            logger.warning("Vertex AI Experiment publish warning (non-fatal): %s", exc)
-    return 0
-
-
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(main())
-
-

@@ -27,6 +27,11 @@ THIS_DIR = Path(__file__).resolve().parent.parent
 BASELINE = THIS_DIR / "data" / "runs" / "v6_0928_0811"
 
 
+def _expected_clip_count() -> int:
+    manifest = json.loads((THIS_DIR / "data" / "golden_v1.manifest.json").read_text(encoding="utf-8"))
+    return sum(len(f["videos"]) for f in manifest["folders"])
+
+
 def _baseline_jobs() -> list[dict]:
     return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(BASELINE.glob("job_*.json"))]
 
@@ -75,9 +80,10 @@ def _fake_judge(cases):
 
 class RunRoundOfflineTest(unittest.TestCase):
     def test_frozen_specs_cover_all_16_clips(self):
-        specs = rgr.load_frozen_folder_specs()
-        self.assertEqual(len(specs), 4)
-        self.assertEqual(sum(len(s["videos"]) for s in specs), rgr.EXPECTED_VIDEO_COUNT)
+        specs = rgr.load_folder_specs()
+        manifest = json.loads((THIS_DIR / "data" / "golden_v1.manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual([s["baseline_job_id"] for s in specs], [f["group_id"] for f in manifest["folders"]])
+        self.assertEqual(sum(len(s["videos"]) for s in specs), _expected_clip_count())
 
     def test_end_to_end_replay_matches_baseline_findings(self):
         tmp = Path(tempfile.mkdtemp(prefix="rgr_test_"))
@@ -107,7 +113,7 @@ class RunRoundOfflineTest(unittest.TestCase):
                     mock.patch.object(rgr, "score_run", partial(sr.score_run, judge_fn=_fake_judge)):
                 rc = asyncio.run(rgr.run_round_async(args))
             self.assertEqual(rc, 0)
-            self.assertEqual(len(fake_auditor.calls), rgr.EXPECTED_VIDEO_COUNT)
+            self.assertEqual(len(fake_auditor.calls), _expected_clip_count())
 
             # Shape parity: the runner's job docs flatten to the same findings as the baseline.
             emitted = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(run_data_dir.glob("job_*.json"))]
@@ -171,7 +177,7 @@ class _FlakyAuditor(FakeAuditor):
 
 
 def _one_folder():
-    return next(s for s in rgr.load_frozen_folder_specs() if len(s["videos"]) >= 3)
+    return next(s for s in rgr.load_folder_specs() if len(s["videos"]) >= 3)
 
 
 def _run_folder(auditor, ckpt):

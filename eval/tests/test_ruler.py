@@ -26,7 +26,8 @@ class BuildDatasetTest(unittest.TestCase):
             ["Ice Maker Weekly Cleaning", "2", "Bau Cat", "Red", "Footage 2&3: 174340 c", "c.mov,d.mov"],
         ]
         idx = {"a.mov": "A", "b.mov": "B", "c.mov": "C", "d.mov": "D"}
-        items = bd.build_items(raw, idx)
+        items = bd.build_items(raw, idx, dev_groups={("Handwashing Monitoring", "Cantavil D2"),
+                                                     ("Ice Maker Weekly Cleaning", "Bau Cat")})
         self.assertEqual([i.item_id for i in items], ["R02", "R03", "R04"])
         self.assertEqual(items[1].focus, "Handwashing Monitoring")
         self.assertEqual(items[1].audit_clause, "1.5 HW")
@@ -165,6 +166,7 @@ class ScoreRunTest(unittest.TestCase):
             "focus": "Handwashing Monitoring",
             "outlet_name": "Cantavil D2",
             "audit_clause": "1.5 Handwashing and Sanitation Standard",
+            "sop_category": "A_Handwashing",
             "finding_verbatim": "Footage 4: 120720 Partner apply soap before wet hand",
             "video_filenames": ["a.mov"],
             "parts": [{"part_id": "R08", "description": "Partner apply soap before wet hand", "osd_times": ["12:07:20"]}],
@@ -177,6 +179,7 @@ class ScoreRunTest(unittest.TestCase):
             "focus": "Ice Maker Weekly Cleaning",
             "outlet_name": "Cantavil D2",
             "audit_clause": "5.8 Ice Maker Routine Cleaning and Maintenance",
+            "sop_category": "B_IceMaker",
             "finding_verbatim": "Footage 1: 221647 Leave chemical for 5 minutes",
             "video_filenames": ["b.mov"],
             "parts": [{"part_id": "R14", "description": "Leave chemical for 5 minutes", "osd_times": ["22:16:47"]}],
@@ -246,13 +249,13 @@ class ScoreRunTest(unittest.TestCase):
         self.assertEqual(rep["video_breakdown"]["a.mov"]["recall"], 1.0)
 
 
-class MonitoringPublisherTest(unittest.TestCase):
-    def test_build_record_and_timeseries_and_history_dedup(self):
+class EvalRecordsTest(unittest.TestCase):
+    def test_build_record_history_dedup_and_round_average(self):
         import json
         import tempfile
         from pathlib import Path
         from unittest import mock
-        import monitoring_publisher as mp
+        from eval import eval_records as mp
 
         score_doc = {
             "recall": {
@@ -322,16 +325,6 @@ class MonitoringPublisherTest(unittest.TestCase):
         self.assertEqual(rec["metrics"]["mean_clip_latency_sec"], 360.0)
         self.assertAlmostEqual(rec["metrics"]["flip_rate"], 1 / 3, places=4)
 
-        ts = mp.build_cloud_monitoring_timeseries(rec)
-        metric_types = {t["metric"]["type"] for t in ts}
-        self.assertIn("custom.googleapis.com/cctv_audit/eval/overall_recall", metric_types)
-        self.assertIn("custom.googleapis.com/cctv_audit/eval/confirmed_only_recall", metric_types)
-        self.assertIn("custom.googleapis.com/cctv_audit/eval/mean_point_timestamp_drift_sec", metric_types)
-        self.assertIn("custom.googleapis.com/cctv_audit/eval/sop_category_recall", metric_types)
-        self.assertIn("custom.googleapis.com/cctv_audit/eval/outlet_focus_recall", metric_types)
-        self.assertIn("custom.googleapis.com/cctv_audit/eval/video_recall", metric_types)
-        self.assertIn("custom.googleapis.com/cctv_audit/eval/video_findings_count", metric_types)
-
         with tempfile.TemporaryDirectory() as tmp:
             hist = Path(tmp) / "eval_history.jsonl"
             rec_a = {
@@ -359,77 +352,6 @@ class MonitoringPublisherTest(unittest.TestCase):
             self.assertAlmostEqual(r_avg["metrics"]["overall_recall"], (0.60 + 0.7895) / 2, places=5)
             self.assertAlmostEqual(r_avg["metrics"]["findings_per_clip"], 2.5, places=5)
             self.assertAlmostEqual(r_avg["video_breakdown"]["a.mov"]["findings_count"], 2.5, places=2)
-
-            round_ts = mp.build_round_monitoring_timeseries(r_avg, emit_timestamp="2026-10-09T00:00:00Z")
-            round_metric_types = {t["metric"]["type"] for t in round_ts}
-            self.assertIn("custom.googleapis.com/cctv_audit/eval_round/overall_recall", round_metric_types)
-            self.assertIn("custom.googleapis.com/cctv_audit/eval_round/sop_category_recall", round_metric_types)
-            self.assertIn("custom.googleapis.com/cctv_audit/eval_round/outlet_focus_recall", round_metric_types)
-            self.assertIn("custom.googleapis.com/cctv_audit/eval_round/video_recall", round_metric_types)
-            self.assertIn("custom.googleapis.com/cctv_audit/eval_round/video_findings_count", round_metric_types)
-            for t in round_ts:
-                self.assertEqual(t["metric"]["labels"]["runs_count"], "2")
-                self.assertNotIn("run_id", t["metric"]["labels"])
-
-            exp_round_payload = mp.build_vertex_experiment_run_payload(r_avg, is_round_average=True)
-            self.assertEqual(exp_round_payload["run_name"], "r01-v2-6-r01-gemini-3-8-flash")
-            self.assertEqual(exp_round_payload["params"]["sop_version"], "v2.6_r01")
-            self.assertEqual(exp_round_payload["params"]["model_version"], "gemini-3.8-flash")
-            self.assertEqual(exp_round_payload["params"]["runs_count"], 2)
-            self.assertAlmostEqual(
-                exp_round_payload["metrics"]["overall_recall"], (0.60 + 0.7895) / 2, places=5
-            )
-            self.assertIn("recall_sop_A_Handwashing", exp_round_payload["metrics"])
-
-            exp_run_payload = mp.build_vertex_experiment_run_payload(rec, is_round_average=False)
-            self.assertEqual(exp_run_payload["run_name"], "r01-r01-b-v2-6-r01")
-            self.assertEqual(exp_run_payload["params"]["runs_count"], 1)
-
-            with (
-                mock.patch("google.cloud.aiplatform.init") as mock_init,
-                mock.patch(
-                    "google.cloud.aiplatform.start_run",
-                    side_effect=[
-                        RuntimeError("404 Context not found"),
-                        RuntimeError("403 PermissionDenied on first run"),
-                        RuntimeError("404 Context not found"),
-                        mock.MagicMock(),
-                    ],
-                ) as mock_start,
-                mock.patch("google.cloud.aiplatform.log_params") as mock_params,
-                mock.patch("google.cloud.aiplatform.log_metrics") as mock_metrics,
-                mock.patch("google.cloud.aiplatform.end_run") as mock_end,
-            ):
-                bad_avg = {**r_avg, "round_id": "r00", "sop_version": "v2.5_r00"}
-                logged = mp.publish_vertex_experiment_records(
-                    "example-project",
-                    [bad_avg, r_avg],
-                    location="asia-southeast1",
-                    experiment_name="chagee-cctv-audit-eval",
-                    is_round_average=True,
-                )
-            self.assertEqual(logged, ["r01-v2-6-r01-gemini-3-8-flash"])
-            mock_init.assert_called_once()
-            self.assertEqual(
-                mock_start.call_args_list,
-                [
-                    mock.call(run="r00-v2-5-r00-gemini-3-8-flash", resume=True),
-                    mock.call(run="r00-v2-5-r00-gemini-3-8-flash", resume=False),
-                    mock.call(run="r01-v2-6-r01-gemini-3-8-flash", resume=True),
-                    mock.call(run="r01-v2-6-r01-gemini-3-8-flash", resume=False),
-                ],
-            )
-            mock_params.assert_called_once_with(exp_round_payload["params"])
-            mock_metrics.assert_called_once_with(exp_round_payload["metrics"])
-            mock_end.assert_called_once()
-
-        fake_sess = mock.MagicMock()
-        fake_resp = mock.MagicMock(status_code=200, text="{}")
-        fake_sess.post.return_value = fake_resp
-        with mock.patch("google.auth.transport.requests.AuthorizedSession", return_value=fake_sess):
-            res = mp.publish_eval_timeseries("example-project", ts, credentials=mock.MagicMock())
-        self.assertEqual(res, len(ts))
-        self.assertEqual(fake_sess.post.call_count, 1)
 
         sample_golden = [
             {

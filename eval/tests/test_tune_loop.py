@@ -25,7 +25,6 @@ from eval.tune_loop import (  # noqa: E402
     DEFAULT_RESULTS_DIR,
     MAX_RULE_CHARS,
     PROPOSED_R01_LAYER1_TEMPLATE,
-    STABLE_BASELINE_ITEMS,
     bootstrap_r00,
     create_round_snapshot,
     evaluate_loop_state,
@@ -37,6 +36,10 @@ from eval.tune_loop import (  # noqa: E402
     validate_layer2_rules,
     validate_single_layer_mutation,
 )
+
+
+# Test fixture only: the stable set the synthetic docs declare in their golden block.
+STABLE_BASELINE_ITEMS: tuple[str, ...] = ("R08", "R09", "R12", "R13", "R14", "R19")
 
 
 def _make_synthetic_score_doc(
@@ -77,6 +80,8 @@ def _make_synthetic_score_doc(
     return {
         "run_id": run_id,
         "judge_model": "gemini-2.5-pro",
+        "golden": {"golden_version": "golden_test@0000000000",
+                   "stable_baseline_items": list(STABLE_BASELINE_ITEMS)},
         "recall": {
             "all": {"rows": 19, "points": total_hits, "recall": round(total_hits / 19.0, 4)},
             "dev": {"rows": 6, "points": dev_hits, "recall": round(dev_hits / 6.0, 4)},

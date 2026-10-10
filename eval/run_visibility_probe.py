@@ -80,7 +80,7 @@ from eval.run_gcp_round import (  # noqa: E402
     DEFAULT_ROUNDS_DIR,
     ClipCheckpointStore,
     analyze_clip_with_retry,
-    load_frozen_folder_specs,
+    load_folder_specs,
     resolve_or_ingest_video_slice,
     upload_directory_to_gcs,
 )
@@ -719,7 +719,7 @@ async def run_probe_async(
     )
 
     # Map file_id -> (video_dict, candidate_job_ids) from frozen folder specs
-    folder_specs = load_frozen_folder_specs()
+    folder_specs = load_folder_specs(args.golden)
     video_lookup: dict[str, tuple[dict[str, Any], list[str]]] = {}
     for fspec in folder_specs:
         for vdict in fspec["videos"]:

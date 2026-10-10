@@ -9,10 +9,12 @@ Responsibilities:
    `Tab0_版本总控与回滚开关`.
 3. Resolves and probes the active model via `PromptManager.load_active_config` /
    `PromptManager.resolve_and_probe_model` — zero hardcoded model versions.
-4. Evaluates the 4 validation folders (16 CCTV clips) in `agentic` video mode using
+4. Evaluates every folder / clip of the golden set (eval/golden_set.py: the golden's manifest
+   ``folders``, else derived from the golden items) in `agentic` video mode using
    `AgenticAuditor.analyze_segment`, reusing pre-sliced audio-stripped MP4s in GCS when
    available and falling back to Drive download + FFmpeg slice if missing.
-5. Scores the resulting 4 folder JSONs against `eval/data/golden_v1.jsonl` via
+5. Scores the resulting folder JSONs against the golden set (``--golden`` / env ``EVAL_GOLDEN_URI``,
+   local path or gs://; Terraform ``eval_golden_uri`` -> Cloud Build ``_GOLDEN_URI``) via
    `eval/score_run.py` (Vertex AI GenAI Eval SDK `LLMMetric` judge), updates
    `eval/rounds/<round_id>/manifest.json` + `eval/rounds/ledger.{json,md}`, and syncs
    artifacts to `gs://<staging_bucket>/eval/rounds/<round_id>/<run_id>/`.
@@ -64,21 +66,22 @@ from cctv_audit.video_ingestor import (  # noqa: E402
     VideoMetadataItem,
     VideoSliceSegment,
 )
-from eval.monitoring_publisher import (  # noqa: E402
+from eval.eval_records import (  # noqa: E402
     DEFAULT_AGENT_EVAL_LOCATION,
-    DEFAULT_EXPERIMENT_LOCATION,
-    DEFAULT_ROUND_EXPERIMENT_NAME,
-    DEFAULT_RUNS_EXPERIMENT_NAME,
     append_eval_history_jsonl,
-    build_cloud_monitoring_timeseries,
     build_eval_monitoring_record,
-    build_round_monitoring_timeseries,
     publish_agent_platform_evaluation,
-    publish_eval_timeseries,
-    publish_vertex_experiment_records,
     write_round_averages_jsonl,
 )
+from eval.golden_set import (  # noqa: E402
+    GoldenSet,
+    GoldenSetError,
+    derive_folder_specs,
+    load_golden,
+    materialize_golden,
+)
 from eval.score_run import render_markdown, score_run  # noqa: E402
+from eval.sheet_report import publish_run_sheet_report_safely  # noqa: E402
 from eval.tune_loop import (  # noqa: E402
     DEFAULT_GOLDEN_PATH,
     DEFAULT_RESULTS_DIR,
@@ -93,52 +96,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger("eval.run_gcp_round")
 
-BASELINE_RUN_DIR = THIS_DIR / "data" / "runs" / "v6_0928_0811"
-FALLBACK_RUN_DIR = THIS_DIR / "data" / "runs" / "r_0928_1009"
+ENV_GOLDEN_URI = "EVAL_GOLDEN_URI"
 
 
-EXPECTED_VIDEO_COUNT = 16  # 4 folders of the golden set (6 + 3 + 5 + 2 clips)
+def default_golden_uri() -> str:
+    """Golden location for this environment (env EVAL_GOLDEN_URI), else the repo-local default."""
+    return os.environ.get(ENV_GOLDEN_URI, "").strip() or str(DEFAULT_GOLDEN_PATH)
 
 
-def load_frozen_folder_specs(
-    primary_run_dir: Path = BASELINE_RUN_DIR,
-    secondary_run_dir: Path = FALLBACK_RUN_DIR,
-) -> list[dict[str, Any]]:
-    """Loads the 4 folder specs and 16 video file metadata from the frozen baseline job JSONs."""
-    secondary_job_ids: dict[str, str] = {}
-    if secondary_run_dir.exists():
-        for p in sorted(secondary_run_dir.glob("job_*.json")):
-            doc = json.loads(p.read_text(encoding="utf-8"))
-            secondary_job_ids[str(doc["folder_id"])] = str(doc["job_id"])
+def folder_specs_from_golden(golden: GoldenSet) -> list[dict[str, Any]]:
+    """Runner folder specs (one job per folder) derived from the golden set -- no hard-coded clips."""
+    return [
+        {
+            "baseline_job_id": spec["group_id"],
+            "candidate_job_ids": list(spec["cache_job_ids"]),
+            "folder_id": spec["folder_id"],
+            "preflight": {"folder_id": spec["folder_id"], "label": spec["label"], "videos": spec["videos"]},
+            "videos": spec["videos"],
+        }
+        for spec in derive_folder_specs(golden)
+    ]
 
-    specs: list[dict[str, Any]] = []
-    for p in sorted(primary_run_dir.glob("job_*.json")):
-        doc = json.loads(p.read_text(encoding="utf-8"))
-        folder_id = str(doc["folder_id"])
-        primary_jid = str(doc["job_id"])
-        sec_jid = secondary_job_ids.get(folder_id)
-        candidate_jids = [primary_jid] + ([sec_jid] if sec_jid else [])
 
-        # Production job JSON (jobs.py AuditJob) stores the preflight under "preflight_report".
-        preflight = doc.get("preflight_report") or doc.get("preflight") or {}
-        videos = preflight.get("videos") or []
-        if not videos:
-            raise RuntimeError(f"Baseline job {primary_jid} ({p.name}) lists no preflight videos")
-        specs.append(
-            {
-                "baseline_job_id": primary_jid,
-                "candidate_job_ids": candidate_jids,
-                "folder_id": folder_id,
-                "preflight": preflight,
-                "videos": videos,
-            }
-        )
-    if len(specs) != 4:
-        raise RuntimeError(f"Expected 4 baseline folder specs in {primary_run_dir}, found {len(specs)}")
-    n_videos = sum(len(s["videos"]) for s in specs)
-    if n_videos != EXPECTED_VIDEO_COUNT:
-        raise RuntimeError(f"Expected {EXPECTED_VIDEO_COUNT} baseline videos, found {n_videos}")
-    return specs
+def load_folder_specs(golden_uri: str | Path | None = None) -> list[dict[str, Any]]:
+    return folder_specs_from_golden(load_golden(materialize_golden(str(golden_uri or default_golden_uri()))))
 
 
 def archive_sop_tab_to_master_sheet(
@@ -207,11 +188,11 @@ async def resolve_or_ingest_video_slice(
 
     file_id = str(video_dict["file_id"])
     filename = str(video_dict["filename"])
-    duration_sec = float(video_dict.get("duration_sec", 302.028))
-    width = int(video_dict.get("width", 2560))
-    height = int(video_dict.get("height", 1440))
+    # Clip metadata comes from the golden manifest; clips derived from golden items have none until
+    # the first ingest probes them (ffprobe) and stores eval/media/<file_id>/meta.json next to the slice.
+    meta: dict[str, Any] = {k: video_dict[k] for k in ("duration_sec", "width", "height") if k in video_dict}
 
-    def _check_gcs() -> str | None:
+    def _check_gcs() -> tuple[str | None, dict[str, Any]]:
         storage_client = storage.Client(project=cfg.gcp_project)
         bucket = storage_client.bucket(bucket_name)
         candidate_blob_paths = [
@@ -221,10 +202,21 @@ async def resolve_or_ingest_video_slice(
         for blob_path in candidate_blob_paths:
             blob = bucket.blob(blob_path)
             if blob.exists():
-                return f"gs://{bucket_name}/{blob_path}"
-        return None
+                stored: dict[str, Any] = {}
+                meta_blob = bucket.blob(f"eval/media/{file_id}/meta.json")
+                if len(meta) < 3 and meta_blob.exists():
+                    stored = json.loads(meta_blob.download_as_text())
+                return f"gs://{bucket_name}/{blob_path}", stored
+        return None, {}
 
-    cached_uri = await asyncio.to_thread(_check_gcs)
+    cached_uri, stored_meta = await asyncio.to_thread(_check_gcs)
+    meta = {**stored_meta, **meta}
+    if cached_uri and len(meta) < 3:
+        logger.warning("No duration/size metadata for cached clip %s (%s); slice offsets use 0..%ss",
+                       filename, file_id, UNKNOWN_DURATION_SEC)
+    duration_sec = float(meta.get("duration_sec") or UNKNOWN_DURATION_SEC)
+    width = int(meta.get("width") or 0)
+    height = int(meta.get("height") or 0)
     if cached_uri:
         logger.info("Reusing cached GCS slice for %s (%s): %s", filename, file_id, cached_uri)
         return VideoSliceSegment(
@@ -257,6 +249,11 @@ async def resolve_or_ingest_video_slice(
         work_dir = Path(tmp_dir)
         dest_src = work_dir / filename
         src_path = await ingestor.materialise_source(vmeta, dest_src)
+        if "duration_sec" not in meta:
+            probed = await ingestor.probe_local_video(src_path)
+            vmeta = vmeta.model_copy(update={"duration_sec": probed.duration_sec, "width": probed.width,
+                                             "height": probed.height, "size_bytes": probed.size_bytes})
+            width, height = probed.width, probed.height
         segments = await ingestor.slice_and_strip_audio(
             src_path,
             vmeta,
@@ -271,6 +268,9 @@ async def resolve_or_ingest_video_slice(
             bucket = storage_client.bucket(bucket_name)
             blob_path = f"eval/media/{file_id}/seg_0.mp4"
             bucket.blob(blob_path).upload_from_filename(str(seg.local_path), content_type="video/mp4")
+            bucket.blob(f"eval/media/{file_id}/meta.json").upload_from_string(json.dumps({
+                "duration_sec": vmeta.duration_sec, "width": vmeta.width, "height": vmeta.height,
+            }), content_type="application/json")
             return f"gs://{bucket_name}/{blob_path}"
 
         gcs_uri = await asyncio.to_thread(_upload_slice)
@@ -286,6 +286,8 @@ async def resolve_or_ingest_video_slice(
             height=height,
         )
 
+
+UNKNOWN_DURATION_SEC = 300.0  # only for a cached clip with no recorded metadata (logged)
 
 CLIP_MAX_ATTEMPTS = 3
 CLIP_RETRY_BASE_SEC = 30.0
@@ -535,7 +537,16 @@ async def run_round_async(args: argparse.Namespace) -> int:
         logger.warning("Drive ingestor init skipped (%s); relying on cached GCS slices.", exc)
         ingestor = None
 
-    folder_specs = load_frozen_folder_specs()
+    preloaded = getattr(args, "preloaded_golden", None)
+    if preloaded is not None:
+        golden_local, golden = preloaded
+    else:
+        golden_local = materialize_golden(str(args.golden), args.results_dir / f".golden_{run_id}")
+        golden = load_golden(golden_local)
+    folder_specs = folder_specs_from_golden(golden)
+    logger.info("Golden set %s: %d items / %d parts, %d folders / %d clips (%s)", golden.version,
+                golden.item_count, golden.part_count, len(folder_specs),
+                sum(len(s["videos"]) for s in folder_specs), args.golden)
     sem = asyncio.Semaphore(max(1, int(args.folder_concurrency)))
 
     ckpt = ClipCheckpointStore(
@@ -575,7 +586,7 @@ async def run_round_async(args: argparse.Namespace) -> int:
     score_doc = await asyncio.to_thread(
         score_run,
         run_dir=run_data_dir,
-        golden_path=args.golden,
+        golden_path=golden_local,
         project=cfg.gcp_project,
         run_label=run_id,
         judge_model=args.judge_model,
@@ -619,67 +630,29 @@ async def run_round_async(args: argparse.Namespace) -> int:
     )
     history_jsonl = args.rounds_dir / "eval_history.jsonl"
     append_eval_history_jsonl(mon_record, history_jsonl)
-    round_averages = write_round_averages_jsonl(
+    write_round_averages_jsonl(
         history_jsonl,
         args.rounds_dir / "eval_round_averages.jsonl",
     )
-    matching_round_avg = next(
-        (
-            r
-            for r in reversed(round_averages)
-            if r.get("round_id") == args.round
-            and r.get("model_version") == mon_record["model_version"]
-            and r.get("sop_version") == mon_record["sop_version"]
-        ),
-        None,
-    )
+    # Per-run Google Sheet report (single source of truth for the numbers: this run's score.json +
+    # eval_history.jsonl). Never fails the run: model/judge money is already spent and the results
+    # are on disk / GCS; a failure is logged at ERROR and printed next to the LOOP STATUS line.
+    sheet_report_line = "Sheet report: skipped (--skip-sheet-report)"
+    if not getattr(args, "skip_sheet_report", False):
+        golden_rows_for_sheet = golden.items
+        sheet_outcome = await asyncio.to_thread(
+            publish_run_sheet_report_safely,
+            history_path=history_jsonl,
+            score_doc=score_doc,
+            run_record=mon_record,
+            golden_items=golden_rows_for_sheet,
+            res_dir=res_dir,
+        )
+        sheet_report_line = sheet_outcome.status_line
 
-    if not getattr(args, "skip_monitoring_publish", False) and not args.skip_gcs_sync:
+    if not args.skip_gcs_sync:
         try:
-            ts_payload = build_cloud_monitoring_timeseries(mon_record)
-            if matching_round_avg is not None:
-                ts_payload.extend(build_round_monitoring_timeseries(matching_round_avg))
-            await asyncio.to_thread(
-                publish_eval_timeseries,
-                cfg.gcp_project,
-                ts_payload,
-            )
-        except Exception as exc:
-            logger.warning("Cloud Monitoring publish warning (non-fatal for eval run): %s", exc)
-        exp_location = os.environ.get("GCP_REGION") or DEFAULT_EXPERIMENT_LOCATION
-        try:
-            await asyncio.to_thread(
-                publish_vertex_experiment_records,
-                cfg.gcp_project,
-                [mon_record],
-                location=exp_location,
-                experiment_name=DEFAULT_RUNS_EXPERIMENT_NAME,
-                experiment_description="CHAGEE CCTV AI Audit Per-Run Detailed Evaluation Ledger",
-                is_round_average=False,
-            )
-        except Exception as exc:
-            logger.warning("Vertex AI Experiments per-run publish warning (non-fatal for eval run): %s", exc)
-        if matching_round_avg is not None:
-            try:
-                await asyncio.to_thread(
-                    publish_vertex_experiment_records,
-                    cfg.gcp_project,
-                    [matching_round_avg],
-                    location=exp_location,
-                    experiment_name=DEFAULT_ROUND_EXPERIMENT_NAME,
-                    experiment_description=(
-                        "CHAGEE CCTV AI Audit MLOps Evaluation (Model x SOP Version x Round Comparison)"
-                    ),
-                    is_round_average=True,
-                )
-            except Exception as exc:
-                logger.warning("Vertex AI Experiments round-avg publish warning (non-fatal for eval run): %s", exc)
-        try:
-            golden_rows = [
-                json.loads(line)
-                for line in args.golden.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
+            golden_rows = golden.items
             agent_eval_loc = os.environ.get("VERTEX_AGENT_EVAL_LOCATION") or DEFAULT_AGENT_EVAL_LOCATION
             await asyncio.to_thread(
                 publish_agent_platform_evaluation,
@@ -735,6 +708,7 @@ async def run_round_async(args: argparse.Namespace) -> int:
         f"Status: {loop_state['status']} | Best Round: {loop_state['best_round_id']} | "
         f"Action: {loop_state['recommended_action']}"
     )
+    print(sheet_report_line)
     return 0
 
 
@@ -744,17 +718,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--run-id", default=None, help="Optional explicit run ID (default: <round>_<MMDD_HHMM>)")
     parser.add_argument("--rounds-dir", type=Path, default=DEFAULT_ROUNDS_DIR)
     parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
-    parser.add_argument("--golden", type=Path, default=DEFAULT_GOLDEN_PATH)
+    parser.add_argument("--golden", default=default_golden_uri(),
+                        help="Golden JSONL, local path or gs:// (default: env EVAL_GOLDEN_URI, else the repo copy); "
+                             "its <stem>.manifest.json sidecar is read from the same place")
     parser.add_argument("--judge-model", default=None, help="Optional judge model override (default: newest Pro)")
     parser.add_argument("--folder-concurrency", type=int, default=2, help="Max concurrent folders (default: 2)")
     parser.add_argument("--sync-sop-tab", action="store_true", help="Archive Prompt_v2.6_rNN tab to Master SOP Sheet")
     parser.add_argument("--skip-gcs-sync", action="store_true", help="Skip uploading round results to GCS")
-    parser.add_argument("--skip-monitoring-publish", action="store_true",
-                        help="Skip publishing custom evaluation metrics to Cloud Monitoring API")
+    parser.add_argument("--skip-sheet-report", action="store_true",
+                        help="Do not create the per-run Google Sheet report (folder: env EVAL_RESULTS_FOLDER_ID)")
     parser.add_argument("--ckpt-local-dir", type=Path, default=None,
                         help="Keep per-clip checkpoints in this local dir instead of GCS (tests/local runs)")
     args = parser.parse_args(argv)
+    # Golden first: no model / judge / Drive call happens before the ruler is known to be loadable.
+    try:
+        golden_local = materialize_golden(str(args.golden), Path(tempfile.mkdtemp(prefix="golden_")))
+        args.preloaded_golden = (golden_local, load_golden(golden_local))
+    except (FileNotFoundError, GoldenSetError) as exc:
+        print(golden_setup_message(str(args.golden), exc), file=sys.stderr)
+        return 2
     return asyncio.run(run_round_async(args))
+
+
+def golden_setup_message(golden_uri: str, exc: BaseException) -> str:
+    """Operator-facing explanation when the golden set is missing or malformed (printed, no traceback)."""
+    return (
+        f"无法加载黄金集（标准答案）：{golden_uri}\n  原因：{exc}\n"
+        "  本仓库不附带客户的黄金集数据。请任选其一：\n"
+        "  - Terraform：在 <env>.tfvars 设置 eval_golden_uri = \"gs://<私有桶>/<路径>/<name>.jsonl\"，"
+        "apply 后 Cloud Build 传 _GOLDEN_URI=$(terraform output -raw eval_golden_uri)\n"
+        "  - 本地：python eval/run_gcp_round.py --golden <路径或 gs://...> ...\n"
+        "  黄金集与可选的 <name>.manifest.json 格式见 eval/data/README.md。本次未调用任何模型，没有产生费用。"
+    )
 
 
 if __name__ == "__main__":

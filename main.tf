@@ -56,7 +56,7 @@ variable "vertex_model_location" {
 }
 
 # ---- Name overrides. Empty = derived from name_prefix. Only for adopting names that existed before
-# ---- name_prefix did (see study-project-496907.tfvars); new stacks leave them empty.
+# ---- name_prefix did (see the first environment's <env>.tfvars); new stacks leave them empty.
 
 variable "artifact_repository_id" {
   description = "Image repository ID (created by bootstrap/; must equal its artifact_repository_id). Empty = <name_prefix>-images."
@@ -71,7 +71,7 @@ variable "staging_bucket_name" {
 }
 
 variable "scheduler_time_zone" {
-  description = "Time zone of the watchdog cron (runs every 2 minutes, so this only affects how the schedule is displayed)"
+  description = "IANA time zone of the watchdog cron (runs every 2 minutes, so this only affects how the schedule is displayed) and of the timestamp in eval report Sheet names (output eval_report_time_zone)"
   type        = string
   default     = "Etc/UTC"
 }
@@ -195,6 +195,45 @@ variable "workspace_impersonate_user" {
       !endswith(lower(var.workspace_impersonate_user), "@gmail.com")
     )
     error_message = "workspace_impersonate_user must be empty or a Google Workspace user email (not a service account or @gmail.com)."
+  }
+}
+
+variable "eval_results_folder_id" {
+  description = <<-EOT
+    Google Drive folder ID in which every prompt-tuning eval run (eval/cloudbuild_round.yaml ->
+    eval/run_gcp_round.py) creates its own timestamped Google Sheet report
+    ("<brand> AI稽核测评_<round>_<run>_<YYYYMMDD-HHMMSS>", see eval/sheet_report.py). The Workspace identity -- output
+    workspace_identity: workspace_impersonate_user, or the worker SA when that is empty (Shared Drives
+    only) -- needs Editor on this folder. Only the eval Cloud Build job reads it (via output
+    eval_results_folder_id); the Cloud Run worker and the ReasoningEngine do not. Empty = no report.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.eval_results_folder_id == "" || can(regex("^[A-Za-z0-9_-]{10,}$", var.eval_results_folder_id))
+    error_message = "eval_results_folder_id must be empty or a bare Google Drive folder ID ([A-Za-z0-9_-], >= 10 chars), not a URL."
+  }
+}
+
+variable "eval_golden_uri" {
+  description = <<-EOT
+    Golden set (labelled ground truth) the prompt-tuning eval scores against: a gs://<bucket>/<path>.jsonl
+    object, or a path inside the uploaded source tree (e.g. eval/data/<name>.jsonl). Its optional
+    <name>.manifest.json sidecar (folders/clips, stable baseline items, item overrides) is read from
+    the same place. Switching to a rebuilt golden set is a change of this value, never a code change;
+    every run records golden_version = <name>@<content hash>, and recall is only compared within one
+    version. Customer-private data: keep it out of public repos and out of the staging bucket (its
+    objects are deleted after 30 days). Read only by the eval Cloud Build job (output
+    eval_golden_uri -> _GOLDEN_URI); the worker SA needs read access when it is a gs:// URI.
+    Empty = the job's built-in default (eval/data/golden_v1.jsonl in the uploaded source tree).
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.eval_golden_uri == "" || can(regex("^(gs://[a-z0-9][a-z0-9._-]{1,220}/.+|[^:]+)\\.jsonl$", var.eval_golden_uri))
+    error_message = "eval_golden_uri must be empty, gs://<bucket>/<path>.jsonl, or a relative/absolute path ending in .jsonl."
   }
 }
 
@@ -609,727 +648,6 @@ resource "google_cloud_scheduler_job" "cctv_audit_watchdog" {
   ]
 }
 
-# 6. Cloud Monitoring Evaluation & Operations Dashboard (24-month metric retention in GCM)
-# Tracks Model Version x SOP Version recall (Overall / Holdout / Dev / Confirmed-Only 2-point PR),
-# SOP category & Outlet/Focus drill-downs, per-video recall & alert counts, point-action timestamp
-# drift (±20s window for 1.5 Handwashing vs ±60s window for continuous processes), alert density
-# guardrail (<= 8.0/clip), stability flip rate, token cost/latency per clip, and Cloud Run health.
-resource "google_monitoring_dashboard" "cctv_audit_dashboard" {
-  project = var.project_id
-  dashboard_json = jsonencode({
-    displayName = "${local.ge_brand} CCTV AI 稽核测评与运行监控大盘 [${var.name_prefix}]"
-    dashboardFilters = [
-      {
-        filterType = "METRIC_LABEL"
-        labelKey   = "model_version"
-      },
-      {
-        filterType = "METRIC_LABEL"
-        labelKey   = "sop_version"
-      },
-      {
-        filterType = "METRIC_LABEL"
-        labelKey   = "media_mode"
-      },
-      {
-        filterType = "METRIC_LABEL"
-        labelKey   = "round_id"
-      },
-      {
-        filterType = "METRIC_LABEL"
-        labelKey   = "sop_category"
-      },
-      {
-        filterType = "METRIC_LABEL"
-        labelKey   = "outlet_focus"
-      },
-      {
-        filterType = "METRIC_LABEL"
-        labelKey   = "video_name"
-      },
-    ]
-    mosaicLayout = {
-      columns = 12
-      tiles = [
-        # ---- Row 1 (yPos=0): 1x1 维度拆分 —— 固定模型看 SOP 演进连续曲线 (1.1) vs 固定模型看不同 SOP 柱状对比 (1.2)
-        {
-          xPos   = 0
-          yPos   = 0
-          width  = 6
-          height = 4
-          widget = {
-            title = "1.1 [1×1 连续趋势] 固定模型下随轮次演进的召回率连续曲线 (按轮次均值聚合，消除单点断线)"
-            xyChart = {
-              dataSets = [
-                {
-                  legendTemplate = "总体召回 Overall ($${metric.labels.model_version})"
-                  plotType       = "LINE"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/overall_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.model_version"]
-                      }
-                    }
-                  }
-                },
-                {
-                  legendTemplate = "留出集 Holdout ($${metric.labels.model_version})"
-                  plotType       = "LINE"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/holdout_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.model_version"]
-                      }
-                    }
-                  }
-                },
-                {
-                  legendTemplate = "开发集 Dev ($${metric.labels.model_version})"
-                  plotType       = "LINE"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/dev_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.model_version"]
-                      }
-                    }
-                  }
-                },
-              ]
-              thresholds = [
-                {
-                  label = "目标召回线 (0.75)"
-                  value = 0.75
-                },
-              ]
-              yAxis = {
-                label = "Recall (0.0 - 1.0)"
-                scale = "LINEAR"
-              }
-            }
-          }
-        },
-        {
-          xPos   = 6
-          yPos   = 0
-          width  = 6
-          height = 4
-          widget = {
-            title = "1.2 [1×1 跨 SOP 对比] 同一模型下不同 SOP 版本召回率柱状对比 (v2.5_r00 vs v2.6_r01 vs v2.6_r02)"
-            xyChart = {
-              dataSets = [
-                {
-                  legendTemplate = "SOP: $${metric.labels.sop_version} (轮次 $${metric.labels.round_id} 均值)"
-                  plotType       = "STACKED_BAR"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/overall_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.sop_version", "metric.label.round_id"]
-                      }
-                    }
-                  }
-                },
-              ]
-              thresholds = [
-                {
-                  label = "目标召回线 (0.75)"
-                  value = 0.75
-                },
-              ]
-              yAxis = {
-                label = "Overall Recall (0.0 - 1.0)"
-                scale = "LINEAR"
-              }
-            }
-          }
-        },
-        # ---- Row 2 (yPos=4): 1x1 跨模型对比 (2.1) & 置信度双工作点 PR 连续趋势 (2.2)
-        {
-          xPos   = 0
-          yPos   = 4
-          width  = 6
-          height = 4
-          widget = {
-            title = "2.1 [1×1 跨模型对比] 同一 SOP 版本下不同模型版本召回率对比 (可通过顶部 sop_version 筛选指定 SOP)"
-            xyChart = {
-              dataSets = [
-                {
-                  legendTemplate = "模型总体召回: $${metric.labels.model_version} ($${metric.labels.media_mode})"
-                  plotType       = "STACKED_BAR"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/overall_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.model_version", "metric.label.media_mode"]
-                      }
-                    }
-                  }
-                },
-                {
-                  legendTemplate = "模型留出集 Holdout: $${metric.labels.model_version} ($${metric.labels.media_mode})"
-                  plotType       = "LINE"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/holdout_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.model_version", "metric.label.media_mode"]
-                      }
-                    }
-                  }
-                },
-              ]
-              thresholds = [
-                {
-                  label = "目标召回线 (0.75)"
-                  value = 0.75
-                },
-              ]
-              yAxis = {
-                label = "Recall (0.0 - 1.0)"
-                scale = "LINEAR"
-              }
-            }
-          }
-        },
-        {
-          xPos   = 6
-          yPos   = 4
-          width  = 6
-          height = 4
-          widget = {
-            title = "2.2 [1×1 连续趋势] 置信度双工作点 PR 与有效告警命中率 (Hit Rate) 演进曲线"
-            xyChart = {
-              dataSets = [
-                {
-                  legendTemplate = "标准工作点 CONFIRMED+SUSPECTED ($${metric.labels.model_version})"
-                  plotType       = "LINE"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/overall_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.model_version"]
-                      }
-                    }
-                  }
-                },
-                {
-                  legendTemplate = "严格工作点 仅 CONFIRMED ($${metric.labels.model_version})"
-                  plotType       = "LINE"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/confirmed_only_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.model_version"]
-                      }
-                    }
-                  }
-                },
-                {
-                  legendTemplate = "有效告警命中率 Hit Rate ($${metric.labels.model_version})"
-                  plotType       = "LINE"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/hit_rate\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.model_version"]
-                      }
-                    }
-                  }
-                },
-              ]
-              yAxis = {
-                label = "Ratio (0.0 - 1.0)"
-                scale = "LINEAR"
-              }
-            }
-          }
-        },
-        # ---- Row 3 (yPos=8): 1x1 维度拆分 —— 按 SOP 大类连续趋势 (3.1) & 按门店机位连续趋势 (3.2)
-        {
-          xPos   = 0
-          yPos   = 8
-          width  = 6
-          height = 4
-          widget = {
-            title = "3.1 [1×1 连续趋势] 按 SOP 违规大类分组召回率演进曲线 (A_Handwashing / B_IceMaker / C_TeaBar_Hygiene)"
-            xyChart = {
-              dataSets = [
-                {
-                  legendTemplate = "SOP 大类: $${metric.labels.sop_category}"
-                  plotType       = "LINE"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/sop_category_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.sop_category"]
-                      }
-                    }
-                  }
-                },
-              ]
-              yAxis = {
-                label = "Category Recall (0.0 - 1.0)"
-                scale = "LINEAR"
-              }
-            }
-          }
-        },
-        {
-          xPos   = 6
-          yPos   = 8
-          width  = 6
-          height = 4
-          widget = {
-            title = "3.2 [1×1 连续趋势] 按门店与机位视角分组召回率演进曲线 (Bau Cat / Cantavil D2 × 洗手 / 制冰机)"
-            xyChart = {
-              dataSets = [
-                {
-                  legendTemplate = "门店×机位: $${metric.labels.outlet_focus}"
-                  plotType       = "LINE"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/outlet_focus_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.outlet_focus"]
-                      }
-                    }
-                  }
-                },
-              ]
-              yAxis = {
-                label = "Outlet×Focus Recall (0.0 - 1.0)"
-                scale = "LINEAR"
-              }
-            }
-          }
-        },
-        # ---- Row 4 (yPos=12): 质量守卫连续趋势 (4.1) & Token 成本/耗时/Cloud Run 实例监控 (4.2)
-        {
-          xPos   = 0
-          yPos   = 12
-          width  = 6
-          height = 4
-          widget = {
-            title = "4.1 [1×1 连续趋势] 告警密度守卫 (<=8.0条/视频)、瞬时动作时间定位误差 (秒, ±20s) 与跨 Run 翻转率"
-            xyChart = {
-              dataSets = [
-                {
-                  legendTemplate = "单视频平均告警数 Findings/Clip ($${metric.labels.model_version})"
-                  plotType       = "LINE"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/findings_per_clip\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.model_version"]
-                      }
-                    }
-                  }
-                },
-                {
-                  legendTemplate = "瞬时动作平均时间误差秒数 Point Drift ($${metric.labels.model_version})"
-                  plotType       = "LINE"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/mean_point_timestamp_drift_sec\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.model_version"]
-                      }
-                    }
-                  }
-                },
-                {
-                  legendTemplate = "跨 Run 翻转率 Flip Rate ($${metric.labels.model_version})"
-                  plotType       = "LINE"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/flip_rate\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.model_version"]
-                      }
-                    }
-                  }
-                },
-                {
-                  legendTemplate = "稳定项回退数 Regressed Stable Items ($${metric.labels.model_version})"
-                  plotType       = "STACKED_BAR"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/regressed_stable_items\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MAX"
-                        groupByFields      = ["metric.label.model_version"]
-                      }
-                    }
-                  }
-                },
-              ]
-              thresholds = [
-                {
-                  label = "单视频告警上限 (8.0)"
-                  value = 8.0
-                },
-                {
-                  label = "瞬时动作时间容差上限 (20s)"
-                  value = 20.0
-                },
-              ]
-              yAxis = {
-                label = "Count / Seconds / Ratio"
-                scale = "LINEAR"
-              }
-            }
-          }
-        },
-        {
-          xPos   = 6
-          yPos   = 12
-          width  = 6
-          height = 4
-          widget = {
-            title = "4.2 [1×1 连续趋势] 单段 5 分钟视频平均成本 (USD)、推理耗时 (秒) 与 Cloud Run 活跃实例数"
-            xyChart = {
-              dataSets = [
-                {
-                  legendTemplate = "单视频平均成本 USD ($${metric.labels.model_version})"
-                  plotType       = "LINE"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/cost_per_clip_usd\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.model_version"]
-                      }
-                    }
-                  }
-                },
-                {
-                  legendTemplate = "单视频平均耗时秒数 ($${metric.labels.model_version})"
-                  plotType       = "LINE"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/mean_clip_latency_sec\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.model_version"]
-                      }
-                    }
-                  }
-                },
-                {
-                  legendTemplate = "Cloud Run 活跃容器实例数 ($${metric.labels.state})"
-                  plotType       = "LINE"
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"run.googleapis.com/container/instance_count\" resource.type=\"cloud_run_revision\" resource.label.\"service_name\"=\"${local.worker_service_name}\""
-                      aggregation = {
-                        alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_SUM"
-                        groupByFields      = ["metric.label.state"]
-                      }
-                    }
-                  }
-                },
-              ]
-              yAxis = {
-                label = "USD / Seconds / Instances"
-                scale = "LINEAR"
-              }
-            }
-          }
-        },
-        # ---- Row 5 (yPos=16): 清单 A —— 轮次均值汇总清单 (Model × SOP × Round)
-        {
-          xPos   = 0
-          yPos   = 16
-          width  = 6
-          height = 5
-          widget = {
-            title = "5.1 清单 A（静态速览）：各轮次平均汇总表 (Model × SOP × Round，同轮次多次 Run 已取均值)"
-            text = {
-              format  = "MARKDOWN"
-              content = <<-EOT
-**说明**：当同一轮次（同一个 `Model + SOP` 组合）为测试稳定性跑了多次 `Run` 时（如 `r00` 跑了 2 次、`r02` 跑了 2 次），上方趋势图与本表自动按轮次取算术平均值，确保每一轮只有一个代表性数据点：
-
-| 轮次 (`round_id`) | 模型版本 (`model_version`) | SOP 版本 (`sop_version`) | 模式 (`media_mode`) | 包含 Run 数 | 总体召回率 (Overall) | 留出集召回 (Holdout) | 开发集召回 (Dev) | 洗手召回 (`A`) | 制冰机召回 (`B`) | 吧台卫生 (`C`) | 单视频告警数 | 瞬时时间误差 (±20s) | 跨 Run 翻转率 | 单视频成本 |
-| :--- | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`r00`** (基线) | `gemini-3.8-flash` | `v2.5_r00` | `static` | 2 (`v6_0928_0811`, `r_0928_1009`) | **42.11%** | **59.62%** | 4.17% | 42.50% | 39.29% | 50.00% | 6.72 条 | 2.88s | 21.05% | $0.138 |
-| **`r01`** (首轮调优) | `gemini-3.8-flash` | `Prompt_v2.6_r01` | `agentic` | 1 (`r01_run1`) | **35.53%** | **51.92%** | 0.00% | 35.00% | 32.14% | 50.00% | 6.75 条 | 0.33s | 0.00% (单次) | $0.144 |
-| **`r02`** (二轮调优) | `gemini-3.8-flash` | `Prompt_v2.6_r02` | `agentic` | 2 (`r02_run1`, `r02_run2`) | **42.76%** | **58.65%** | **8.33%** | 40.00% | 37.50% | **75.00%** | 7.13 条 | 3.75s | 31.58% | $0.358 |
-EOT
-            }
-          }
-        },
-        {
-          xPos   = 6
-          yPos   = 16
-          width  = 6
-          height = 5
-          widget = {
-            title = "5.2 清单 A（实时指标表）：各轮次 (Model × SOP × Round) 均值动态数据表 [自动随新轮次更新]"
-            timeSeriesTable = {
-              dataSets = [
-                {
-                  minAlignmentPeriod  = "3600s"
-                  tableDisplayOptions = {}
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/overall_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.round_id", "metric.label.model_version", "metric.label.sop_version", "metric.label.media_mode"]
-                      }
-                    }
-                  }
-                },
-                {
-                  minAlignmentPeriod  = "3600s"
-                  tableDisplayOptions = {}
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/holdout_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.round_id", "metric.label.model_version", "metric.label.sop_version", "metric.label.media_mode"]
-                      }
-                    }
-                  }
-                },
-                {
-                  minAlignmentPeriod  = "3600s"
-                  tableDisplayOptions = {}
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/dev_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.round_id", "metric.label.model_version", "metric.label.sop_version", "metric.label.media_mode"]
-                      }
-                    }
-                  }
-                },
-                {
-                  minAlignmentPeriod  = "3600s"
-                  tableDisplayOptions = {}
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/findings_per_clip\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.round_id", "metric.label.model_version", "metric.label.sop_version", "metric.label.media_mode"]
-                      }
-                    }
-                  }
-                },
-              ]
-            }
-          }
-        },
-        # ---- Row 6 (yPos=21): 清单 B —— 每次具体执行 (Per-Run) 完整历史明细清单
-        {
-          xPos   = 0
-          yPos   = 21
-          width  = 6
-          height = 5
-          widget = {
-            title = "6.1 清单 B（静态速览）：历史全部 5 次独立测试 (Per-Run) 明细清单 [含真实执行时间与单次波动]"
-            text = {
-              format  = "MARKDOWN"
-              content = <<-EOT
-**说明**：为什么 `r00` 和 `r02` 各跑了 2 遍？因为视频多模态推理存在采样随机性，同一套 `Model + SOP` 跑 2 遍是为了测量**跨次翻转率 (`Flip Rate`)**。下方完整保留全部 5 次独立运行的原始明细：
-
-| 运行 ID (`run_id`) | 所属轮次 | 真实测试时间 (UTC) | 模型版本 | SOP 版本 | 模式 | 总体召回率 | 留出集 (Holdout) | 开发集 (Dev) | 单视频告警数 | 有效命中率 (Hit Rate) | 瞬时时间误差 (±20s) | 稳定项回退 | 单视频成本 | 平均耗时 |
-| :--- | :---: | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`v6_0928_0811`** | `r00` | `2026-09-28 18:12` | `gemini-3.8-flash` | `v2.5_r00` | `static` | **42.11%** | **61.54%** | 0.00% | 6.38 条 | 8.82% | 2.25s (max 6s) | 0 ✅ | $0.127 | 356.7s |
-| **`r_0928_1009`** | `r00` | `2026-09-28 18:15` | `gemini-3.8-flash` | `v2.5_r00` | `static` | **42.11%** | **57.69%** | 8.33% | 7.06 条 | 7.96% | 3.50s (max 11s) | 0 ✅ | $0.148 | 361.7s |
-| **`r01_run1`** | `r01` | `2026-09-29 08:06` | `gemini-3.8-flash` | `Prompt_v2.6_r01` | `agentic` | **35.53%** | **51.92%** | 0.00% | 6.75 条 | 8.33% | 0.33s (max 1s) | 1 ⚠️ | $0.144 | 426.7s |
-| **`r02_run1`** | `r02` | `2026-09-29 09:50` | `gemini-3.8-flash` | `Prompt_v2.6_r02` | `agentic` | **43.42%** | **55.77%** | **16.67%** | 7.63 条 | 9.02% | 7.00s (max 20s) | 1 ⚠️ | $0.346 | 318.8s |
-| **`r02_run2`** | `r02` | `2026-09-29 09:14` | `gemini-3.8-flash` | `Prompt_v2.6_r02` | `agentic` | **42.11%** | **61.54%** | 0.00% | 6.63 条 | 8.49% | 0.50s (max 1s) | 0 ✅ | $0.370 | 414.5s |
-EOT
-            }
-          }
-        },
-        {
-          xPos   = 6
-          yPos   = 21
-          width  = 6
-          height = 5
-          widget = {
-            title = "6.2 清单 B（实时指标表）：每次独立运行 (run_id × round_id × model × SOP) 原始指标表"
-            timeSeriesTable = {
-              dataSets = [
-                {
-                  minAlignmentPeriod  = "3600s"
-                  tableDisplayOptions = {}
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/overall_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.round_id", "metric.label.run_id", "metric.label.model_version", "metric.label.sop_version", "metric.label.media_mode"]
-                      }
-                    }
-                  }
-                },
-                {
-                  minAlignmentPeriod  = "3600s"
-                  tableDisplayOptions = {}
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/holdout_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.round_id", "metric.label.run_id", "metric.label.model_version", "metric.label.sop_version", "metric.label.media_mode"]
-                      }
-                    }
-                  }
-                },
-                {
-                  minAlignmentPeriod  = "3600s"
-                  tableDisplayOptions = {}
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval/findings_per_clip\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.round_id", "metric.label.run_id", "metric.label.model_version", "metric.label.sop_version", "metric.label.media_mode"]
-                      }
-                    }
-                  }
-                },
-              ]
-            }
-          }
-        },
-        # ---- Row 7 (yPos=26): 清单 C —— 单段视频 (16 支测试视频) 细粒度表现明细表
-        {
-          xPos   = 0
-          yPos   = 26
-          width  = 6
-          height = 5
-          widget = {
-            title = "7.1 清单 C（左表）：单段视频 (video_name) 各轮次平均召回率明细表 [定位具体哪支视频漏检/提升]"
-            timeSeriesTable = {
-              dataSets = [
-                {
-                  minAlignmentPeriod  = "3600s"
-                  tableDisplayOptions = {}
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/video_recall\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.video_name", "metric.label.round_id", "metric.label.sop_version", "metric.label.model_version"]
-                      }
-                    }
-                  }
-                },
-              ]
-            }
-          }
-        },
-        {
-          xPos   = 6
-          yPos   = 26
-          width  = 6
-          height = 5
-          widget = {
-            title = "7.2 清单 C（右表）：单段视频 (video_name) 各轮次平均告警条数明细表 [定位哪支视频误报偏高]"
-            timeSeriesTable = {
-              dataSets = [
-                {
-                  minAlignmentPeriod  = "3600s"
-                  tableDisplayOptions = {}
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/cctv_audit/eval_round/video_findings_count\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "3600s"
-                        perSeriesAligner   = "ALIGN_MAX"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                        groupByFields      = ["metric.label.video_name", "metric.label.round_id", "metric.label.sop_version", "metric.label.model_version"]
-                      }
-                    }
-                  }
-                },
-              ]
-            }
-          }
-        },
-      ]
-    }
-  })
-
-  depends_on = [google_project_service.required]
-}
-
 output "staging_bucket_name" {
   description = "Regional GCS bucket for ephemeral video slices and Zero-DB cross-instance job state"
   value       = google_storage_bucket.staging_bucket.name
@@ -1380,7 +698,26 @@ output "gemini_enterprise_console_url" {
   value       = "https://console.cloud.google.com/gen-app-builder/engines?project=${var.project_id}"
 }
 
-output "monitoring_dashboard_console_url" {
-  description = "GCP Console URL to open the CCTV AI Audit Evaluation & Operations Dashboard in Cloud Monitoring"
-  value       = "https://console.cloud.google.com/monitoring/dashboards?project=${var.project_id}"
+# Consumed by the eval Cloud Build job (eval/cloudbuild_round.yaml), not by the runtime:
+#   --substitutions=...,_EVAL_RESULTS_FOLDER_ID=$(terraform output -raw eval_results_folder_id),\
+#     _EVAL_REPORT_TIME_ZONE=$(terraform output -raw eval_report_time_zone),\
+#     _GOLDEN_URI=$(terraform output -raw eval_golden_uri)
+output "eval_results_folder_id" {
+  description = "Drive folder in which every eval run creates its own timestamped Google Sheet report (empty = report skipped)"
+  value       = var.eval_results_folder_id
+}
+
+output "eval_golden_uri" {
+  description = "Golden set the eval Cloud Build job scores against (_GOLDEN_URI); empty = the job's built-in default"
+  value       = var.eval_golden_uri
+
+  precondition {
+    condition     = !startswith(var.eval_golden_uri, "gs://${local.staging_bucket_name}/")
+    error_message = "eval_golden_uri must not point into the staging bucket: its lifecycle rule deletes objects after 30 days."
+  }
+}
+
+output "eval_report_time_zone" {
+  description = "IANA time zone of the timestamp in eval report Sheet names (= scheduler_time_zone)"
+  value       = var.scheduler_time_zone
 }

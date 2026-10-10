@@ -12,14 +12,22 @@
 #     --gcs-log-dir=gs://$BUCKET/eval/cloudbuild-logs \
 #     --gcs-source-staging-dir=gs://$BUCKET/eval/source \
 #     --substitutions=_ROUND_ID=r01,_RUN_ID=r01_run1,_IMAGE=$IMG,_REGION=$R,_WORKER_SA=$WORKER_SA,\
-#   _STAGING_BUCKET=$BUCKET,_MASTER_PROMPT_SHEET_ID=<sheet id>,_WORKSPACE_IMPERSONATE_USER=<bot user> .
+#   _STAGING_BUCKET=$BUCKET,_MASTER_PROMPT_SHEET_ID=<sheet id>,_WORKSPACE_IMPERSONATE_USER=<bot user>,\
+#   _EVAL_RESULTS_FOLDER_ID=$(terraform output -raw eval_results_folder_id),\
+#   _EVAL_REPORT_TIME_ZONE=$(terraform output -raw eval_report_time_zone),\
+#   _GOLDEN_URI=$(terraform output -raw eval_golden_uri) .
+# _GOLDEN_URI selects the golden set (gs://... or a path in the uploaded source tree; '' = the runner's
+# default). A rebuilt golden set is a new value here, not a code change.
+# Each run creates one timestamped Google Sheet report in _EVAL_RESULTS_FOLDER_ID (Terraform variable
+# eval_results_folder_id; the Workspace identity needs Editor on it). Empty = report skipped (printed).
 # _IMAGE must be the digest the live Cloud Run worker runs (runtime deps + ffmpeg); the round code
 # itself comes from the uploaded source tree (/workspace).
 # --service-account / --gcs-log-dir are flags, not `serviceAccount:` / `logsBucket:` fields, so this
 # file stays stack-neutral. The step refuses to run unless it really runs as _WORKER_SA (the logs go
 # to the staging bucket because the worker SA has no roles/logging.logWriter).
 
-# 16 agentic clips (largest folder = 6 sequential clips with carryover) + 3-pass judge; 1 h was too tight.
+# golden_v1: 16 agentic clips (largest folder = 6 sequential clips with carryover) + 3-pass judge; 1 h was too tight.
+# A larger golden set may need a longer timeout.
 timeout: '7200s'
 
 substitutions:
@@ -33,6 +41,9 @@ substitutions:
   _STAGING_BUCKET: ''             # main.tf output staging_bucket_name
   _MASTER_PROMPT_SHEET_ID: ''     # <env>.tfvars master_prompt_sheet_id
   _WORKSPACE_IMPERSONATE_USER: '' # <env>.tfvars workspace_impersonate_user ('' = the SA itself)
+  _EVAL_RESULTS_FOLDER_ID: ''     # main.tf output eval_results_folder_id ('' = no Sheet report)
+  _EVAL_REPORT_TIME_ZONE: 'Asia/Singapore' # main.tf output eval_report_time_zone
+  _GOLDEN_URI: ''                 # main.tf output eval_golden_uri ('' = eval/data/golden_v1.jsonl)
 
 options:
   machineType: 'E2_HIGHCPU_8'
@@ -59,6 +70,11 @@ steps:
       - 'SOP_SHEET_ID=${_MASTER_PROMPT_SHEET_ID}'
       - 'WORKSPACE_IMPERSONATE_USER=${_WORKSPACE_IMPERSONATE_USER}'
       - 'WORKSPACE_DWD_SERVICE_ACCOUNT=${_WORKER_SA}'
+      # Read by eval/sheet_report.py (per-run Google Sheet report), not by cctv_audit/config.py.
+      - 'EVAL_RESULTS_FOLDER_ID=${_EVAL_RESULTS_FOLDER_ID}'
+      - 'EVAL_REPORT_TIME_ZONE=${_EVAL_REPORT_TIME_ZONE}'
+      # Read by eval/run_gcp_round.py (--golden default); gs:// is downloaded at start.
+      - 'EVAL_GOLDEN_URI=${_GOLDEN_URI}'
       - 'PYTHONPATH=/workspace'
     args:
       - '-ce'

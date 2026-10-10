@@ -48,8 +48,18 @@ POINT_ACTION_KEYWORDS: tuple[str, ...] = (
 
 
 def classify_temporal_mode(item: dict[str, Any], part: dict[str, Any] | None = None) -> str:
+    """Temporal mode of a golden part; see ``temporal_mode_and_source``."""
+    return temporal_mode_and_source(item, part)[0]
+
+
+def temporal_mode_and_source(item: dict[str, Any], part: dict[str, Any] | None = None) -> tuple[str, str]:
     """Classify a golden item/part as ``POINT`` (±20s, timestamp drift enabled) or
     ``WINDOW`` (±60s + span containment, exempt from single-point timestamp drift).
+
+    Returns ``(mode, source)``. ``source == "explicit"`` when the golden part / item (or the golden
+    manifest's ``item_overrides``) sets ``temporal_mode``; that always wins. Otherwise
+    ``source == "heuristic"``: the documented fallback below (clause / keyword based, tuned on the
+    customer's first label sheet). New golden sets should set ``temporal_mode`` explicitly.
 
     - ``POINT``: instant single-step actions at the handwashing sink (e.g. Clause 1.5
       soaping <20s, applying soap before wetting hands, not rinsing before gel, not
@@ -61,17 +71,17 @@ def classify_temporal_mode(item: dict[str, Any], part: dict[str, Any] | None = N
     """
     explicit = str((part or {}).get("temporal_mode") or item.get("temporal_mode") or "").strip().upper()
     if explicit in ("POINT", "WINDOW"):
-        return explicit
+        return explicit, "explicit"
     osd_list = (part or {}).get("osd_times") if part is not None else item.get("osd_times")
     if not osd_list:
-        return "WINDOW"
+        return "WINDOW", "heuristic"
     clause = str(item.get("audit_clause") or "").strip().lower()
     desc = str((part or {}).get("description") or item.get("finding_verbatim") or "").strip().lower()
     if "1.5 handwashing" in clause:
-        return "POINT"
+        return "POINT", "heuristic"
     if any(kw in desc for kw in POINT_ACTION_KEYWORDS):
-        return "POINT"
-    return "WINDOW"
+        return "POINT", "heuristic"
+    return "WINDOW", "heuristic"
 
 
 def part_window_sec(mode: str) -> int:
@@ -79,18 +89,30 @@ def part_window_sec(mode: str) -> int:
     return POINT_WINDOW_SEC if str(mode).upper() == "POINT" else WINDOW_SEC
 
 
-def classify_sop_category(item: dict[str, Any]) -> str:
-    """Map a golden item to one of the 3 canonical SOP categories for dashboard drill-down."""
+UNCATEGORIZED = "未分类"
+
+
+def sop_category_and_source(item: dict[str, Any]) -> tuple[str, str]:
+    """SOP category of a golden item for drill-down, with its source.
+
+    ``explicit``: the golden item (or the manifest's ``item_overrides``) sets ``sop_category``.
+    ``audit_clause``: fallback, the item's own audit clause text, so a new clause becomes its own
+    category instead of being forced into a fixed bucket. ``focus`` / ``none``: further fallbacks.
+    """
     explicit = str(item.get("sop_category") or "").strip()
     if explicit:
-        return explicit
-    clause = str(item.get("audit_clause") or "").strip().lower()
-    focus = str(item.get("focus") or "").strip().lower()
-    if "ice maker" in clause or "equipment cleaning" in clause or "ice maker" in focus:
-        return "B_IceMaker"
-    if "tea maker" in clause or "personal belonging" in clause or "6.2" in clause or "1.4" in clause:
-        return "C_TeaBar_Hygiene"
-    return "A_Handwashing"
+        return explicit, "explicit"
+    clause = str(item.get("audit_clause") or "").strip()
+    if clause:
+        return clause, "audit_clause"
+    focus = str(item.get("focus") or "").strip()
+    if focus:
+        return focus, "focus"
+    return UNCATEGORIZED, "none"
+
+
+def classify_sop_category(item: dict[str, Any]) -> str:
+    return sop_category_and_source(item)[0]
 
 
 JUDGE_TEMPLATE = """你是连锁茶饮门店 CCTV 稽核的阅卷老师。任务：判断 AI 稽核输出里，有没有抓到下面这 1 条人工标注的违规。
@@ -404,9 +426,11 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
     for it in items:
         per_part: dict[str, list[Finding]] = {}
         part_modes: dict[str, str] = {}
+        part_mode_src: dict[str, str] = {}
         for p in it["parts"]:
-            mode = classify_temporal_mode(it, p)
+            mode, mode_src = temporal_mode_and_source(it, p)
             part_modes[p["part_id"]] = mode
+            part_mode_src[p["part_id"]] = mode_src
             part_spec_by_id[p["part_id"]] = p
             per_part[p["part_id"]] = prefilter(
                 p, it["video_filenames"], findings, window_sec=part_window_sec(mode)
@@ -421,6 +445,7 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
                 "item_id": it["item_id"],
                 "part_id": p["part_id"],
                 "temporal_mode": mode,
+                "temporal_mode_source": part_mode_src[p["part_id"]],
                 "window_sec": w_sec,
                 "candidate_ids": ids,
                 "near_misses": near_misses(p, it["video_filenames"], findings, set(ids)),
@@ -479,12 +504,13 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
             confirmed_part_scores.append(r["score"] if has_confirmed else 0.0)
         confirmed_row_score = sum(confirmed_part_scores) / len(parts) if parts else 0.0
         confirmed_only_total_pts += confirmed_row_score
-        sop_cat = classify_sop_category(it)
+        sop_cat, sop_cat_src = sop_category_and_source(it)
         results.append({
-            "item_id": it["item_id"], "sheet_row": it["sheet_row"], "split": it["split"],
+            "item_id": it["item_id"], "sheet_row": it.get("sheet_row"), "split": it["split"],
             "focus": it["focus"], "outlet_name": it["outlet_name"],
             "audit_clause": it.get("audit_clause", ""),
             "sop_category": sop_cat,
+            "sop_category_source": sop_cat_src,
             "finding_verbatim": it["finding_verbatim"],
             "video_filenames": it["video_filenames"],
             "score": row_score,
@@ -502,9 +528,9 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
     for f in findings:
         per_clip[f.filename] = per_clip.get(f.filename, 0) + 1
 
-    # Drill-down 1: Recall by SOP Category (A_Handwashing, B_IceMaker, C_TeaBar_Hygiene)
+    # Drill-down 1: Recall by SOP category -- every category present in the golden set
     sop_category_recall: dict[str, dict[str, Any]] = {}
-    for cat in ("A_Handwashing", "B_IceMaker", "C_TeaBar_Hygiene"):
+    for cat in sorted({r["sop_category"] for r in results}):
         cat_rows = [r for r in results if r["sop_category"] == cat]
         if cat_rows:
             pts = sum(r["score"] for r in cat_rows)
@@ -620,7 +646,8 @@ def render_markdown(run_label: str, rep: dict[str, Any]) -> str:
     lines = [
         f"# 尺子打分：{run_label}",
         "",
-        f"- 加权召回（全部 19 行）：**{r['all']['points']:.1f} / {r['all']['rows']} = {r['all']['recall']:.1%}**",
+        f"- 黄金集：{(rep.get('golden') or {}).get('golden_version', '未记录')}（{r['all']['rows']} 题）",
+        f"- 加权召回（全部 {r['all']['rows']} 行）：**{r['all']['points']:.1f} / {r['all']['rows']} = {r['all']['recall']:.1%}**",
         f"- 开卷 dev：{r['dev']['points']:.1f} / {r['dev']['rows']} = {r['dev']['recall']:.1%}",
         f"- 检查 holdout：{r['holdout']['points']:.1f} / {r['holdout']['rows']} = {r['holdout']['recall']:.1%}",
         f"- 仅 CONFIRMED 召回率：{qm.get('confirmed_only_points', 0.0):.1f} / {r['all']['rows']} = {qm.get('confirmed_only_recall', 0.0):.1%}",
@@ -645,7 +672,7 @@ def render_markdown(run_label: str, rep: dict[str, Any]) -> str:
         near = "<br>".join(n for p in it["parts"] for n in p.get("near_misses", [])) or "—"
         label = it["finding_verbatim"].replace("|", "/")
         lines.append(
-            f"| {it['sheet_row']} | {grp} | {modes} | {label} | {mark.get(it['score'], it['score'])} | "
+            f"| {it.get('sheet_row') or it['item_id']} | {grp} | {modes} | {label} | {mark.get(it['score'], it['score'])} | "
             f"{reasons.replace('|', '/')} | {hits.replace('|', '/')} | {near.replace('|', '/')} |"
         )
     return "\n".join(lines) + "\n"
@@ -673,8 +700,10 @@ def score_run(*, run_dir: str | os.PathLike[str], golden_path: str | os.PathLike
     if not job_paths:
         raise FileNotFoundError(f"no job_*.json in {run_dir}")
     jobs = [load_json(str(p)) for p in job_paths]
-    with open(golden_path, encoding="utf-8") as fh:
-        items = [json.loads(line) for line in fh if line.strip()]
+    from eval.golden_set import load_golden
+
+    golden = load_golden(str(golden_path))
+    items = golden.items
     findings = flatten_findings(jobs)
 
     sdk_result: list[Any] = []
@@ -690,6 +719,7 @@ def score_run(*, run_dir: str | os.PathLike[str], golden_path: str | os.PathLike
             return vote(passes)
 
     rep = score(items, findings, judge_fn)
+    rep["golden"] = golden.summary()
     rep.update(
         judge_passes=judge_passes, run_label=run_label, judge_model=judge_model or "injected",
         job_ids=[j.get("job_id") for j in jobs],
