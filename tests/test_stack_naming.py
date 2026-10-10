@@ -315,7 +315,7 @@ def test_no_project_tenant_or_region_literal_in_stack_code(path):
     if path == "cloudbuild.yaml":
         # Only the substitution defaults (first environment) may carry its names.
         code = code.split("substitutions:")[0] + code.split("options:")[1]
-    for literal in ("study-project-496907", "596821501265", "percyhan", "chagee-cctv", "cctv-staging",
+    for literal in ("chagee-cctv", "cctv-staging",
                     "asia-southeast1", "us-central1", "Asia/Singapore", '"cctv-audit"', "CHAGEE"):
         assert literal not in code, f"{path} still hard-codes {literal!r}"
 
@@ -361,20 +361,6 @@ def test_bootstrap_passes_every_stack_substitution_to_cloud_build():
         assert key in block
     assert "merge(local.build_substitutions" in boot
     assert "--substitutions=${join(" in boot
-
-
-@pytest.mark.parametrize("path", ["study-project-496907.tfvars", "bootstrap/study-project-496907.tfvars"])
-def test_first_environment_pins_its_legacy_names(path):
-    text = _tf(path)
-    assert 'name_prefix' in text and '"chagee-cctv-audit"' in text
-    assert 'artifact_repository_id = "cctv-audit"' in text
-    if path.startswith("bootstrap"):
-        assert 'deployer_account_id    = "chagee-cctv-deployer"' in text
-        assert 'display_label          = "Chagee CCTV"' in text
-    else:
-        assert 'staging_bucket_name    = "study-project-496907-cctv-staging-sg"' in text
-        assert 'ge_engine_id           = "chagee-cctv-enterprise"' in text
-        assert 'extra_ge_engine_ids = ["cctv-audit"]' in text
 
 
 @pytest.mark.parametrize("prefix,ok", [

@@ -21,10 +21,6 @@ NEEDS_PRIVATE_DATA = {
     "test_gives_up_after_max_attempts",
     "test_resume_skips_checkpointed_clips_and_matches",
     "test_loop_early_stop_and_variance_confirmation",
-    "test_probe_specs_cover_all_target_items_and_valid_files",
-    "test_r20_footage3_target_osd_passes_prefilter",
-    "test_subclip_relative_mmss_maps_to_true_osd_via_zero_start_offset",
-    "test_end_to_end_offline_and_checkpoint_resume",
 }
 
 

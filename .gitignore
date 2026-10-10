@@ -24,3 +24,4 @@ eval/rounds/ledger.json
 eval/rounds/ledger.md
 eval/rounds/active_candidate.json
 eval/rounds/eval_history.jsonl
+eval/rounds/eval_round_averages.jsonl

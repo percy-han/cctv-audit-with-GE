@@ -258,7 +258,7 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
   - `eval/eval_records.py`：每次运行的结构化记录（召回率、命中率、告警密度、时间漂移、翻转率、成本、耗时、Token）、历史台账与按轮次（同 round + 模型 + SOP + 视频模式）取均值；以及 Agent Platform Evaluation 逐题明细发布。
   - `eval/sheet_report.py`：每次评测新建一份 Google Sheet 报告；也可为已有的运行补生成：`python -m eval.sheet_report --history eval/rounds/eval_history.jsonl --score eval/results/<run_id>/score.json --folder-id <文件夹ID>`（加 `--dry-run` 只打印内容、不调用 API）。
   - `eval/tune_loop.py`：自动调优循环的控制器和守则（单层修改、防过拟合词表、早停守卫：`findings_per_clip <= 8.0` 且 `regressed_stable_items == 0`）。
-  - `eval/run_visibility_probe.py`：针对单条漏检，裁出前后 60–75 秒的短片，检查模型能否"看见"该动作。
+  - 可见性探针（针对单条漏检裁出前后 60–75 秒短片、检查模型能否"看见"该动作）是项目内部针对第一批黄金集的诊断工具，含客户视频 ID，不随本仓库分发。
 
 - **Google Sheet 测评报告（每次评测一份新表）**：
   - 存放位置由 Terraform 变量 **`eval_results_folder_id`**（`<env>.tfvars`）指定，每个环境各填各的 Drive 文件夹；Workspace 身份（`terraform output -raw workspace_identity`）需要对该文件夹有「编辑者」权限。变量为空时评测照常完成，只打印「Sheet report: SKIPPED」。
