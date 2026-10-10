@@ -42,9 +42,21 @@ class FakeGcs(gg.GcsStorageGateway):
         self.forbidden = set(forbidden)
         self.ffprobe_calls: List[str] = []
         self.calls: List[Tuple[str, str]] = []
+        self.history: Dict[Tuple[str, str, str], bytes] = {}  # (bucket, name, generation) -> data
+        self.versioning: Dict[str, bool] = {}
+        self.bucket_patch_status = 200
+        self._next_gen = 1728547200000000
 
-    def put(self, bucket: str, name: str, data: bytes = b"v", ctype: str = "video/mp4") -> None:
-        self.objects[(bucket, name)] = {"data": data, "contentType": ctype, "metadata": {}}
+    def _new_gen(self, bucket: str, name: str, data: bytes) -> str:
+        self._next_gen += 1
+        gen = str(self._next_gen)
+        self.history[(bucket, name, gen)] = data
+        return gen
+
+    def put(self, bucket: str, name: str, data: bytes = b"v", ctype: str = "video/mp4") -> str:
+        gen = self._new_gen(bucket, name, data)
+        self.objects[(bucket, name)] = {"data": data, "contentType": ctype, "metadata": {}, "generation": gen}
+        return gen
 
     def _get_access_token(self) -> str:
         return "fake-token"
@@ -71,6 +83,12 @@ class FakeGcs(gg.GcsStorageGateway):
         self.calls.append((method, url))
         parsed = urllib.parse.urlparse(url)
         qs = urllib.parse.parse_qs(parsed.query)
+        bucket_only = re.fullmatch(r".*/storage/v1/b/([^/]+)", parsed.path)
+        if bucket_only:  # bucket-level PATCH (Object Versioning)
+            if self.bucket_patch_status >= 400:
+                return self.bucket_patch_status, b'{"error": "storage.buckets.update denied"}'
+            self.versioning[urllib.parse.unquote(bucket_only.group(1))] = json.loads(body)["versioning"]["enabled"]
+            return 200, b'{"versioning": {"enabled": true}}'
         bucket = urllib.parse.unquote(re.search(r"/b/([^/]+)/o", parsed.path).group(1))
         if bucket in self.forbidden:
             return 403, b'{"error": "forbidden"}'
@@ -78,16 +96,25 @@ class FakeGcs(gg.GcsStorageGateway):
             data = body.read() if hasattr(body, "read") else (body or b"")
             name = qs["name"][0]
             prev = self.objects.get((bucket, name), {})
+            gen = self._new_gen(bucket, name, data)
             self.objects[(bucket, name)] = {
                 "data": data,
                 "contentType": content_type,
                 "metadata": prev.get("metadata", {}),
+                "generation": gen,
             }
-            return 200, json.dumps({"name": name}).encode()
+            return 200, json.dumps({"name": name, "generation": gen}).encode()
         m = re.search(r"/o/(.+)$", parsed.path)
         if m:
             name = urllib.parse.unquote(m.group(1))
             obj = self.objects.get((bucket, name))
+            if "generation" in qs:  # pinned version read (Object Versioning)
+                data = self.history.get((bucket, name, qs["generation"][0]))
+                if data is None:
+                    return 404, b"{}"
+                if qs.get("alt") == ["media"]:
+                    return 200, data
+                return 200, json.dumps({"name": name, "size": str(len(data)), "generation": qs["generation"][0]}).encode()
             if obj is None:
                 return 404, b"{}"
             if method == "DELETE":
@@ -98,7 +125,9 @@ class FakeGcs(gg.GcsStorageGateway):
                 return 200, b"{}"
             if qs.get("alt") == ["media"]:
                 return 200, obj["data"]
-            return 200, json.dumps({"name": name, "size": str(len(obj["data"]))}).encode()
+            return 200, json.dumps(
+                {"name": name, "size": str(len(obj["data"])), "generation": obj.get("generation", "")}
+            ).encode()
         # list
         prefix = qs.get("prefix", [""])[0]
         delim = qs.get("delimiter", [""])[0]
@@ -234,10 +263,18 @@ def test_internal_state_prefixes_blocked(target):
     assert gw.calls == []  # rejected before any GCS request
 
 
-def test_non_internal_prefixes_allowed():
+def test_whole_staging_bucket_blocked_customer_buckets_allowed():
+    """The staging bucket has a 30-day auto-delete lifecycle rule: no customer data may live there."""
     gw = FakeGcs()
-    assert asyncio.run(gw.probe_write_access(f"gs://{STAGING}/stores/A")) == f"gs://{STAGING}/stores/A"
-    assert asyncio.run(gw.probe_write_access(f"gs://{STAGING}/jobs_archive")) == f"gs://{STAGING}/jobs_archive"
+    for target in (f"gs://{STAGING}/stores/A", f"gs://{STAGING}/jobs_archive", f"gs://{STAGING}/sop"):
+        with pytest.raises(WorkspaceAccessError, match="30 天后自动删除"):
+            asyncio.run(gw.probe_write_access(target))
+        with pytest.raises(WorkspaceAccessError, match="内部暂存"):
+            asyncio.run(gw.list_folder_videos(target))
+    assert gw.calls == []
+    assert asyncio.run(gw.probe_write_access("gs://customer-cctv-bucket/stores/store_01")) == (
+        "gs://customer-cctv-bucket/stores/store_01"
+    )
     assert asyncio.run(gw.probe_write_access("gs://other-bkt")) == "gs://other-bkt"
     assert not gw.objects  # the write probe object was deleted again
 
@@ -715,10 +752,14 @@ def test_gcs_sop_object_guardrails():
         gw.download_object_bytes(f"gs://{STAGING}/jobs/master_sheet.xlsx")
     with pytest.raises(WorkspaceAccessError, match="内部暂存"):
         gw.upload_object_bytes(f"gs://{STAGING}/eval/x.xlsx", b"x", gg.XLSX_CONTENT_TYPE)
-    # The staging bucket's own sop/ prefix is allowed.
-    url = gw.upload_object_bytes(f"gs://{STAGING}/sop/master_sheet.xlsx", b"x", gg.XLSX_CONTENT_TYPE)
-    assert url.endswith(f"/_details/{STAGING}/sop/master_sheet.xlsx")
-    assert gw.download_object_bytes(f"gs://{STAGING}/sop/master_sheet.xlsx") == b"x"
+    # Even the staging bucket's sop/ prefix is refused (30-day auto-delete); customer buckets are fine.
+    with pytest.raises(WorkspaceAccessError, match="30 天后自动删除"):
+        gw.upload_object_bytes(f"gs://{STAGING}/sop/master_sheet.xlsx", b"x", gg.XLSX_CONTENT_TYPE)
+    with pytest.raises(WorkspaceAccessError, match="30 天后自动删除"):
+        gw.download_object_bytes(f"gs://{STAGING}/sop/master_sheet.xlsx")
+    url = gw.upload_object_bytes("gs://customer-cctv-bucket/sop/master_sheet.xlsx", b"x", gg.XLSX_CONTENT_TYPE)
+    assert url.endswith("/_details/customer-cctv-bucket/sop/master_sheet.xlsx")
+    assert gw.download_object_bytes("gs://customer-cctv-bucket/sop/master_sheet.xlsx") == b"x"
     with pytest.raises(WorkspaceAccessError, match="init_sop_sheet.py --gcs-uri"):
         gw.download_object_bytes("gs://store-videos/sop/missing.xlsx")
     with pytest.raises(WorkspaceAccessError, match="roles/storage.objectViewer"):
@@ -876,3 +917,114 @@ def test_download_size_cap_applies_when_metadata_size_missing():
     gw.put("store-videos", "sop/master_sheet.xlsx", b"z" * 2048)
     with pytest.raises(WorkspaceAccessError, match="上限"):
         gw.download_object_bytes(SOP_URI, max_bytes=1024)
+
+
+# ---------------------------------------------------------------------------------------------
+# Round 70c: GCS Object Versioning / generation pinning for the Master SOP workbook
+# ---------------------------------------------------------------------------------------------
+
+GEN = "1728547200123456"
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (f"gs://store-videos/sop/master_sheet.xlsx#{GEN}", f"gs://store-videos/sop/master_sheet.xlsx#{GEN}"),
+        (f"gs://store-videos/sop/master_sheet.json#{GEN}", f"gs://store-videos/sop/master_sheet.json#{GEN}"),
+        (
+            "https://console.cloud.google.com/storage/browser/_details/store-videos/sop/master_sheet.xlsx"
+            f";tab=live_object?project=p&generation={GEN}",
+            f"gs://store-videos/sop/master_sheet.xlsx#{GEN}",
+        ),
+        (
+            f"https://storage.googleapis.com/store-videos/sop/master_sheet.xlsx?generation={GEN}",
+            f"gs://store-videos/sop/master_sheet.xlsx#{GEN}",
+        ),
+        # non-numeric fragments / generations are UI anchors: stripped as before
+        ("gs://store-videos/sop/master_sheet.xlsx#tab=live_object", "gs://store-videos/sop/master_sheet.xlsx"),
+        (
+            "https://storage.cloud.google.com/store-videos/sop/master_sheet.xlsx?generation=abc",
+            "gs://store-videos/sop/master_sheet.xlsx",
+        ),
+    ],
+)
+def test_generation_pinning_preserved_by_extract_spreadsheet_id(raw, expected):
+    assert extract_spreadsheet_id(raw) == expected
+
+
+def test_generation_suffix_requires_workbook_object_and_parse_helpers():
+    with pytest.raises(ValueError):
+        extract_spreadsheet_id(f"gs://store-videos/sop/master_sheet.csv#{GEN}")
+    with pytest.raises(ValueError):
+        extract_spreadsheet_id(f"gs://store-videos#{GEN}")
+    assert gg.parse_gcs_uri(f"gs://b-1/sop/m.xlsx#{GEN}") == ("b-1", "sop/m.xlsx")
+    assert gg.parse_gcs_uri_with_generation(f"gs://b-1/sop/m.xlsx#{GEN}") == ("b-1", "sop/m.xlsx", GEN)
+    assert gg.parse_gcs_uri_with_generation("gs://b-1/sop/m.xlsx") == ("b-1", "sop/m.xlsx", None)
+
+
+def test_pinned_generation_download_and_prompt_manager(tmp_path):
+    mod = _load_init_script()
+    fake = FakeGcs()
+    v1 = mod.build_xlsx_bytes(mod.load_snapshot(mod.DEFAULT_SNAPSHOT))
+    gen1 = fake.put("store-videos", "sop/master_sheet.xlsx", v1, ctype=gg.XLSX_CONTENT_TYPE)
+
+    def _v2(tabs):
+        tabs["Prompt_v2.5_V10全量17条标准版"][1][6] = "【v2】A1 新规则"
+
+    gen2 = fake.put("store-videos", "sop/master_sheet.xlsx", _edit_workbook(v1, _v2), ctype=gg.XLSX_CONTENT_TYPE)
+    assert gen1 != gen2
+
+    fake.calls.clear()
+    assert fake.download_object_bytes(f"{SOP_URI}#{gen1}") == v1
+    assert [u for _, u in fake.calls] and all(f"generation={gen1}" in u for _, u in fake.calls)
+    assert "fields=size,generation" in fake.calls[0][1] and "alt=media" in fake.calls[1][1]
+    with pytest.raises(WorkspaceAccessError, match="历史版本"):
+        fake.download_object_bytes(f"{SOP_URI}#999")
+
+    pm = PromptManager(sheet_client=GoogleSheetsConfigClient(gcs_gateway=fake), known_valid_models={"gemini-3.8-flash"})
+    live = asyncio.run(pm.load_active_config(SOP_URI))
+    assert live.rules[0].check_instruction == "【v2】A1 新规则"
+    console_pinned = (
+        "https://console.cloud.google.com/storage/browser/_details/store-videos/sop/master_sheet.xlsx"
+        f"?generation={gen1}"
+    )
+    fake.calls.clear()
+    pinned = asyncio.run(pm.load_active_config(console_pinned))
+    assert pinned.rules[0].check_instruction != "【v2】A1 新规则" and len(pinned.rules) == 24
+    assert any("alt=media" in u and f"generation={gen1}" in u for _, u in fake.calls)
+    # pinned SOP passes the preflight readability check too
+    assert asyncio.run(fake.check_sheet_readable(f"{SOP_URI}#{gen1}")) == ""
+
+
+def test_init_script_enables_versioning_and_prints_pinned_uri(monkeypatch, capsys):
+    mod = _load_init_script()
+    fake = FakeGcs()
+    monkeypatch.setattr(mod, "make_gcs_gateway", lambda sa="": fake)
+    assert mod.main(["--gcs-uri", SOP_URI]) == 0
+    out = capsys.readouterr().out
+    gen = fake.objects[("store-videos", "sop/master_sheet.xlsx")]["generation"]
+    assert fake.versioning == {"store-videos": True}
+    assert f"live URI (tracks the latest version): {SOP_URI}" in out
+    assert f"pinned URI (this exact version, immutable): {SOP_URI}#{gen}" in out
+    assert "Version history" in out
+    # read-back verified the exact uploaded generation
+    assert any("alt=media" in u and f"generation={gen}" in u for _, u in fake.calls)
+
+
+def test_init_script_continues_when_versioning_forbidden(monkeypatch, capsys):
+    mod = _load_init_script()
+    fake = FakeGcs()
+    fake.bucket_patch_status = 403  # caller has objectAdmin but not storage.buckets.update
+    monkeypatch.setattr(mod, "make_gcs_gateway", lambda sa="": fake)
+    assert mod.main(["--gcs-uri", f"{SOP_URI}#{GEN}"]) == 0  # a pinned URI still uploads the live object
+    captured = capsys.readouterr()
+    assert "gcloud storage buckets update gs://store-videos --versioning" in captured.err
+    assert ("store-videos", "sop/master_sheet.xlsx") in fake.objects
+    assert fake.versioning == {}
+
+    fake2 = FakeGcs()
+    monkeypatch.setattr(mod, "make_gcs_gateway", lambda sa="": fake2)
+    assert mod.main(["--gcs-uri", SOP_URI, "--no-enable-versioning"]) == 0
+    assert not any(m == "PATCH" for m, _ in fake2.calls)
+    with pytest.raises(WorkspaceAccessError, match="30 天后自动删除"):
+        mod.main(["--gcs-uri", f"gs://{STAGING}/sop/master_sheet.xlsx"])

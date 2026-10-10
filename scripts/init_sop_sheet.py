@@ -15,7 +15,8 @@ Option A — Browser import (zero OAuth / zero CLI setup):
   2. Share the Sheet with the bot account (`workspace_impersonate_user`) as Viewer (or Editor).
   3. Put the Sheet ID into `<env>.tfvars` -> `master_prompt_sheet_id`.
 
-Option C — Zero-GWS (no Google Workspace): keep the SOP workbook in GCS as `.xlsx`:
+Option C — Zero-GWS (no Google Workspace): keep the SOP workbook in a customer GCS bucket as `.xlsx`
+   (Object Versioning is enabled on the bucket when permitted, so every re-upload is archived):
      gcloud auth application-default login
      python3 scripts/init_sop_sheet.py --gcs-uri gs://<bucket>/sop/master_sheet.xlsx --tfvars <env>.tfvars
    then set `master_prompt_sheet_id = "gs://<bucket>/sop/master_sheet.xlsx"` in `<env>.tfvars`.
@@ -296,12 +297,12 @@ def _import_cctv_audit() -> None:
 def resolve_gcs_sop_uri(value: str) -> str:
     """`gs://bucket/<obj>.xlsx` from a gs:// URI or Cloud Console / storage URL; '' if not a GCS reference."""
     _import_cctv_audit()
-    from cctv_audit.gcs_uri import normalize_gcs_target
+    from cctv_audit.gcs_uri import normalize_gcs_target, split_generation
 
     target = normalize_gcs_target(value or "")
     if target is None:
         return ""
-    obj = target[len("gs://"):].partition("/")[2]
+    obj = split_generation(target)[0][len("gs://"):].partition("/")[2]
     if not obj.lower().endswith(".xlsx"):
         raise ValueError(f"--gcs-uri must name a .xlsx object such as gs://<bucket>/sop/master_sheet.xlsx, got {value!r}")
     return target
@@ -327,19 +328,40 @@ def make_gcs_gateway(service_account: str = "") -> Any:
     return gw
 
 
-def upload_to_gcs(gw: Any, gcs_uri: str, tabs: list[dict[str, Any]]) -> str:
-    """Uploads the snapshot as `.xlsx`, reads it back and verifies every tab and cell; returns the Console URL."""
+def enable_versioning(gw: Any, gcs_uri: str) -> bool:
+    """Best-effort Object Versioning on the SOP bucket so every re-upload keeps the previous version."""
+    _import_cctv_audit()
+    from cctv_audit.gcs_gateway import parse_gcs_uri
+
+    bucket, _ = parse_gcs_uri(gcs_uri)
+    status = gw.enable_bucket_versioning(bucket)
+    if status < 400:
+        print(f"object versioning: enabled on gs://{bucket}")
+        return True
+    print(
+        f"note: could not enable object versioning on gs://{bucket} (HTTP {status}; needs storage.buckets.update). "
+        f"Ask a bucket admin to run: gcloud storage buckets update gs://{bucket} --versioning",
+        file=sys.stderr,
+    )
+    return False
+
+
+def upload_to_gcs(gw: Any, gcs_uri: str, tabs: list[dict[str, Any]]) -> tuple[str, str]:
+    """Uploads the snapshot as `.xlsx`, reads that generation back and verifies every tab and cell.
+
+    Returns (Console URL, uploaded object generation or '').
+    """
     _import_cctv_audit()
     from cctv_audit.gcs_gateway import XLSX_CONTENT_TYPE, read_xlsx_sheets
 
-    console_url = gw.upload_object_bytes(gcs_uri, build_xlsx_bytes(tabs), XLSX_CONTENT_TYPE)
-    got = read_xlsx_sheets(gw.download_object_bytes(gcs_uri))
+    console_url, generation = gw.upload_object(gcs_uri, build_xlsx_bytes(tabs), XLSX_CONTENT_TYPE)
+    got = read_xlsx_sheets(gw.download_object_bytes(f"{gcs_uri}#{generation}" if generation else gcs_uri))
     for tab in tabs:
         if tab["title"] not in got:
             raise SystemExit(f"read-back from {gcs_uri}: tab {tab['title']!r} missing")
         if _normalize_rows(got[tab["title"]]) != _normalize_rows(tab["values"]):
             raise SystemExit(f"read-back mismatch in tab {tab['title']!r} of {gcs_uri}")
-    return console_url
+    return console_url, generation
 
 
 def build_sheets_credentials(
@@ -395,6 +417,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--sheet-id", default="", help="Target Google Sheet ID or URL (create it in the browser first)")
     parser.add_argument("--gcs-uri", default="", help="Zero-GWS: upload the snapshot as .xlsx to gs://<bucket>/<path>.xlsx (or a Console URL of it) instead of a Google Sheet")
+    parser.add_argument(
+        "--enable-versioning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="With --gcs-uri: best-effort enable Object Versioning on the bucket (default on; --no-enable-versioning to skip)",
+    )
     parser.add_argument("--snapshot", type=Path, default=DEFAULT_SNAPSHOT, help=f"default: {DEFAULT_SNAPSHOT}")
     parser.add_argument("--export-xlsx", type=Path, default=None, help="Export snapshot to a multi-tab .xlsx file for browser File -> Import (no OAuth needed)")
     parser.add_argument("--tfvars", type=Path, default=None, help="Optional <env>.tfvars to auto-derive worker service account and workspace_impersonate_user")
@@ -423,11 +451,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if gcs_uri:
+        live_uri = gcs_uri.split("#", 1)[0]  # always upload the live object, never a pinned generation
         sa_email, _ = resolve_impersonation_targets(args.tfvars, args.service_account, "")
-        console_url = upload_to_gcs(make_gcs_gateway(sa_email), gcs_uri, tabs)
-        print(f"done: {gcs_uri} (read-back verified)")
+        gw = make_gcs_gateway(sa_email)
+        if args.enable_versioning:
+            enable_versioning(gw, live_uri)
+        console_url, generation = upload_to_gcs(gw, live_uri, tabs)
+        print(f"done: {live_uri} (read-back verified)")
         print(f"console: {console_url}")
-        print(f'next: set master_prompt_sheet_id = "{gcs_uri}" in <env>.tfvars and grant the worker service account '
+        print(f"live URI (tracks the latest version): {live_uri}")
+        print("  roll back anytime: Cloud Console -> bucket -> master_sheet.xlsx -> Version history (版本历史记录) -> Restore (恢复)")
+        if generation:
+            print(f"pinned URI (this exact version, immutable): {live_uri}#{generation}")
+        print(f'next: set master_prompt_sheet_id = "{live_uri}" in <env>.tfvars and grant the worker service account '
               "roles/storage.objectViewer (or objectAdmin) on the bucket; later edits only need re-uploading the .xlsx")
         return 0
 

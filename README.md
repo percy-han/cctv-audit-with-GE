@@ -237,15 +237,24 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 
 没有 Google Workspace（或暂时不想配 Drive 域委派）时，可以把视频放在 GCS 里，用法几乎一样：
 
-1. **SOP 规则放哪里**（二选一，第 6、7 步的域委派、共享 Drive 文件夹都可以跳过）：
-   - **放在 GCS 里的 Excel（推荐，可随时改规则）**：先把 SOP 模板上传成 `.xlsx`，脚本会上传后再读回来逐格核对：
-     ```bash
-     gcloud auth application-default login
-     python3 scripts/init_sop_sheet.py --gcs-uri gs://<桶>/sop/master_sheet.xlsx --tfvars <env>.tfvars
-     ```
-     然后在 `<env>.tfvars` 里设置 `master_prompt_sheet_id = "gs://<桶>/sop/master_sheet.xlsx"`（也可以填这个文件在控制台的链接，或者 `.json` 快照），重新执行第 5 步部署。Worker 服务账号对这个桶至少要有 `roles/storage.objectViewer`。
-     以后要改规则：从控制台把 `master_sheet.xlsx` 下载下来，用 Excel 或 WPS 改（规则文字、启用/停用、`Tab0_版本总控与回滚开关` 里的 `Active_Prompt_Version` / `Active_Model_Version`），另存为 `.xlsx` 后上传覆盖同一路径即可。**不用重新部署**，最多 60 秒后新任务就按新规则跑。注意不要改页签名称和表头。预检时会先确认这个文件能读、有 Tab0 页签，读不到会直接提示怎么处理，不会扣 Token。
-   - **不配 SOP 文件**：设置 `master_prompt_sheet_id = ""`，直接用内置的 V25 基准规则库（日志里会打印 `MASTER_PROMPT_SHEET_ID 未配置（Zero-GWS 模式）...`）。规则要改只能改代码重新部署。
+1. **SOP 规则放哪里：GCS `master_sheet.xlsx` + 存储桶版本控制（推荐标准方案）**（第 6、7 步的域委派、共享 Drive 文件夹都可以跳过）：
+   1. 在客户自己的存储桶上开启对象版本控制（Object Versioning），之后每次覆盖上传，旧版本都会自动归档：
+      ```bash
+      gcloud storage buckets update gs://<桶> --versioning
+      ```
+      下一步的脚本默认也会尝试开启。如果当前账号没有 `storage.buckets.update` 权限，脚本会提示上面这条命令，然后继续上传。
+   2. 上传初始 SOP 规则表（脚本会上传 `.xlsx` 后再读回来逐格核对，并打印本次版本号）：
+      ```bash
+      gcloud auth application-default login
+      python3 scripts/init_sop_sheet.py --gcs-uri gs://<桶>/sop/master_sheet.xlsx --tfvars <env>.tfvars
+      ```
+   3. 在 `<env>.tfvars` 里设置 `master_prompt_sheet_id = "gs://<桶>/sop/master_sheet.xlsx"`（也可以填这个文件在控制台的链接，或者 `.json` 快照），然后重新执行第 5 步部署。Worker 服务账号对这个桶至少要有 `roles/storage.objectViewer`。不能放在本服务自己的暂存桶里，那个桶的文件 30 天后会被自动删除，部署和预检都会拒绝。
+   4. 平时改规则：从控制台把 `master_sheet.xlsx` 下载下来，用 Excel 或 WPS 修改，可以改规则文字、删掉某条规则所在的行来停用它、改 `Tab0_版本总控与回滚开关` 里的 `Active_Prompt_Version` / `Active_Model_Version`。改完另存为 `.xlsx`，用同一个文件名上传覆盖。**不用重新部署**，最多 60 秒后新任务就按新规则跑。不要改页签名称和表头。预检时会先确认这个文件能读、有 Tab0 页签，读不到会直接提示怎么处理，不会扣 Token。
+   5. 两种管理和回滚 SOP 版本的方式：
+      - **方式 A（推荐，不用改配置，1 秒回滚）**：`master_prompt_sheet_id` 一直保持 `gs://<桶>/sop/master_sheet.xlsx`，平时同名上传覆盖，GCS 自动保留历史版本。需要回滚时，在 GCP 控制台打开这个文件的 **「版本历史记录 (Version history)」**，对想要的版本点 **「恢复 (Restore)」**；或者用命令 `gcloud storage cp gs://<桶>/sop/master_sheet.xlsx#<旧版本号> gs://<桶>/sop/master_sheet.xlsx`。60 秒内自动生效。
+      - **方式 B（在配置里锁死某一个版本）**：在 `master_prompt_sheet_id` 末尾带上版本号，比如 `gs://<桶>/sop/master_sheet.xlsx#1728547200123456`，系统就固定读取这个历史版本，之后再上传覆盖也不影响。控制台链接里带 `?generation=<版本号>` 也可以。版本号可以在「版本历史记录」里看到，上传脚本也会打印出来。
+
+   不配外部 SOP 文件时，可以设置 `master_prompt_sheet_id = ""`，直接用内置的 V25 基准规则库，但规则要改就只能改代码重新部署。
 2. **授权**：在存放视频的存储桶上，把 `roles/storage.objectAdmin` 授予 Worker 服务账号（`<p>-worker@<项目ID>.iam.gserviceaccount.com`）。只读视频要 `objectViewer`；写回 Excel 报告和证据切片要 `objectAdmin`：
    ```bash
    gcloud storage buckets add-iam-policy-binding gs://<视频桶> \
@@ -257,7 +266,7 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
    - `📁 违规证据切片_Evidence/`：每条违规对应的 20 秒 MP4 证据切片。
 
    任务完成时，GE 会回复 Excel 报告链接和这个 GCS 目录的控制台链接。
-5. **不能用的目录**：本服务自己的暂存桶（`STAGING_BUCKET`）根目录，以及其中的 `jobs/`、`eval/`、`smoke/`、`agent_platform_eval/` 目录，存的是任务状态和评测文件，会被直接拒绝。请用别的目录（例如 `gs://<暂存桶>/stores/<门店>/`）或者另开一个桶。
+5. **不能用的存储桶**：本服务自己的暂存桶（`STAGING_BUCKET`，`<项目ID>-<p>-staging`）整个桶都不能放门店视频、报告或 SOP 文件。它存的是任务状态和临时切片，而且所有文件 30 天后会被自动删除，系统会直接拒绝。请使用客户自己的存储桶（例如 `gs://<客户桶>/stores/<门店>/`）。
 
 ## 7. 运行测试
 

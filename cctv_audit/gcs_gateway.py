@@ -9,9 +9,11 @@ target ID: `gs://...` goes to `GcsStorageGateway`, everything else to the unchan
 * writes 20s evidence MP4s under `<prefix>/📁 违规证据切片_Evidence/`,
 * writes the dual-tab report as a styled `.xlsx` (stdlib `zipfile` + SpreadsheetML; no openpyxl).
 
-Guardrail: the service's own staging bucket root and its internal state prefixes (`jobs/`, `eval/`,
-`smoke/`, `agent_platform_eval/`) are never accepted as an audit target, so a supervisor link can
-never list, overwrite or pollute job checkpoints / eval artefacts.
+Guardrail: no path inside the service's own staging bucket is ever accepted (videos, reports,
+evidence or SOP workbooks). It holds job checkpoints / eval artefacts (`jobs/`, `eval/`, `smoke/`,
+`agent_platform_eval/`) and has a 30-day auto-delete lifecycle rule.
+
+SOP workbooks may be pinned to one Object Versioning generation (`gs://b/sop/master_sheet.xlsx#<gen>`).
 """
 
 from __future__ import annotations
@@ -37,11 +39,12 @@ from xml.sax.saxutils import escape as _xml_escape
 
 from .config import config
 from .gcp import WorkspaceAccessError
-from .gcs_uri import GCS_SCHEME, is_gcs_target, normalize_gcs_target
+from .gcs_uri import GCS_SCHEME, is_gcs_target, normalize_gcs_target, split_generation
 from .video_ingestor import VideoMetadataItem, natural_video_sort_key
 
 logger = logging.getLogger("cctv_audit.gcs_gateway")
 
+# Internal prefixes of the staging bucket; the whole bucket is refused (30-day auto-delete).
 INTERNAL_STATE_PREFIXES: Tuple[str, ...] = ("jobs", "eval", "smoke", "agent_platform_eval")
 EVIDENCE_DIR_MARKER = "违规证据切片_Evidence"
 WRITE_PROBE_OBJECT = ".cctv_audit_write_probe"
@@ -61,17 +64,23 @@ _META_W, _META_H, _META_DUR = "cctv_width", "cctv_height", "cctv_duration_sec"
 # --------------------------------------------------------------------------------------------
 
 
-def parse_gcs_uri(uri: str) -> Tuple[str, str]:
-    """(bucket, object_or_prefix) for a GCS URI / Console URL; raises WorkspaceAccessError if invalid."""
+def parse_gcs_uri_with_generation(uri: str) -> Tuple[str, str, Optional[str]]:
+    """(bucket, object_or_prefix, generation or None); `#<digits>` / `?generation=` pin one object version."""
     try:
         canonical = normalize_gcs_target(uri)
     except ValueError as exc:
         raise WorkspaceAccessError(str(exc)) from exc
     if canonical is None:
         raise WorkspaceAccessError(f"不是有效的 GCS 路径（应为 `gs://存储桶/目录`）：`{uri}`")
-    rest = canonical[len(GCS_SCHEME):]
-    bucket, _, prefix = rest.partition("/")
-    return bucket, prefix.strip("/")
+    base, generation = split_generation(canonical)
+    bucket, _, prefix = base[len(GCS_SCHEME):].partition("/")
+    return bucket, prefix.strip("/"), (generation or None)
+
+
+def parse_gcs_uri(uri: str) -> Tuple[str, str]:
+    """(bucket, object_or_prefix) for a GCS URI / Console URL (generation dropped); raises WorkspaceAccessError."""
+    bucket, prefix, _ = parse_gcs_uri_with_generation(uri)
+    return bucket, prefix
 
 
 def _quote_path(path: str) -> str:
@@ -111,18 +120,20 @@ def _staging_bucket_name() -> str:
 
 
 def _assert_not_internal_state_prefix(bucket: str, prefix: str) -> None:
-    """Rejects the service's staging bucket root and its internal state prefixes as audit targets."""
+    """Rejects ANY path in the service's staging bucket (videos, reports, evidence and SOP workbooks).
+
+    The staging bucket holds job state (`jobs/`, `eval/`, `smoke/`, ...) and has a 30-day
+    `age = 30 -> Delete` lifecycle rule, so customer files placed there would silently vanish.
+    """
     staging = _staging_bucket_name()
     if not staging or bucket.lower() != staging:
         return
-    first = prefix.strip("/").split("/", 1)[0] if prefix.strip("/") else ""
-    if not first or first in INTERNAL_STATE_PREFIXES:
-        shown = f"gs://{bucket}/{prefix}".rstrip("/")
-        raise WorkspaceAccessError(
-            f"`{shown}` 是本稽核服务的内部暂存/状态目录（存储桶根目录及 "
-            f"{', '.join(p + '/' for p in INTERNAL_STATE_PREFIXES)} 均为保留目录），不能作为门店视频目录："
-            f"请把监控视频放到其他目录（例如 `gs://{bucket}/stores/门店名/`）或另一个存储桶后重新发送"
-        )
+    shown = f"gs://{bucket}/{prefix}".rstrip("/")
+    raise WorkspaceAccessError(
+        f"`{shown}` 位于本稽核服务的内部暂存存储桶（存放任务状态与临时切片，30 天后自动删除），"
+        "不能存放门店视频、稽核报告或 SOP 配置文件：请改用客户自己的存储桶（例如 "
+        "`gs://<客户存储桶>/stores/门店名/`、`gs://<客户存储桶>/sop/master_sheet.xlsx`）后重新发送"
+    )
 
 
 def _object_parent(obj: str) -> str:
@@ -557,7 +568,7 @@ def load_gcs_sop_tabs(raw: bytes, source_uri: str) -> Dict[str, List[List[str]]]
     if len(raw) > SOP_MAX_BYTES:
         raise ValueError(f"文件大小 {len(raw)} 字节超过 {SOP_MAX_BYTES // (1024 * 1024)} MiB 上限")
     try:
-        if source_uri.lower().endswith(".json"):
+        if split_generation(source_uri)[0].lower().endswith(".json"):
             doc = json.loads(raw.decode("utf-8-sig"))
             tabs = doc.get("tabs") if isinstance(doc, dict) else None
             if not isinstance(tabs, list):
@@ -740,13 +751,17 @@ class GcsStorageGateway:
 
         return await asyncio.to_thread(_probe)
 
-    def _object_path(self, gcs_uri: str) -> Tuple[str, str]:
-        bucket, obj = parse_gcs_uri(gcs_uri)
+    def _object_path_gen(self, gcs_uri: str) -> Tuple[str, str, Optional[str]]:
+        bucket, obj, generation = parse_gcs_uri_with_generation(gcs_uri)
         _assert_not_internal_state_prefix(bucket, obj)
         if not obj:
             raise WorkspaceAccessError(
                 "GCS SOP 配置路径必须指向具体的 .xlsx 或 .json 文件对象（如 gs://bucket/sop/master_sheet.xlsx）"
             )
+        return bucket, obj, generation
+
+    def _object_path(self, gcs_uri: str) -> Tuple[str, str]:
+        bucket, obj, _ = self._object_path_gen(gcs_uri)
         return bucket, obj
 
     def download_object_bytes(self, gcs_uri: str, max_bytes: int = SOP_MAX_BYTES) -> bytes:
@@ -755,11 +770,15 @@ class GcsStorageGateway:
         The object's `size` is checked from metadata before downloading, and the body length again
         after, so an oversized (or swapped-in) object is refused instead of filling memory.
         """
-        bucket, obj = self._object_path(gcs_uri)
+        bucket, obj, generation = self._object_path_gen(gcs_uri)
+        gen_q = f"&generation={generation}" if generation else ""
+        shown = f"gs://{bucket}/{obj}" + (f"#{generation}" if generation else "")
         too_big = WorkspaceAccessError(
-            f"SOP 配置文件 `gs://{bucket}/{obj}` 超过 {max_bytes // (1024 * 1024)} MiB 上限：请只保留 Tab0 与规则页签后重新上传"
+            f"SOP 配置文件 `{shown}` 超过 {max_bytes // (1024 * 1024)} MiB 上限：请只保留 Tab0 与规则页签后重新上传"
         )
-        status, body = self._request("GET", self._object_url(bucket, obj) + "?fields=size", timeout=15.0)
+        status, body = self._request(
+            "GET", self._object_url(bucket, obj) + "?fields=size,generation" + gen_q, timeout=15.0
+        )
         if status < 400:
             try:
                 size = int(json.loads(body.decode("utf-8") or "{}").get("size") or 0)
@@ -767,10 +786,14 @@ class GcsStorageGateway:
                 size = 0
             if size > max_bytes:
                 raise too_big
-            status, body = self._request("GET", self._media_url(bucket, obj), timeout=30.0)
+            status, body = self._request("GET", self._media_url(bucket, obj) + gen_q, timeout=30.0)
         if status in (401, 403, 404):
             who = self._principal()
-            shown = f"gs://{bucket}/{obj}"
+            if status == 404 and generation:
+                raise WorkspaceAccessError(
+                    f"找不到 SOP 配置文件的历史版本 `{shown}`（HTTP 404）：该版本号不存在或已被删除。"
+                    "请在控制台该文件的「版本历史记录」中确认版本号，或去掉 `#<版本号>` 使用最新版本"
+                )
             if status == 404:
                 raise WorkspaceAccessError(
                     f"找不到 SOP 配置文件 `{shown}`（HTTP 404）：请先运行 "
@@ -788,6 +811,13 @@ class GcsStorageGateway:
 
     def upload_object_bytes(self, gcs_uri: str, data: bytes, content_type: str) -> str:
         """Uploads `data` to one GCS object (blocking); returns its Cloud Console URL."""
+        return self.upload_object(gcs_uri, data, content_type)[0]
+
+    def upload_object(self, gcs_uri: str, data: bytes, content_type: str) -> Tuple[str, str]:
+        """Uploads `data` (blocking); returns (Console URL, new object generation or '').
+
+        With Object Versioning enabled the previous content stays archived under its old generation.
+        """
         bucket, obj = self._object_path(gcs_uri)
         status, body = self._request(
             "POST",
@@ -798,7 +828,24 @@ class GcsStorageGateway:
             timeout=60.0,
         )
         self._check(status, body, bucket, obj, "写入")
-        return build_gcs_console_object_url(f"gs://{bucket}/{obj}")
+        try:
+            generation = str(json.loads(body.decode("utf-8") or "{}").get("generation") or "")
+        except (ValueError, AttributeError):
+            generation = ""
+        if generation:
+            logger.info("Uploaded gs://%s/%s generation %s", bucket, obj, generation)
+        return build_gcs_console_object_url(f"gs://{bucket}/{obj}"), generation
+
+    def enable_bucket_versioning(self, bucket: str) -> int:
+        """Best-effort `versioning.enabled = true` on `bucket`; returns the HTTP status (403 = no buckets.update)."""
+        status, _ = self._request(
+            "PATCH",
+            f"{_STORAGE_API}/b/{urllib.parse.quote(bucket, safe='')}?fields=versioning",
+            body=json.dumps({"versioning": {"enabled": True}}).encode(),
+            content_type="application/json",
+            timeout=15.0,
+        )
+        return status
 
     async def check_sheet_readable(self, sheet_id: str) -> str:
         """'' when no SOP workbook is configured or the GCS `.xlsx` / `.json` has a readable Tab 0.

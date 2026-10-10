@@ -114,16 +114,17 @@ variable "master_prompt_sheet_id" {
 
   # Mirrors cctv_audit/config.py::extract_spreadsheet_id so a mis-pasted Drive *folder*
   # link is rejected at `terraform plan`, not at cold start. "" = Zero-GWS built-in rules;
-  # gs://.../*.xlsx|*.json (or its Console / storage URL) = Zero-GWS GCS-hosted SOP workbook.
+  # gs://.../*.xlsx|*.json (or its Console / storage URL) = Zero-GWS GCS-hosted SOP workbook;
+  # an optional #<generation> (gs://...xlsx#1728547200123456) pins one Object Versioning generation.
   validation {
     condition = var.master_prompt_sheet_id == "" || can(regex(
       "^([a-zA-Z0-9_-]{15,}|https://docs\\.google\\.com/spreadsheets/(u/[0-9]+/)?d/[a-zA-Z0-9_-]{15,}.*)$",
       var.master_prompt_sheet_id
       )) || can(regex(
-      "^(gs://|https://console\\.cloud\\.google\\.com/storage/browser/(_details/)?|https://storage\\.(cloud\\.google|googleapis)\\.com/)[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]/[^?#;]*\\.(?i:xlsx|json)([;?#].*)?$",
+      "^(gs://|https://console\\.cloud\\.google\\.com/storage/browser/(_details/)?|https://storage\\.(cloud\\.google|googleapis)\\.com/)[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]/[^?#;]*\\.(?i:xlsx|json)(#[0-9]+|[;?#].*)?$",
       var.master_prompt_sheet_id
     ))
-    error_message = "master_prompt_sheet_id must be \"\" (Zero-GWS built-in rules), a gs://<bucket>/<path>.xlsx|.json SOP workbook (or its Cloud Console / storage URL), a bare Spreadsheet ID (>=15 chars) or a https://docs.google.com/spreadsheets/[u/N/]d/<ID>/... URL."
+    error_message = "master_prompt_sheet_id must be \"\" (Zero-GWS built-in rules), a gs://<bucket>/<path>.xlsx|.json[#<generation>] SOP workbook (or its Cloud Console / storage URL), a bare Spreadsheet ID (>=15 chars) or a https://docs.google.com/spreadsheets/[u/N/]d/<ID>/... URL."
   }
 }
 
@@ -623,6 +624,16 @@ resource "terraform_data" "vertex_reasoning_engine" {
         --staging-bucket "${self.triggers_replace[5]}" \
         --service-account "${self.triggers_replace[6]}"
     EOT
+  }
+
+  lifecycle {
+    precondition {
+      condition = !can(regex(
+        "^(gs://|https://console\\.cloud\\.google\\.com/storage/browser/(_details/)?|https://storage\\.(cloud\\.google|googleapis)\\.com/)${replace(local.staging_bucket_name, ".", "\\.")}/",
+        lower(var.master_prompt_sheet_id)
+      ))
+      error_message = "master_prompt_sheet_id must not point into the staging bucket: its lifecycle rule deletes objects after 30 days. Keep the SOP workbook in a customer bucket with Object Versioning (gs://<bucket>/sop/master_sheet.xlsx)."
+    }
   }
 
   # The worker's own IAM (roles/aiplatform.user, self-TokenCreator) is not listed: bootstrap/

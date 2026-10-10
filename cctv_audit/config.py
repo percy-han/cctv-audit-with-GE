@@ -9,7 +9,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from .gcs_uri import normalize_gcs_target
+from .gcs_uri import normalize_gcs_target, split_generation
 
 # Accepts both `/spreadsheets/d/<ID>` and the multi-account `/spreadsheets/u/<N>/d/<ID>`
 # form that Google emits for users signed into more than one account.
@@ -35,11 +35,12 @@ def extract_spreadsheet_id(raw_value: str) -> str:
     # or the Cloud Console / storage URL of that object) is normalised to `gs://bucket/<object>`.
     gcs_target = normalize_gcs_target(cleaned)
     if gcs_target is not None:
-        obj = gcs_target[len("gs://"):].partition("/")[2]
+        # An optional `#<generation>` pins one archived version (GCS Object Versioning).
+        obj = split_generation(gcs_target)[0][len("gs://"):].partition("/")[2]
         if not obj or not obj.lower().endswith(GCS_SOP_SUFFIXES):
             raise ValueError(
                 f"MASTER_PROMPT_SHEET_ID 的 GCS 路径必须指向具体的 .xlsx 或 .json 文件对象"
-                f"（如 gs://bucket/sop/master_sheet.xlsx），当前为: {cleaned!r}"
+                f"（如 gs://bucket/sop/master_sheet.xlsx，可选 #<generation> 锁定历史版本），当前为: {cleaned!r}"
             )
         return gcs_target
     match = _SHEET_URL_PATTERN.search(cleaned)

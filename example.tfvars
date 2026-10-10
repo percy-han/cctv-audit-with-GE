@@ -10,6 +10,12 @@ project_id                 = "<project-id>"
 name_prefix                = "<prefix>" # 2-20 chars [a-z0-9-], e.g. "cctv-store-b"; never reuse another stack's
 region                     = "<region>" # e.g. asia-southeast1 (data residency of bucket, Cloud Run, images)
 reasoning_engine_location  = "<region>" # Vertex AI Agent Engine region, e.g. us-central1
+# SOP rules source, one of:
+#   "<google-sheet-id>"                          Google Sheet (needs Google Workspace)
+#   "gs://<bucket>/sop/master_sheet.xlsx"        Zero-GWS (recommended): Excel workbook in a customer bucket
+#                                                with Object Versioning; upload/refresh it with
+#                                                scripts/init_sop_sheet.py --gcs-uri; append #<generation> to pin a version
+#   ""                                           built-in V25 rules
 master_prompt_sheet_id     = "<master-prompt-sheet-id>"
 workspace_impersonate_user = "<bot-user@customer-domain>" # "" = the worker SA itself (Shared Drives only)
 
