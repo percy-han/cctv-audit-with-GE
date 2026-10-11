@@ -1,37 +1,44 @@
 # 门店 CCTV AI 稽核（Gemini Enterprise + Gemini 视频理解）
 
-门店督导在 **Gemini Enterprise（GE）** 里把一个 Google Drive 视频文件夹的链接发给稽核 Agent，系统会在后台逐个视频做 AI 稽核，按 SOP 规则找出违规，最后在同一个文件夹里生成一张稽核报告 Google Sheet（每条违规带画面时间和 20 秒证据片段链接）。
+门店督导在 **Gemini Enterprise（GE）** 里把一个 **Google Drive 视频文件夹链接** 或 **Google Cloud Storage（GCS）存储桶目录链接（`gs://...` 或 GCP 控制台链接）** 发给稽核 Agent，系统会在后台逐个视频做 AI 稽核，按 SOP 规则找出违规，并根据输入链接类型**自动切换输出方式**：
+- **Google Workspace 模式（输入 Google Drive 文件夹）**：在同一个 Drive 文件夹里生成一张稽核报告 **Google Sheet** 及 `📁 违规证据切片_Evidence/`（每条违规带画面时间和 20 秒证据片段链接），SOP 从 Google Sheet 读取。
+- **Zero-GWS / 纯 GCS 兜底模式（输入 `gs://` 或 GCS 控制台目录，无需 Google Workspace）**：在同一个 GCS 目录里直接生成一份双工作表 Excel 报告 **`📊 AI稽核报告与Token账单.xlsx`** 及 `📁 违规证据切片_Evidence/`，SOP 直接从 Terraform 自动创建的版本控制存储桶（`gs://<项目ID>-<p>-workspace/sop/master_sheet.xlsx`）读取。两种模式可**同时并存、按单自动路由**，也可独立使用。
 
-本仓库包含部署一套完整环境需要的全部内容：Terraform 基础设施、Cloud Build 流水线、服务代码、SOP 规则表快照和 Prompt 调优工具。
+本仓库包含部署一套完整环境需要的全部内容：Terraform 基础设施、Cloud Build 流水线、服务代码、SOP 规则表快照（`.json` 与 `.xlsx`）和 Prompt 调优工具。
 
 ## 1. 架构一览
 
 ```
 督导 ──► Gemini Enterprise 应用 ──► 稽核 Agent
-                                      │  (Vertex AI Agent Engine / ReasoningEngine，负责对话：预检、确认、查进度)
+                                      │  (Vertex AI Agent Engine / ReasoningEngine，负责对话：预检、确认、查进度；按 Session 严格隔离并发任务)
                                       ▼
                              Cloud Run Worker（<p>-worker，每个任务独占一个实例，最多 20 个并发）
-                                      │  下载 Drive 视频 → 去音轨、按 SEGMENT_DURATION_SEC 切片 → Gemini 逐片分析
-                                      │  → 片间状态接力 → 去重 → 写报告
-                                      ▼
-            GCS staging bucket（任务状态 JSON、切片缓存）   Google Drive / Sheets（报告、证据片段）
+                                      │  下载 Drive / GCS 视频 → 去音轨、按 SEGMENT_DURATION_SEC 切片 → Gemini 逐片分析
+                                      │  → 片间状态接力（carryover_state_summary）→ 去重 → 按输入源自动路由写报告
+                                      ├───────────────────────────────────────────────┐
+                                      ▼                                               ▼
+            [模式 A：Google Workspace 模式]                 [模式 B：Zero-GWS / GCS 模式（无需 GWS）]
+            • Google Drive / Sheets（3-Tab 报告、证据切片）  • GCS Workspace Bucket（<项目ID>-<p>-workspace，开启对象版本控制）
+            • SOP 规则 = Google Sheet（实时读取）            • 输出：📊 AI稽核报告与Token账单.xlsx + 📁 违规证据切片_Evidence/
+                                                            • SOP 规则 = gs://<项目ID>-<p>-workspace/sop/master_sheet.xlsx
 
-SOP 规则 = 一张 Google Sheet（运行时读取，改规则不用重新部署）
-Cloud Scheduler 看门狗（<p>-watchdog）：定时唤醒 Worker，续跑被中断的任务
+            [公共底座]
+            • GCS Staging Bucket（<项目ID>-<p>-staging，30 天 TTL）：任务状态 JSON（按用户+会话隔离）、临时无音切片缓存
+            • Cloud Scheduler 看门狗（<p>-watchdog）：每 2 分钟巡检，自动从已完成切片的 Checkpoint 断点续跑中断任务
 ```
 
-- 模型版本不写死：从 SOP Sheet 的 `Tab0_版本总控与回滚开关` 读取 `Active_Model_Version` / `Fallback_Model_Version`，启动时先探测可用性。
-- 访问 Drive/Sheets 用的是**域委派（DWD）**：Worker 的服务账号以一个 Workspace "机器人账号" 的身份读视频、写报告，不需要任何密钥文件。
+- **模型版本与 SOP 规则不写死**：从 SOP 表格（Google Sheet 或 GCS 上的 `master_sheet.xlsx`）的 `Tab0_版本总控与回滚开关` 读取 `Active_Model_Version` / `Fallback_Model_Version` 与生效规则页签，改规则或回滚版本**不用重新部署**。
+- **双模自适应**：当输入 `gs://...`（或 GCS 控制台链接）时，系统自动使用 `GCS_SOP_URI`（默认 `gs://<项目ID>-<p>-workspace/sop/master_sheet.xlsx`），全程 **0 次 Google Workspace API 调用**；当输入 Google Drive 文件夹时，通过**全网域委派（DWD）**以 Workspace「机器人账号」身份读写 Drive/Sheets，不需要任何静态密钥文件。
 
 ## 2. 目录结构
 
 | 路径 | 内容 |
 |---|---|
 | `bootstrap/` | 一次性初始化（项目 Owner 执行）：部署服务账号、Worker 服务账号、镜像仓库、Cloud Build 触发器、所需 API |
-| `main.tf` | 主体资源：staging bucket、Cloud Run Worker、看门狗、Agent Engine、GE 应用与 Agent |
-| `cloudbuild.yaml` + `deploy/` | 部署流水线：构建镜像 → terraform apply → 创建/更新 Agent Engine 并绑定到 GE |
-| `cctv_audit/` | 服务代码 |
-| `sop/master_sheet.json` + `scripts/init_sop_sheet.py` | SOP 规则表快照和导入脚本 |
+| `main.tf` | 主体资源：staging bucket（30 天缓存）、workspace bucket（开启版本控制 + 自动注入初始 `sop/master_sheet.xlsx`）、Cloud Run Worker、看门狗、Agent Engine、GE 应用与 Agent |
+| `cloudbuild.yaml` + `deploy/` | 部署流水线：构建镜像 → terraform apply → 创建/更新 Agent Engine、种子化 SOP 并绑定到 GE |
+| `cctv_audit/` | 服务代码（含 Drive/Sheets 网关与 GCS/Excel 网关双模自动路由） |
+| `sop/master_sheet.xlsx` + `sop/master_sheet.json` + `scripts/init_sop_sheet.py` | SOP 规则表 Excel 种子文件、JSON 快照和导入/同步脚本 |
 | `eval/` | Prompt 调优/召回率评测工具（评测数据不随仓库分发，见 `eval/data/README.md`） |
 | `tests/`, `eval/tests/` | 单元测试 |
 
@@ -39,13 +46,15 @@ Cloud Scheduler 看门狗（<p>-watchdog）：定时唤醒 Worker，续跑被中
 
 1. 一个已开通结算的 GCP 项目（可以是已有项目；多套环境可共用一个项目，只要 `name_prefix` 不同）。执行人需要项目 Owner。
 2. Gemini Enterprise 许可（用来访问 GE 应用的用户需要分配许可）。
-3. 一个 Google Workspace **机器人账号**（如 `cctv-bot@<你的域名>`），需有 Drive 存储空间：报告和证据片段存在它名下。
-4. 一位 Workspace 超级管理员，用来添加一次域委派（部署第 6 步）。
+3. **（仅 Google Drive / Sheets 模式需要；纯 GCS 模式可跳过）** 一个 Google Workspace **机器人账号**（如 `cctv-bot@<你的域名>`），需有 Drive 存储空间：Drive 模式下的报告和证据片段存在它名下。
+4. **（仅 Google Drive / Sheets 模式需要；纯 GCS 模式可跳过）** 一位 Workspace 超级管理员，用来添加一次域委派（部署第 6 步）。
 5. 本地工具：`gcloud`、Terraform ≥ 1.7、Python 3.12+。
 
-> 所有资源名都由 `name_prefix` 派生（`<p>-worker`、`<p>-deployer`、`<p>-images`、`<p>-watchdog`、`<p>-agent`、`<p>-ge`、`<项目ID>-<p>-staging` 等），换一个前缀就能在同一个项目里再建一套，互不冲突。
+> 所有资源名都由 `name_prefix` 派生（`<p>-worker`、`<p>-deployer`、`<p>-images`、`<p>-watchdog`、`<p>-agent`、`<p>-ge`、`<项目ID>-<p>-staging`、`<项目ID>-<p>-workspace` 等），换一个前缀就能在同一个项目里再建一套，互不冲突。
 
-## 4. 账号体系与跨系统打通说明（GCP × Gemini Enterprise × Google Workspace）
+## 4. 账号体系与跨系统打通说明（GCP × Gemini Enterprise × Google Workspace / GCS）
+
+> 💡 **提示**：如果你们当前**没有 Google Workspace（或暂时采用纯 GCS 模式）**，Terraform 会自动建好 `<项目ID>-<p>-workspace` 存储桶并放入初始 SOP `sop/master_sheet.xlsx`，`<p>-worker` 服务账号已自动拥有该桶读写权限，**无需配置下文的 GWS 机器人账号与 DWD 域委派**，可直接跳到「第 5 节 部署步骤」。
 
 本方案横跨 **GCP（云基础设施与模型推理）**、**Gemini Enterprise（对话入口）** 和 **Google Workspace / GWS（Drive 视频存取、Sheets 报告与 Google Chat 通知）** 三套系统。在开始部署前，先理清三边的账号关系和打通方式：
 
@@ -132,9 +141,10 @@ gcloud auth login
 bootstrap/create_state_bucket.sh <项目ID> <region>     # 桶名默认 <项目ID>-tfstate
 ```
 
-### 第 2 步：导入 SOP 规则表
+### 第 2 步：准备 SOP 规则表（纯 GCS 模式可跳过此步）
 
-Sheet 是 Drive 文件，Terraform 建不了，手动准备一次即可（任选以下一种方式，**不需要**申请额外的 OAuth 敏感权限）：
+- **如果你使用 Zero-GWS / 纯 GCS 模式**：**直接跳过第 2 步**。第 5 步执行 Terraform 部署时，会自动创建 `<项目ID>-<p>-workspace` 存储桶，并把本仓库的 `sop/master_sheet.xlsx` 初始化到 `gs://<项目ID>-<p>-workspace/sop/master_sheet.xlsx`（且后续部署绝不会覆盖你修改过的版本）。
+- **如果你使用 Google Workspace（Drive / Sheets）模式**，Sheet 是 Drive 文件，Terraform 建不了，手动准备一次即可（任选以下一种方式，**不需要**申请额外的 OAuth 敏感权限）：
 
 - **方式 A（推荐，浏览器直接导入或上传转换，0 命令行认证）**：
   1. **做法 A1（在空白表格内导入）**：新建一个空白 Google Sheet，点击菜单栏 **文件 (File) → 导入 (Import) → 上传 (Upload)**，选择本仓库里的 `sop/master_sheet.xlsx`，导入位置选 **替换电子表格 (Replace spreadsheet)** → 点击 **导入数据**。
@@ -164,7 +174,8 @@ cp bootstrap/example.gcs.tfbackend bootstrap/<env>.gcs.tfbackend   # prefix = "<
 ```
 
 把文件里所有 `<...>` 换成实际值。两边的 `project_id`、`name_prefix`、`region` 必须一致；`bootstrap/<env>.tfvars` 里设 `trigger_env = "<env>"`。
-`master_prompt_sheet_id` 填第 2 步的 Sheet ID。
+- **双模并存 / Google Workspace 模式**：`master_prompt_sheet_id` 填第 2 步的 `<SheetID>`，`workspace_impersonate_user` 填机器人邮箱（此时发 Drive 链接自动读 Google Sheet，发 `gs://` 链接自动读 `gs://<项目ID>-<p>-workspace/sop/master_sheet.xlsx`）。
+- **纯 GCS（无 Google Workspace）模式**：`master_prompt_sheet_id` 填 `"gs://<项目ID>-<p>-workspace/sop/master_sheet.xlsx"`（或直接留空 `""`），`workspace_impersonate_user` 填 `""`。
 
 这些文件不含密钥，**需要提交到 Git**（推送触发部署时流水线从仓库读取它们）。
 
@@ -189,9 +200,9 @@ gcloud builds submit --project=<项目ID> --region=<region> --config=cloudbuild.
   --substitutions=_ENV=<env>,_REGION=<region>,_REPO=<p>-images,_IMAGE=cctv-audit-worker,_DEPLOYER_SA_ID=<p>-deployer
 ```
 
-整个过程约 15–30 分钟（Agent Engine 创建最慢）。它会自动完成：构建镜像、创建 Cloud Run Worker/看门狗/bucket、创建 Agent Engine、创建 GE 应用并注册 Agent。之后改代码或配置，重新执行这条命令即可（只加 `_APPLY=false` 则只预览不修改）。
+整个过程约 15–30 分钟（Agent Engine 创建最慢）。它会自动完成：构建镜像、创建 Cloud Run Worker/看门狗/staging 与 workspace 双存储桶、初始化 `gs://<项目ID>-<p>-workspace/sop/master_sheet.xlsx`、创建 Agent Engine、创建 GE 应用并注册 Agent。之后改代码或配置，重新执行这条命令即可（只加 `_APPLY=false` 则只预览不修改）。
 
-### 第 6 步：Workspace 管理员添加域委派（一次）
+### 第 6 步：Workspace 管理员添加域委派（仅 Drive/Sheets 模式需要，纯 GCS 模式可跳过）
 
 1. 查 Worker 服务账号的数字 ID（Client ID）：
 
@@ -206,9 +217,10 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 
 一般几分钟内生效。没加 `drive` / `spreadsheets` 或范围不对时，GE 里预检会直接提示写入探测失败。
 
-### 第 7 步：共享视频文件夹
+### 第 7 步：准备并授权待稽核的视频目录
 
-把要稽核的 Drive 文件夹共享给机器人账号，权限选**编辑者**（报告和证据片段要写回这个文件夹）。
+- **方式 A（使用 Google Drive 文件夹）**：把要稽核的 Drive 文件夹共享给机器人账号，权限选**编辑者**（报告和证据片段要写回这个文件夹）。
+- **方式 B（使用 GCS 目录，无需 Google Workspace）**：直接把门店视频上传到 Terraform 自动创建的版本控制工作桶（例如 `gs://<项目ID>-<p>-workspace/stores/<门店名>/`），Worker 服务账号已自动拥有该桶读写权限，无需额外执行任何授权命令。
 
 ### （可选）开启 Google Chat 完成通知（自动 `@发起人`）
 
@@ -229,17 +241,17 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 ## 6. 使用
 
 1. 打开 GE 应用（控制台 → Gemini Enterprise → 应用 `<p>-ge`），给用户分配许可。
-2. 在 GE 里选择稽核 Agent，发送 Drive 文件夹链接。
-3. Agent 先做预检（权限、视频数量/时长、切片计划、生效规则和模型版本），回复"确认开始"后任务在后台运行，可以关掉页面。
-4. 随时问"好了么"查进度；完成后回复报告 Sheet 链接（若开启了 Google Chat 通知，也会在聊天室自动 `@` 发起人并附上报告链接）。
+2. 在 GE 里选择稽核 Agent，发送 **Google Drive 文件夹链接** 或 **GCS 目录地址（`gs://...` 或控制台链接）**。
+3. Agent 先做预检（返回专属**预检单号**、权限检查、视频数量/时长、切片计划、生效规则和模型版本），回复"确认开始"后任务在后台运行，可以关掉页面（支持同时开启多个会话窗口并发稽核不同目录，单号与进度按会话严格隔离）。
+4. 随时问"好了么"查进度；完成后回复报告链接（Drive 模式返回 Google Sheet 链接，GCS 模式返回 `📊 AI稽核报告与Token账单.xlsx` 链接及目录链接；若开启了 Google Chat 通知，也会在聊天室自动 `@` 发起人并附上报告链接）。
 
-### Zero-GWS / GCS 兜底模式（没有 Google Workspace 时）
+### Zero-GWS / GCS 兜底模式详解（没有 Google Workspace 时）
 
 没有 Google Workspace（或暂时不想配 Drive 域委派）时，可以把视频放在 GCS 里，用法几乎一样。
 
 > **Terraform 会自动准备好 GCS 模式要用的东西**（第 5 步部署时创建）：
 > - 一个开启了对象版本控制的存储桶 `<项目ID>-<p>-workspace`（可用 `workspace_bucket_name` 改名），Worker 服务账号自动拥有读写权限。里面放门店视频（如 `gs://<项目ID>-<p>-workspace/stores/<门店>/`）、Excel 报告、证据切片和 SOP 规则表。这个桶没有按时间自动删除的规则，只会清理每个文件第 30 个之前的旧版本。
-> - 默认 SOP 规则表 `gs://<项目ID>-<p>-workspace/sop/master_sheet.xlsx`，由仓库里的 `sop/master_sheet.xlsx` 在建桶时写入一次，之后客户改过的版本不会被 Terraform 覆盖。地址可以用 `terraform output gcs_sop_uri` 查看。
+> - 默认 SOP 规则表 `gs://<项目ID>-<p>-workspace/sop/master_sheet.xlsx`，由仓库里的 `sop/master_sheet.xlsx` 在建桶时通过原子条件上传（`ifGenerationMatch=0`）写入一次，之后客户改过的版本绝不会被 Terraform 覆盖。地址可以用 `terraform output gcs_sop_uri` 查看。
 > - 这个地址会以 `GCS_SOP_URI` 的形式注入 Worker 和 Agent Engine。督导发 `gs://` 目录时，如果 `master_prompt_sheet_id` 本身不是 `gs://` 地址，就自动用这个规则表，全程不调用 Google Workspace。发 Drive 文件夹时仍用 `master_prompt_sheet_id` 指向的 Google Sheet；没填 Sheet 时 Drive 文件夹也用这个规则表。
 >
 > 所以用 Terraform 部署后，把视频上传到 `gs://<项目ID>-<p>-workspace/stores/<门店>/`，在 GE 里发这个地址就能直接稽核。下面第 1 步说明怎么改规则、怎么回滚；如果想把 SOP 放在客户自己的其他桶里，也按这一步操作。
@@ -256,13 +268,13 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
       python3 scripts/init_sop_sheet.py --gcs-uri gs://<桶>/sop/master_sheet.xlsx --tfvars <env>.tfvars
       ```
    3. 在 `<env>.tfvars` 里设置 `master_prompt_sheet_id = "gs://<桶>/sop/master_sheet.xlsx"`（也可以填这个文件在控制台的链接，或者 `.json` 快照），然后重新执行第 5 步部署。Worker 服务账号对这个桶至少要有 `roles/storage.objectViewer`。不能放在本服务自己的暂存桶里，那个桶的文件 30 天后会被自动删除，部署和预检都会拒绝。
-   4. 平时改规则：从控制台把 `master_sheet.xlsx` 下载下来，用 Excel 或 WPS 修改，可以改规则文字、删掉某条规则所在的行来停用它、改 `Tab0_版本总控与回滚开关` 里的 `Active_Prompt_Version` / `Active_Model_Version`。改完另存为 `.xlsx`，用同一个文件名上传覆盖。**不用重新部署**，最多 60 秒后新任务就按新规则跑。不要改页签名称和表头。预检时会先确认这个文件能读、有 Tab0 页签，读不到会直接提示怎么处理，不会扣 Token。
+   4. 平时改规则：从控制台把 `master_sheet.xlsx` 下载下来，用 Excel 或 WPS 修改，可以改规则文字、删掉某条规则所在的行来停用它、改 `Tab0_版本总控与回滚开关` 里的 `Active_Prompt_Version` / `Active_Model_Version`。改完另存为 `.xlsx`，用同一个文件名上传覆盖。**不用重新部署**，最多 5 分钟（300 秒）后新任务就按新规则跑。不要改页签名称和表头。预检时会先确认这个文件能读、有 Tab0 页签，读不到会直接提示怎么处理，不会扣 Token。
    5. 两种管理和回滚 SOP 版本的方式：
-      - **方式 A（推荐，不用改配置，1 秒回滚）**：`master_prompt_sheet_id` 一直保持 `gs://<桶>/sop/master_sheet.xlsx`，平时同名上传覆盖，GCS 自动保留历史版本。需要回滚时，在 GCP 控制台打开这个文件的 **「版本历史记录 (Version history)」**，对想要的版本点 **「恢复 (Restore)」**；或者用命令 `gcloud storage cp gs://<桶>/sop/master_sheet.xlsx#<旧版本号> gs://<桶>/sop/master_sheet.xlsx`。60 秒内自动生效。
+      - **方式 A（推荐，不用改配置，1 秒回滚）**：`master_prompt_sheet_id` 一直保持 `gs://<桶>/sop/master_sheet.xlsx`，平时同名上传覆盖，GCS 自动保留历史版本。需要回滚时，在 GCP 控制台打开这个文件的 **「版本历史记录 (Version history)」**，对想要的版本点 **「恢复 (Restore)」**；或者用命令 `gcloud storage cp gs://<桶>/sop/master_sheet.xlsx#<旧版本号> gs://<桶>/sop/master_sheet.xlsx`。最多 5 分钟（300 秒）内自动生效。
       - **方式 B（在配置里锁死某一个版本）**：在 `master_prompt_sheet_id` 末尾带上版本号，比如 `gs://<桶>/sop/master_sheet.xlsx#1728547200123456`，系统就固定读取这个历史版本，之后再上传覆盖也不影响。控制台链接里带 `?generation=<版本号>` 也可以。版本号可以在「版本历史记录」里看到，上传脚本也会打印出来。
 
    不配外部 SOP 文件时，可以设置 `master_prompt_sheet_id = ""`，直接用内置的 V25 基准规则库，但规则要改就只能改代码重新部署。
-2. **授权**：在存放视频的存储桶上，把 `roles/storage.objectAdmin` 授予 Worker 服务账号（`<p>-worker@<项目ID>.iam.gserviceaccount.com`）。只读视频要 `objectViewer`；写回 Excel 报告和证据切片要 `objectAdmin`：
+2. **授权**：如果使用 Terraform 自动创建的 `<项目ID>-<p>-workspace` 桶，权限已自动配好；如果使用客户自己的其他存储桶，把 `roles/storage.objectAdmin` 授予 Worker 服务账号（`<p>-worker@<项目ID>.iam.gserviceaccount.com`）：
    ```bash
    gcloud storage buckets add-iam-policy-binding gs://<视频桶> \
      --member="serviceAccount:<p>-worker@<项目ID>.iam.gserviceaccount.com" --role="roles/storage.objectAdmin"
@@ -273,7 +285,7 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
    - `📁 违规证据切片_Evidence/`：每条违规对应的 20 秒 MP4 证据切片。
 
    任务完成时，GE 会回复 Excel 报告链接和这个 GCS 目录的控制台链接。
-5. **不能用的存储桶**：本服务自己的暂存桶（`STAGING_BUCKET`，`<项目ID>-<p>-staging`）整个桶都不能放门店视频、报告或 SOP 文件。它存的是任务状态和临时切片，而且所有文件 30 天后会被自动删除，系统会直接拒绝。请使用客户自己的存储桶（例如 `gs://<客户桶>/stores/<门店>/`）。
+5. **不能用的存储桶**：本服务自己的暂存桶（`STAGING_BUCKET`，`<项目ID>-<p>-staging`）整个桶都不能放门店视频、报告或 SOP 文件。它存的是任务状态和临时切片，而且所有文件 30 天后会被自动删除，系统会直接拒绝。请使用 `<项目ID>-<p>-workspace` 桶或客户自己的存储桶（例如 `gs://<客户桶>/stores/<门店>/`）。
 
 ## 7. 运行测试
 
@@ -313,7 +325,7 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 
 ## 9. 删除环境
 
-以下命令都需要项目 Owner 凭据，在仓库根目录按顺序执行。`terraform destroy` 会通过 `terraform_data.vertex_reasoning_engine` 的销毁钩子（`deploy/deploy_reasoning_engine.py destroy-stack`）自动清理该环境专属的 Gemini Enterprise Agent / 应用 / 数据存储、Vertex AI ReasoningEngine、Staging Bucket 内的缓存对象以及 Cloud Run 服务（严格校验 `service_account` 归属，绝不触碰同项目下的其他环境）：
+以下命令都需要项目 Owner 凭据，在仓库根目录按顺序执行。`terraform destroy` 会通过 `terraform_data.stack_teardown` 的销毁钩子（`deploy/deploy_reasoning_engine.py destroy-stack`）自动清理该环境专属的 Gemini Enterprise Agent / 应用 / 数据存储、Vertex AI ReasoningEngine、Staging Bucket 内的缓存对象以及 Cloud Run 服务（严格校验 `service_account` 归属，绝不触碰同项目下的其他环境）：
 
 1. **销毁主环境资源**：
    ```bash
