@@ -325,6 +325,30 @@ class EvalRecordsTest(unittest.TestCase):
         self.assertEqual(rec["metrics"]["mean_clip_latency_sec"], 360.0)
         self.assertAlmostEqual(rec["metrics"]["flip_rate"], 1 / 3, places=4)
 
+        # When prompt/thoughts/candidates token breakdown fields are present, cost must be
+        # recomputed uniformly at config rates ($0.75/1M input, $3.75/1M output+thinking)
+        # even if a historical ledger row carries a legacy estimated_cost_usd.
+        res_tok = mp.extract_run_resource_summary([
+            {
+                "token_ledger": [
+                    {
+                        "prompt_token_count": 400_000,
+                        "thoughts_token_count": 10_000,
+                        "candidates_token_count": 10_000,
+                        "total_token_count": 420_000,
+                        "estimated_cost_usd": 0.17,  # stale legacy rate ($0.30 / $2.50)
+                        "processing_latency_sec": 300.0,
+                    }
+                ]
+            }
+        ])
+        self.assertEqual(res_tok["prompt_token_count"], 400_000)
+        self.assertEqual(res_tok["thoughts_token_count"], 10_000)
+        self.assertEqual(res_tok["candidates_token_count"], 10_000)
+        self.assertEqual(res_tok["total_token_count"], 420_000)
+        self.assertAlmostEqual(res_tok["cost_per_clip_usd"], 0.375, places=6)
+        self.assertAlmostEqual(res_tok["total_cost_usd"], 0.375, places=6)
+
         with tempfile.TemporaryDirectory() as tmp:
             hist = Path(tmp) / "eval_history.jsonl"
             rec_a = {

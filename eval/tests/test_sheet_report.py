@@ -117,6 +117,16 @@ class SpecTest(unittest.TestCase):
         self.assertEqual(r08[items.col("人工标注原文")], "Footage 2: 080530 Soaping time is less than 20s")
         r11a = next(r for r in items.rows if r[0] == "R11a")
         self.assertEqual(r11a[items.col("标注时间点 (OSD)")], "12:10:36")
+        self.assertEqual(overview["Input Token 数 (含动态抽帧)"], record["metrics"]["prompt_token_count"])
+        self.assertEqual(overview["Thinking Token 数"], record["metrics"]["thoughts_token_count"])
+        self.assertEqual(overview["Output Token 数"], record["metrics"]["candidates_token_count"])
+        runs = spec.tables[3]
+        r01_row = next(r for r in runs.rows[1:] if r[runs.col("run_id")] == "r01_run1")
+        self.assertAlmostEqual(r01_row[runs.col("单视频平均成本 (USD)")], 0.331525, places=6)
+        self.assertEqual(r01_row[runs.col("Input Token 数")], 6183314)
+        self.assertEqual(r01_row[runs.col("Thinking Token 数")], 114826)
+        self.assertEqual(r01_row[runs.col("Output Token 数")], 63016)
+        self.assertEqual(r01_row[runs.col("总 Token 数")], 6361156)
 
     def test_percent_values_are_numbers_with_percent_format(self):
         spec = _spec()
@@ -223,6 +233,14 @@ class PublishTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, self.assertLogs("eval.sheet_report", "ERROR"):
             out = self._publish(tmp, folder_id=FOLDER, services=no_creds)
         self.assertEqual(out.status, "failed")
+
+    def test_update_report_spreadsheet_in_place(self):
+        spec = _spec()
+        sheets = FakeSheets()
+        url = srp.update_report_spreadsheet(spec, "SHEET123", sheets=sheets)
+        self.assertEqual(url, "https://docs.google.com/spreadsheets/d/SHEET123/edit")
+        self.assertEqual(len(sheets.batch_updates), 3)
+        self.assertEqual(len(sheets.value_updates), 1)
 
 
 if __name__ == "__main__":

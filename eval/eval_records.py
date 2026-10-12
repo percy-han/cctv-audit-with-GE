@@ -27,6 +27,7 @@ from pathlib import Path
 import re
 from typing import Any, Sequence
 
+from cctv_audit.config import config
 from eval.tune_loop import evaluate_run_guardrails
 
 logger = logging.getLogger("eval.eval_records")
@@ -35,7 +36,14 @@ DEFAULT_AGENT_EVAL_LOCATION = "us-central1"
 
 
 def extract_run_resource_summary(job_docs: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """Extract token usage, USD cost, latency, and active model/SOP version from folder job JSONs."""
+    """Extract token usage, USD cost, latency, and active model/SOP version from folder job JSONs.
+
+    Whenever per-clip token breakdown fields (``prompt_token_count``, ``thoughts_token_count``,
+    ``candidates_token_count``) are present in the ledger row, USD cost is computed uniformly from
+    those three buckets using ``config.input_cost_per_million_usd`` and
+    ``config.output_cost_per_million_usd`` so historical runs recorded before rate table updates
+    are compared on an apples-to-apples basis.
+    """
     ledger_rows: list[dict[str, Any]] = []
     model_version = ""
     sop_version = ""
@@ -75,8 +83,33 @@ def extract_run_resource_summary(job_docs: Sequence[dict[str, Any]]) -> dict[str
             sop_version = str(row["prompt_version_used"]).strip()
 
     clips_count = len(ledger_rows)
-    total_tokens = sum(int(r.get("total_token_count") or 0) for r in ledger_rows)
-    total_cost_usd = sum(float(r.get("estimated_cost_usd") or 0.0) for r in ledger_rows)
+    prompt_tokens = sum(int(r.get("prompt_token_count") or 0) for r in ledger_rows)
+    thoughts_tokens = sum(int(r.get("thoughts_token_count") or 0) for r in ledger_rows)
+    candidates_tokens = sum(int(r.get("candidates_token_count") or 0) for r in ledger_rows)
+    total_tokens = sum(
+        int(r.get("total_token_count") or 0)
+        or (
+            int(r.get("prompt_token_count") or 0)
+            + int(r.get("thoughts_token_count") or 0)
+            + int(r.get("candidates_token_count") or 0)
+        )
+        for r in ledger_rows
+    )
+
+    total_cost_usd = 0.0
+    for r in ledger_rows:
+        p_tok = int(r.get("prompt_token_count") or 0)
+        t_tok = int(r.get("thoughts_token_count") or 0)
+        c_tok = int(r.get("candidates_token_count") or 0)
+        if (p_tok + t_tok + c_tok) > 0:
+            row_cost = (
+                (p_tok / 1_000_000.0) * config.input_cost_per_million_usd
+                + ((t_tok + c_tok) / 1_000_000.0) * config.output_cost_per_million_usd
+            )
+        else:
+            row_cost = float(r.get("estimated_cost_usd") or 0.0)
+        total_cost_usd += row_cost
+
     latencies_sec: list[float] = []
     for r in ledger_rows:
         if r.get("e2e_latency_ms") is not None:
@@ -90,6 +123,9 @@ def extract_run_resource_summary(job_docs: Sequence[dict[str, Any]]) -> dict[str
         "model_version": model_version or "unknown",
         "sop_version": sop_version or "unknown",
         "clips_count": clips_count,
+        "prompt_token_count": prompt_tokens,
+        "thoughts_token_count": thoughts_tokens,
+        "candidates_token_count": candidates_tokens,
         "total_token_count": total_tokens,
         "total_cost_usd": round(total_cost_usd, 6),
         "cost_per_clip_usd": round(total_cost_usd / clips_count, 6) if clips_count else 0.0,
@@ -243,6 +279,9 @@ def build_eval_monitoring_record(
             "total_cost_usd": res_summary["total_cost_usd"],
             "mean_clip_latency_sec": res_summary["mean_clip_latency_sec"],
             "max_clip_latency_sec": res_summary["max_clip_latency_sec"],
+            "prompt_token_count": res_summary["prompt_token_count"],
+            "thoughts_token_count": res_summary["thoughts_token_count"],
+            "candidates_token_count": res_summary["candidates_token_count"],
             "total_token_count": res_summary["total_token_count"],
         },
         "sop_category_recall": score_doc.get("sop_category_recall") or {},
@@ -315,8 +354,9 @@ def aggregate_round_monitoring_record(records_for_round: Sequence[dict[str, Any]
     avg_metrics["window_sec"] = int(last_m.get("window_sec", 60))
     max_lat_vals = [float((r.get("metrics") or {}).get("max_clip_latency_sec") or 0.0) for r in records_for_round]
     avg_metrics["max_clip_latency_sec"] = round(max(max_lat_vals), 3) if max_lat_vals else 0.0
-    tok_vals = [int((r.get("metrics") or {}).get("total_token_count") or 0) for r in records_for_round]
-    avg_metrics["total_token_count"] = int(round(sum(tok_vals) / n))
+    for tok_key in ("prompt_token_count", "thoughts_token_count", "candidates_token_count", "total_token_count"):
+        tok_vals = [int((r.get("metrics") or {}).get(tok_key) or 0) for r in records_for_round]
+        avg_metrics[tok_key] = int(round(sum(tok_vals) / n))
 
     # Aggregate sop_category_recall
     cat_keys = sorted({k for r in records_for_round for k in (r.get("sop_category_recall") or {})})

@@ -230,11 +230,16 @@ def build_overview_table(
     add("同轮次翻转率 (flip_rate)", m.get("flip_rate"), "同一轮次多次运行间得分变化的题目比例", PERCENT)
     add("瞬时动作时间漂移均值 (秒)", m.get("mean_point_timestamp_drift_sec"), "仅 POINT 规则 (±20s)", DECIMAL_2)
     add("瞬时动作时间漂移最大 (秒)", m.get("max_point_timestamp_drift_sec"), "", INTEGER)
-    add("单视频平均成本 (USD)", m.get("cost_per_clip_usd"), "", USD)
+    add("单视频平均成本 (USD)", m.get("cost_per_clip_usd"),
+        "按 Input ($0.75/1M) + Thinking ($3.75/1M) + Output ($3.75/1M) 统一折算", USD)
     add("本次总成本 (USD)", m.get("total_cost_usd"), "稽核模型调用，不含裁判", USD)
     add("单视频平均耗时 (秒)", m.get("mean_clip_latency_sec"), "", DECIMAL_2)
     add("单视频最大耗时 (秒)", m.get("max_clip_latency_sec"), "", DECIMAL_2)
-    add("总 Token 数", m.get("total_token_count"), "", INTEGER)
+    add("Input Token 数 (含动态抽帧)", m.get("prompt_token_count"),
+        "视频流 + 提示词 + Agentic 动态高清抽帧回传 (tool_use)", INTEGER)
+    add("Thinking Token 数", m.get("thoughts_token_count"), "模型内部多步视觉推演消耗", INTEGER)
+    add("Output Token 数", m.get("candidates_token_count"), "最终结构化 JSON 报告输出", INTEGER)
+    add("总 Token 数", m.get("total_token_count"), "Input + Thinking + Output 合计", INTEGER)
     rows.append([
         "说明",
         "召回率由 eval/score_run.py 在本地评分一次得出，是权威数字；本表只展示 score.json 与 "
@@ -370,7 +375,9 @@ def build_runs_table(history: Sequence[dict[str, Any]], current_run_id: str) -> 
     header = [
         "运行", "本次", "round_id", "run_id", "SOP 版本", "模型版本", "视频模式",
         "总体召回率", "留出集召回率", "开发集召回率", "平均告警数 / 视频", GUARDRAIL_HEADER,
-        "时间漂移均值 (秒)", "单视频平均成本 (USD)", "总成本 (USD)", "单视频平均耗时 (秒)", "护栏通过",
+        "时间漂移均值 (秒)", "单视频平均成本 (USD)", "总成本 (USD)",
+        "Input Token 数", "Thinking Token 数", "Output Token 数", "总 Token 数",
+        "单视频平均耗时 (秒)", "护栏通过",
     ]
     rows: list[list[Any]] = [header]
     for rec in history:
@@ -382,7 +389,10 @@ def build_runs_table(history: Sequence[dict[str, Any]], current_run_id: str) -> 
             _blank(m.get("overall_recall")), _blank(m.get("holdout_recall")), _blank(m.get("dev_recall")),
             _blank(m.get("findings_per_clip")), MAX_MEAN_ALERT_DENSITY,
             _blank(m.get("mean_point_timestamp_drift_sec")), _blank(m.get("cost_per_clip_usd")),
-            _blank(m.get("total_cost_usd")), _blank(m.get("mean_clip_latency_sec")),
+            _blank(m.get("total_cost_usd")),
+            _blank(m.get("prompt_token_count")), _blank(m.get("thoughts_token_count")),
+            _blank(m.get("candidates_token_count")), _blank(m.get("total_token_count")),
+            _blank(m.get("mean_clip_latency_sec")),
             "是" if m.get("guardrails_passed") else "否",
         ])
     t = Table(TAB_RUNS, rows)
@@ -391,6 +401,8 @@ def build_runs_table(history: Sequence[dict[str, Any]], current_run_id: str) -> 
         t.col_formats[t.col(h)] = DECIMAL_2
     for h in ("单视频平均成本 (USD)", "总成本 (USD)"):
         t.col_formats[t.col(h)] = USD
+    for h in ("Input Token 数", "Thinking Token 数", "Output Token 数", "总 Token 数"):
+        t.col_formats[t.col(h)] = INTEGER
     return t
 
 
@@ -622,6 +634,39 @@ def create_report_spreadsheet(spec: ReportSpec, folder_id: str, *, drive: Any, s
     return sid, url
 
 
+def update_report_spreadsheet(spec: ReportSpec, spreadsheet_id: str, *, sheets: Any) -> str:
+    """Refreshes an existing report spreadsheet in-place (preserving its file ID and URL)."""
+    sid = str(spreadsheet_id).strip()
+    url = f"https://docs.google.com/spreadsheets/d/{sid}/edit"
+    scratch_sheet_id = 999
+    try:
+        meta = sheets.spreadsheets().get(
+            spreadsheetId=sid, fields="sheets.properties(sheetId,title)").execute(num_retries=3)
+        existing_ids = [int(s["properties"]["sheetId"]) for s in meta.get("sheets", [])]
+        prep_reqs: list[dict[str, Any]] = []
+        if scratch_sheet_id not in existing_ids:
+            prep_reqs.append({"addSheet": {"properties": {"sheetId": scratch_sheet_id, "title": "_refresh_tmp"}}})
+        for eid in existing_ids:
+            if eid != scratch_sheet_id:
+                prep_reqs.append({"deleteSheet": {"sheetId": eid}})
+        if prep_reqs:
+            sheets.spreadsheets().batchUpdate(
+                spreadsheetId=sid, body={"requests": prep_reqs}
+            ).execute(num_retries=3)
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=sid, body={"requests": build_structure_requests(spec, [scratch_sheet_id])}
+        ).execute(num_retries=3)
+        sheets.spreadsheets().values().batchUpdate(
+            spreadsheetId=sid, body={"valueInputOption": "RAW", "data": build_value_ranges(spec)}
+        ).execute(num_retries=3)
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=sid, body={"requests": build_format_requests(spec) + spec.chart_requests}
+        ).execute(num_retries=3)
+    except Exception as exc:
+        raise SheetReportError(f"表格原地刷新失败（{url}）：{exc}") from exc
+    return url
+
+
 def _describe_error(exc: BaseException, folder_id: str) -> str:
     try:
         from cctv_audit.gcp import _classify_write_error
@@ -732,6 +777,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--golden", default=os.environ.get("EVAL_GOLDEN_URI", "") or str(DEFAULT_GOLDEN_PATH),
                         help="Golden the run was scored on (only for label texts / overrides); local or gs://")
     parser.add_argument("--folder-id", default=None, help=f"Default: env {ENV_FOLDER_ID}")
+    parser.add_argument("--update-sheet-id", default=None,
+                        help="Refresh an existing spreadsheet ID in-place instead of creating a new file")
     parser.add_argument("--time-zone", default=None, help=f"Default: env {ENV_TIME_ZONE} or {DEFAULT_TIME_ZONE}")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the spreadsheet title, cell values and batchUpdate requests; call no API")
@@ -760,6 +807,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "format_requests": build_format_requests(spec),
             "chart_requests": spec.chart_requests,
         }, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.update_sheet_id:
+        spec = build_report_spec(history=history, score_doc=score_doc, run_record=run_record,
+                                 golden_items=golden, time_zone=tz_name)
+        _, sheets = default_services()
+        url = update_report_spreadsheet(spec, str(args.update_sheet_id), sheets=sheets)
+        print(f"Sheet report updated in-place: {url}")
         return 0
 
     folder = (args.folder_id if args.folder_id is not None else os.environ.get(ENV_FOLDER_ID, "")).strip()
