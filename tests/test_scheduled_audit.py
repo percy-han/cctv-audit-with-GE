@@ -2051,6 +2051,202 @@ def test_preflight_rejected_store_preserves_error_message_in_batch_and_portal(
     asyncio.run(_run())
 
 
+def test_tab3_eval_workbench_parsing_and_dropdown_validations() -> None:
+    """Verifies Tab3_黄金集评测工作台 row parsing, error diagnostics, and native dropdown validations."""
+    from cctv_audit.prompt_manager import (
+        EVAL_WORKBENCH_HEADERS,
+        build_master_sheet_validation_requests,
+        parse_scheduled_eval_rules_with_diagnostics,
+    )
+
+    rows = [
+        list(EVAL_WORKBENCH_HEADERS),
+        [
+            "EVAL-01",
+            "V10 基线评测",
+            "Prompt_v2.5_V10全量17条标准版",
+            "gemini-3.1-flash-preview",
+            "https://docs.google.com/spreadsheets/d/1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w/edit",
+            "https://drive.google.com/drive/folders/1ky221gNbzgIT83981ghVpFc03and4s-g",
+            "supervisor@chagee.com",
+            "START_EVAL",
+            "",
+        ],
+        [
+            "EVAL-BAD-TAB",
+            "无效 SOP 标签页",
+            "Prompt_NonExistent",
+            "gemini-3.1-flash-preview",
+            "https://docs.google.com/spreadsheets/d/1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w/edit",
+            "https://drive.google.com/drive/folders/1ky221gNbzgIT83981ghVpFc03and4s-g",
+            "supervisor@chagee.com",
+            "START_EVAL",
+            "",
+        ],
+    ]
+    valid_rules, row_errors = parse_scheduled_eval_rules_with_diagnostics(
+        rows,
+        available_prompt_tabs=["Prompt_v2.5_V10全量17条标准版", "Prompt_v2.6_r02"],
+    )
+    assert len(valid_rules) == 1
+    assert valid_rules[0].eval_id == "EVAL-01"
+    assert valid_rules[0].trigger_action == "START_EVAL"
+    assert valid_rules[0].golden_source_id == "1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w"
+    assert valid_rules[0].results_folder_id == "1ky221gNbzgIT83981ghVpFc03and4s-g"
+    assert len(row_errors) == 1
+    assert row_errors[0].row_index == 3
+    assert "Prompt_NonExistent" in row_errors[0].error_message
+
+    sheet_meta = {
+        "sheets": [
+            {"properties": {"title": "Tab0_版本总控与回滚开关", "sheetId": 10}},
+            {"properties": {"title": "Prompt_v2.5_V10全量17条标准版", "sheetId": 11}},
+            {"properties": {"title": "Prompt_v2.6_r02", "sheetId": 12}},
+            {"properties": {"title": "Tab2_定时巡检配置表", "sheetId": 20}},
+            {"properties": {"title": "Tab3_黄金集评测工作台", "sheetId": 30}},
+        ]
+    }
+    reqs = build_master_sheet_validation_requests(sheet_meta)
+    tab3_reqs = [
+        r["setDataValidation"]
+        for r in reqs
+        if "setDataValidation" in r
+        and r["setDataValidation"]["range"]["sheetId"] == 30
+    ]
+    assert len(tab3_reqs) == 4
+
+
+def test_tab3_eval_workbench_tick_lifecycle_and_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies Tab3_黄金集评测工作台 15m tick:
+    1. Row with missing Results_Folder_URL (and empty EVAL_RESULTS_FOLDER_ID) fails 0-Token preflight -> Trigger_Action = 'FAILED'.
+    2. Valid START_EVAL row transitions START_EVAL -> RUNNING -> DONE, writes 5-tab Sheet URL back to Tab3,
+       releases/marks the eval lock DONE, and sends Google Chat completion notification.
+    """
+    from cctv_audit.prompt_manager import ScheduledEvalRule
+
+    async def _run() -> None:
+        monkeypatch.delenv("EVAL_RESULTS_FOLDER_ID", raising=False)
+        job_store = UserScopedJobStore(state_dir=tmp_path / "jobs")
+        state_store = ScheduledStateStore(local_dir=tmp_path / "state")
+        svc = AuditService(job_store=job_store)
+
+        tab3_updates: List[Tuple[int, str, str]] = []
+        eval_chat_notifications: List[Dict[str, Any]] = []
+
+        async def _update_eval_row(
+            row_index: int,
+            *,
+            trigger_action: Optional[str] = None,
+            last_eval_report: Optional[str] = None,
+            sheet_id: Optional[str] = None,
+        ) -> bool:
+            tab3_updates.append((row_index, str(trigger_action or ""), str(last_eval_report or "")))
+            return True
+
+        async def _load_config_for_tab(
+            prompt_tab_name: str,
+            model_version: str,
+            sheet_id: Optional[str] = None,
+        ) -> Any:
+            return await svc.prompt_manager.load_active_config()
+
+        async def _send_eval_chat(**kwargs: Any) -> bool:
+            eval_chat_notifications.append(kwargs)
+            return True
+
+        monkeypatch.setattr(svc.prompt_manager, "update_scheduled_eval_row", _update_eval_row)
+        monkeypatch.setattr(svc.prompt_manager, "load_config_for_tab", _load_config_for_tab)
+        monkeypatch.setattr(svc.reporter, "send_eval_completion_notification", _send_eval_chat)
+        monkeypatch.setattr(svc.prompt_manager, "load_scheduled_rules", lambda: asyncio.sleep(0, result=[]))
+
+        rule_bad_folder = ScheduledEvalRule(
+            row_index=2,
+            eval_id="EVAL-NO-FOLDER",
+            eval_name="缺少归档目录测试",
+            prompt_tab_name="Prompt_v2.5_V10全量17条标准版",
+            model_version="gemini-3.1-flash-preview",
+            golden_sheet_url="https://docs.google.com/spreadsheets/d/1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w/edit",
+            golden_source_id="1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w",
+            results_folder_url="",
+            results_folder_id="",
+            supervisor_email="supervisor@chagee.com",
+            trigger_action="START_EVAL",
+            last_eval_report="",
+        )
+        rule_ok = ScheduledEvalRule(
+            row_index=3,
+            eval_id="EVAL-OK-01",
+            eval_name="V10.2 候选评测",
+            prompt_tab_name="Prompt_v2.6_r02",
+            model_version="gemini-3.1-flash-preview",
+            golden_sheet_url="https://docs.google.com/spreadsheets/d/1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w/edit",
+            golden_source_id="1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w",
+            results_folder_url="https://drive.google.com/drive/folders/1ky221gNbzgIT83981ghVpFc03and4s-g",
+            results_folder_id="1ky221gNbzgIT83981ghVpFc03and4s-g",
+            supervisor_email="supervisor@chagee.com",
+            trigger_action="START_EVAL",
+            last_eval_report="",
+        )
+
+        async def _load_eval_rules(sheet_id: Optional[str] = None) -> List[ScheduledEvalRule]:
+            return [rule_bad_folder, rule_ok]
+
+        monkeypatch.setattr(svc.prompt_manager, "load_scheduled_eval_rules", _load_eval_rules)
+
+        async def _fake_eval_runner(task_rec: Any) -> Dict[str, Any]:
+            return {
+                "eval_id": task_rec.eval_id,
+                "eval_name": task_rec.eval_name,
+                "round_id": "eval_ok_01",
+                "run_id": task_rec.eval_task_id,
+                "prompt_tab_name": task_rec.prompt_tab_name,
+                "model_version": task_rec.model_version,
+                "overall_recall": 0.421,
+                "holdout_recall": 0.444,
+                "dev_recall": 0.400,
+                "findings_per_clip": 5.5,
+                "hit_rate": 0.5625,
+                "guardrails_passed": True,
+                "total_cost_usd": 3.45,
+                "total_tokens": 128000,
+                "spreadsheet_url": "https://docs.google.com/spreadsheets/d/eval_sheet_999/edit",
+                "spreadsheet_id": "eval_sheet_999",
+                "sheet_error": None,
+            }
+
+        engine = ScheduledAuditEngine(
+            audit_service=svc,
+            state_store=state_store,
+            eval_runner=_fake_eval_runner,
+        )
+        res = await engine.run_scheduled_tick(
+            now_utc=dt.datetime(2026, 10, 16, 14, 0, tzinfo=dt.timezone.utc)
+        )
+        assert res["status"] == "triggered"
+        assert len(res["triggered_evals"]) == 2
+        assert res["triggered_evals"][0]["status"] == "preflight_failed"
+        assert res["triggered_evals"][1]["status"] == "dispatched"
+
+        # Row 2 was marked FAILED on preflight
+        row2_updates = [u for u in tab3_updates if u[0] == 2]
+        assert len(row2_updates) == 1
+        assert row2_updates[0][1] == "FAILED"
+        assert "Results_Folder_URL" in row2_updates[0][2]
+
+        # Row 3 transitioned START_EVAL -> RUNNING -> DONE with report link
+        row3_updates = [u for u in tab3_updates if u[0] == 3]
+        assert [u[1] for u in row3_updates] == ["RUNNING", "DONE"]
+        assert "https://docs.google.com/spreadsheets/d/eval_sheet_999/edit" in row3_updates[-1][2]
+        assert "42.1%" in row3_updates[-1][2]
+        assert len(eval_chat_notifications) == 1
+        assert eval_chat_notifications[0]["status"] == "DONE"
+
+    asyncio.run(_run())
+
+
+
 
 
 

@@ -74,6 +74,8 @@ INTEGER = {"type": "NUMBER", "pattern": "#,##0"}
 CHART_WIDTH_PX = 900
 CHART_HEIGHT_PX = 380
 CHART_ROW_STRIDE = 21  # rows between stacked charts (~380 px at the default 21 px row height)
+MAX_CHART_ROUNDS = 12
+MAX_CHART_RUNS = 15
 
 
 # --------------------------------------------------------------------------------------- pure layer
@@ -406,7 +408,35 @@ def build_runs_table(history: Sequence[dict[str, Any]], current_run_id: str) -> 
     return t
 
 
-def _col_range(sheet_id: int, col: int, n_rows: int) -> dict[str, Any]:
+def _col_range(
+    sheet_id: int,
+    col: int,
+    n_rows: int,
+    *,
+    max_data_rows: int | None = None,
+) -> dict[str, Any]:
+    if max_data_rows is not None and max_data_rows > 0 and (n_rows - 1) > max_data_rows:
+        start_data_row = n_rows - max_data_rows
+        return {
+            "sourceRange": {
+                "sources": [
+                    {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": 1,
+                        "startColumnIndex": col,
+                        "endColumnIndex": col + 1,
+                    },
+                    {
+                        "sheetId": sheet_id,
+                        "startRowIndex": start_data_row,
+                        "endRowIndex": n_rows,
+                        "startColumnIndex": col,
+                        "endColumnIndex": col + 1,
+                    },
+                ]
+            }
+        }
     return {"sourceRange": {"sources": [{
         "sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": n_rows,
         "startColumnIndex": col, "endColumnIndex": col + 1,
@@ -423,6 +453,7 @@ def build_chart_request(
     left_title: str,
     right_title: str = "",
     anchor_row: int,
+    max_data_rows: int | None = None,
 ) -> dict[str, Any]:
     """A native ``basicChart`` whose domain is the text label column, so the X axis is categorical."""
     n = len(table.rows)
@@ -440,9 +471,9 @@ def build_chart_request(
                 "legendPosition": "BOTTOM_LEGEND",
                 "headerCount": 1,
                 "axis": axis,
-                "domains": [{"domain": _col_range(table.sheet_id, table.col(domain_header), n)}],
+                "domains": [{"domain": _col_range(table.sheet_id, table.col(domain_header), n, max_data_rows=max_data_rows)}],
                 "series": [
-                    {"series": _col_range(table.sheet_id, table.col(h), n), "type": typ, "targetAxis": ax}
+                    {"series": _col_range(table.sheet_id, table.col(h), n, max_data_rows=max_data_rows), "type": typ, "targetAxis": ax}
                     for h, typ, ax in series
                 ],
             },
@@ -464,25 +495,29 @@ def build_chart_requests(rounds: Table, cats: Sequence[str], ofs: Sequence[str],
             rounds, title="图1 各轮次核心召回率与告警命中率", domain_header="轮次",
             series=[("总体召回率", "COLUMN", "LEFT_AXIS"), ("留出集召回率", "COLUMN", "LEFT_AXIS"),
                     ("开发集召回率", "COLUMN", "LEFT_AXIS"), ("告警命中率", "LINE", "LEFT_AXIS")],
-            bottom_title="轮次 · SOP 版本", left_title="比例", anchor_row=base),
+            bottom_title="轮次 · SOP 版本", left_title="比例", anchor_row=base,
+            max_data_rows=MAX_CHART_ROUNDS),
     ]
     if cats:
         reqs.append(build_chart_request(
             rounds, title="图2 各轮次按 SOP 大类召回率", domain_header="轮次",
             series=[(c, "COLUMN", "LEFT_AXIS") for c in cats],
-            bottom_title="轮次 · SOP 版本", left_title="召回率", anchor_row=base + CHART_ROW_STRIDE))
+            bottom_title="轮次 · SOP 版本", left_title="召回率", anchor_row=base + CHART_ROW_STRIDE,
+            max_data_rows=MAX_CHART_ROUNDS))
     if ofs:
         reqs.append(build_chart_request(
             rounds, title="图3 各轮次按门店 × 稽核重点召回率", domain_header="轮次",
             series=[(o, "COLUMN", "LEFT_AXIS") for o in ofs],
-            bottom_title="轮次 · SOP 版本", left_title="召回率", anchor_row=base + 2 * CHART_ROW_STRIDE))
+            bottom_title="轮次 · SOP 版本", left_title="召回率", anchor_row=base + 2 * CHART_ROW_STRIDE,
+            max_data_rows=MAX_CHART_ROUNDS))
     reqs.append(build_chart_request(
         runs, title=f"图4 每次运行的告警密度 / 时间漂移 / 单视频成本（守卫线 {MAX_MEAN_ALERT_DENSITY:.1f} 条/视频）",
         domain_header="运行",
         series=[("平均告警数 / 视频", "COLUMN", "LEFT_AXIS"), ("时间漂移均值 (秒)", "COLUMN", "LEFT_AXIS"),
                 (GUARDRAIL_HEADER, "LINE", "LEFT_AXIS"), ("单视频平均成本 (USD)", "LINE", "RIGHT_AXIS")],
         bottom_title="轮次 · 运行", left_title="条/视频 · 秒", right_title="USD / 视频",
-        anchor_row=len(runs.rows) + 2))
+        anchor_row=len(runs.rows) + 2,
+        max_data_rows=MAX_CHART_RUNS))
     return reqs
 
 

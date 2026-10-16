@@ -39,7 +39,7 @@ from pydantic import BaseModel, Field
 from .config import config
 from .gcs_gateway import EVIDENCE_DIR_MARKER, is_gcs_target, parse_gcs_uri
 from .jobs import AuditJob, JobState
-from .prompt_manager import PromptManager, ScheduledAuditRule
+from .prompt_manager import PromptManager, ScheduledAuditRule, ScheduledEvalRule
 from .video_ingestor import VideoMetadataItem, natural_video_sort_key
 from .workspace_reporter import EVIDENCE_SUBFOLDER_NAME
 
@@ -126,6 +126,28 @@ class DiscoveredVideoCandidate(BaseModel):
     duration_sec: float = 300.0
     mime_type: str = "video/mp4"
     size_bytes: int = 0
+
+
+class ScheduledEvalTaskRecord(BaseModel):
+    """State record for one Sheet-triggered golden-set evaluation (`Tab3_黄金集评测工作台`) stored at `eval_tasks/{eval_task_id}.json`."""
+
+    eval_task_id: str
+    eval_id: str
+    eval_name: str
+    row_index: int
+    prompt_tab_name: str
+    model_version: str
+    golden_sheet_url: str
+    golden_source_id: str
+    results_folder_url: str = ""
+    results_folder_id: str = ""
+    supervisor_email: str
+    state: str = "RUNNING"
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
+    report_sheet_url: str = ""
+    summary_text: str = ""
+    error_message: str = ""
 
 
 class PreconditionFailedError(RuntimeError):
@@ -289,6 +311,14 @@ class ScheduledStateStore:
     @staticmethod
     def batch_key(batch_id: str) -> str:
         return f"batches/{batch_id}.json"
+
+    @staticmethod
+    def eval_lock_key(eval_id: str) -> str:
+        return f"schedules/eval_locks/{_safe_slug(eval_id)}.json"
+
+    @staticmethod
+    def eval_task_key(eval_task_id: str) -> str:
+        return f"eval_tasks/{eval_task_id}.json"
 
 
 def is_rule_due(
@@ -657,11 +687,13 @@ class ScheduledAuditEngine:
         state_store: Optional[ScheduledStateStore] = None,
         drive_service_factory: Optional[Callable[[str], Any]] = None,
         cloud_run_job_dispatcher: Optional[Callable[[AuditJob], Any]] = None,
+        eval_runner: Optional[Callable[..., Any]] = None,
     ) -> None:
         self.service = audit_service
         self.state_store = state_store if state_store is not None else ScheduledStateStore()
         self._drive_service_factory = drive_service_factory
         self._cloud_run_job_dispatcher = cloud_run_job_dispatcher
+        self._eval_runner = eval_runner
 
     def _get_drive_service(self, supervisor_email: str) -> Any:
         if self._drive_service_factory is not None:
@@ -1139,6 +1171,465 @@ class ScheduledAuditEngine:
         )
         return True
 
+    def try_acquire_eval_lock(self, eval_id: str, eval_task_id: str, now_ts: float) -> bool:
+        """Atomically acquires `schedules/eval_locks/{safe_eval_id}.json` (`if_generation_match=0`).
+
+        If an older lock exists whose `state` is terminal (`DONE` / `FAILED`) or stale (`> 24h`),
+        CAS-updates it (`if_generation_match=existing_gen`) to claim the new run.
+        """
+        key = self.state_store.eval_lock_key(eval_id)
+        payload = json.dumps(
+            {
+                "eval_id": eval_id,
+                "eval_task_id": eval_task_id,
+                "state": "RUNNING",
+                "acquired_at": now_ts,
+                "updated_at": now_ts,
+            },
+            ensure_ascii=False,
+        )
+        try:
+            self.state_store.write_text_cas(key, payload, if_generation_match=0)
+            return True
+        except PreconditionFailedError:
+            raw_existing, existing_gen = self.state_store.read_text_with_generation(key)
+            if raw_existing and existing_gen > 0:
+                try:
+                    existing_doc = json.loads(raw_existing)
+                except Exception:
+                    existing_doc = {}
+                prev_state = str(existing_doc.get("state") or "").upper()
+                prev_ts = float(existing_doc.get("updated_at") or existing_doc.get("acquired_at") or 0.0)
+                if prev_state in ("DONE", "FAILED", "IDLE") or (now_ts - prev_ts) >= 86400.0:
+                    try:
+                        self.state_store.write_text_cas(
+                            key, payload, if_generation_match=existing_gen
+                        )
+                        return True
+                    except PreconditionFailedError:
+                        return False
+            return False
+
+    def finish_eval_lock(self, eval_id: str, eval_task_id: str, state: str) -> None:
+        """Marks `schedules/eval_locks/{safe_eval_id}.json` as `DONE` or `FAILED` so future `START_EVAL` runs can acquire it."""
+        key = self.state_store.eval_lock_key(eval_id)
+        for _ in range(3):
+            raw_existing, existing_gen = self.state_store.read_text_with_generation(key)
+            if raw_existing is None or existing_gen <= 0:
+                return
+            try:
+                doc = json.loads(raw_existing)
+            except Exception:
+                doc = {"eval_id": eval_id}
+            if doc.get("eval_task_id") and doc.get("eval_task_id") != eval_task_id:
+                return
+            doc["state"] = state
+            doc["updated_at"] = time.time()
+            try:
+                self.state_store.write_text_cas(
+                    key, json.dumps(doc, ensure_ascii=False), if_generation_match=existing_gen
+                )
+                return
+            except PreconditionFailedError:
+                time.sleep(0.05)
+
+    async def _preflight_scheduled_eval_rule(self, rule: ScheduledEvalRule) -> Tuple[bool, str, str]:
+        """Runs a fast 0-Token preflight check on a `Tab3_黄金集评测工作台` row before dispatching a Cloud Run Job.
+
+        Returns `(passed, error_message, effective_results_folder_id)`.
+        """
+        effective_results_folder_id = (
+            str(rule.results_folder_id or "").strip()
+            or os.environ.get("EVAL_RESULTS_FOLDER_ID", "").strip()
+        )
+        if not effective_results_folder_id:
+            return (
+                False,
+                "❌ 评测预检未通过：未配置 Results_Folder_URL（且系统环境变量 EVAL_RESULTS_FOLDER_ID 为空），无法保存 5-Tab 测评报告 Sheet（0 Token 消耗）",
+                "",
+            )
+
+        # 1. Verify Prompt_Tab_Name exists and is parseable + Model_Version is valid
+        load_tab_fn = getattr(self.service.prompt_manager, "load_config_for_tab", None)
+        if callable(load_tab_fn):
+            try:
+                await load_tab_fn(
+                    prompt_tab_name=rule.prompt_tab_name,
+                    model_version=rule.model_version,
+                )
+            except Exception as exc:
+                return (
+                    False,
+                    f"❌ 评测预检未通过：SOP 标签页 '{rule.prompt_tab_name}' 或模型 '{rule.model_version}' 校验失败（{str(exc)[:180]}）（0 Token 消耗）",
+                    effective_results_folder_id,
+                )
+
+        # 2. If Drive service factory is configured or running in production, verify Results_Folder_URL write permission
+        if self._drive_service_factory is not None:
+            try:
+                drive_svc = await asyncio.to_thread(
+                    self._get_drive_service, rule.supervisor_email
+                )
+                folder_meta = await asyncio.to_thread(
+                    lambda: drive_svc.files()
+                    .get(
+                        fileId=effective_results_folder_id,
+                        fields="id,name,capabilities(canAddChildren)",
+                        supportsAllDrives=True,
+                    )
+                    .execute()
+                )
+                caps = folder_meta.get("capabilities") or {}
+                if caps.get("canAddChildren") is False:
+                    return (
+                        False,
+                        f"❌ 评测预检未通过：结果归档目录 ({effective_results_folder_id}) 缺少写入权限 (canAddChildren=False)（0 Token 消耗）",
+                        effective_results_folder_id,
+                    )
+            except Exception as exc:
+                return (
+                    False,
+                    f"❌ 评测预检未通过：无法访问结果归档目录 ({effective_results_folder_id})：{str(exc)[:160]}（0 Token 消耗）",
+                    effective_results_folder_id,
+                )
+
+        return True, "", effective_results_folder_id
+
+    def _trigger_cloud_run_eval_job_sync(self, eval_task_id: str) -> bool:
+        """Calls Cloud Run Admin API v2 `jobs/{job_name}:run` with `CCTV_EVAL_TASK_ID` override."""
+        job_name = (config.cloud_run_job_name or "").strip()
+        project = (config.gcp_project or "").strip()
+        region = (config.gcp_location or "").strip()
+        if not job_name or not project or not region:
+            return False
+
+        import google.auth
+        import google.auth.transport.requests
+
+        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        if not creds.valid:
+            creds.refresh(google.auth.transport.requests.Request())
+
+        url = (
+            f"https://run.googleapis.com/v2/projects/{urllib.parse.quote(project, safe='')}"
+            f"/locations/{urllib.parse.quote(region, safe='')}"
+            f"/jobs/{urllib.parse.quote(job_name, safe='')}:run"
+        )
+        body = {
+            "overrides": {
+                "containerOverrides": [
+                    {
+                        "env": [
+                            {"name": "CCTV_EVAL_TASK_ID", "value": eval_task_id},
+                        ]
+                    }
+                ]
+            }
+        }
+        data = json.dumps(body).encode("utf-8")
+        for attempt in range(1, 4):
+            req = urllib.request.Request(
+                url,
+                data=data,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {creds.token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=20.0) as resp:
+                    if 200 <= resp.status < 300:
+                        logger.info(
+                            "Triggered Cloud Run Job %s for ScheduledEvalTask %s",
+                            job_name,
+                            eval_task_id,
+                        )
+                        return True
+            except urllib.error.HTTPError as exc:
+                if exc.code in (429, 502, 503, 504) and attempt < 3:
+                    time.sleep(1.0 * attempt)
+                    continue
+                logger.error(
+                    "Cloud Run Job %s :run failed for eval_task %s (HTTP %s): %s",
+                    job_name,
+                    eval_task_id,
+                    exc.code,
+                    exc.read().decode("utf-8", "replace")[:300],
+                )
+                return False
+            except Exception as exc:
+                logger.error(
+                    "Cloud Run Job %s :run error for eval_task %s: %s",
+                    job_name,
+                    eval_task_id,
+                    exc,
+                )
+                return False
+        return False
+
+    async def dispatch_eval_job(self, task_rec: ScheduledEvalTaskRecord) -> None:
+        """Dispatches a `ScheduledEvalTaskRecord` to Cloud Run Jobs (24h) or in-process fallback."""
+        if config.cloud_run_job_name and not os.environ.get("PYTEST_CURRENT_TEST"):
+            dispatched = await asyncio.to_thread(
+                self._trigger_cloud_run_eval_job_sync, task_rec.eval_task_id
+            )
+            if dispatched:
+                return
+            logger.warning(
+                "Cloud Run Job dispatch returned False for eval_task %s; falling back to in-process execution",
+                task_rec.eval_task_id,
+            )
+
+        await self.execute_scheduled_eval_task(task_rec.eval_task_id)
+
+    async def execute_scheduled_eval_task(
+        self, eval_task_id: str
+    ) -> Optional[ScheduledEvalTaskRecord]:
+        """Executes a `ScheduledEvalTaskRecord` inside the 24h Cloud Run Job worker, writes the report
+        link & metrics back to `Tab3_黄金集评测工作台`, and sends a Google Chat completion card.
+        """
+        t_key = self.state_store.eval_task_key(eval_task_id)
+        raw, gen = await asyncio.to_thread(self.state_store.read_text_with_generation, t_key)
+        if raw is None:
+            logger.error("ScheduledEvalTaskRecord %s not found in GCS state store", eval_task_id)
+            return None
+
+        task_rec = ScheduledEvalTaskRecord.model_validate_json(raw)
+        try:
+            if self._eval_runner is not None:
+                res = self._eval_runner(task_rec)
+                summary = await res if asyncio.iscoroutine(res) else res
+            else:
+                from eval.run_gcp_round import run_sheet_triggered_eval
+
+                summary = await run_sheet_triggered_eval(
+                    eval_id=task_rec.eval_id,
+                    eval_name=task_rec.eval_name,
+                    prompt_tab_name=task_rec.prompt_tab_name,
+                    model_version=task_rec.model_version,
+                    golden_source_id=task_rec.golden_source_id,
+                    results_folder_id=task_rec.results_folder_id,
+                    supervisor_email=task_rec.supervisor_email,
+                    eval_task_id=task_rec.eval_task_id,
+                )
+
+            sheet_url = str(summary.get("spreadsheet_url") or "")
+            overall_pct = float(summary.get("overall_recall", 0.0)) * 100.0
+            holdout_pct = float(summary.get("holdout_recall", 0.0)) * 100.0
+            dev_pct = float(summary.get("dev_recall", 0.0)) * 100.0
+            fpc = float(summary.get("findings_per_clip", 0.0))
+            cost_usd = float(summary.get("total_cost_usd", 0.0))
+            guardrails_ok = bool(summary.get("guardrails_passed", False))
+            guard_tag = "护栏通过" if guardrails_ok else "触发护栏"
+            report_msg = (
+                f"✅ 评测完成 ({task_rec.eval_task_id})：总体召回率 {overall_pct:.1f}% "
+                f"(留出集 {holdout_pct:.1f}% / 开发集 {dev_pct:.1f}%) | "
+                f"密度 {fpc:.2f} 条/段 ({guard_tag}) | 成本 ${cost_usd:.2f}"
+            )
+            if sheet_url:
+                report_msg += f" | 报告：{sheet_url}"
+            elif summary.get("sheet_error"):
+                report_msg += f" | ⚠️ 报告表生成提示：{str(summary['sheet_error'])[:120]}"
+
+            finished_rec = task_rec.model_copy(
+                update={
+                    "state": "DONE",
+                    "updated_at": time.time(),
+                    "report_sheet_url": sheet_url,
+                    "summary_text": report_msg,
+                    "error_message": "",
+                }
+            )
+            await asyncio.to_thread(
+                self.state_store.write_text_cas,
+                t_key,
+                finished_rec.model_dump_json(indent=2),
+                if_generation_match=gen,
+            )
+            await asyncio.to_thread(
+                self.finish_eval_lock, task_rec.eval_id, task_rec.eval_task_id, "DONE"
+            )
+            update_eval_fn = getattr(
+                self.service.prompt_manager, "update_scheduled_eval_row", None
+            )
+            if callable(update_eval_fn):
+                await update_eval_fn(
+                    task_rec.row_index,
+                    trigger_action="DONE",
+                    last_eval_report=report_msg,
+                )
+            send_eval_fn = getattr(
+                self.service.reporter, "send_eval_completion_notification", None
+            )
+            if callable(send_eval_fn):
+                await send_eval_fn(
+                    eval_id=task_rec.eval_id,
+                    eval_name=task_rec.eval_name,
+                    run_id=task_rec.eval_task_id,
+                    prompt_tab_name=task_rec.prompt_tab_name,
+                    model_version=task_rec.model_version,
+                    supervisor_email=task_rec.supervisor_email,
+                    status="DONE",
+                    summary=summary,
+                )
+            return finished_rec
+        except Exception as exc:
+            err_str = str(exc).replace("\n", " ")[:240]
+            fail_msg = f"❌ 评测执行异常 ({task_rec.eval_task_id})：{err_str}"
+            logger.error("Scheduled evaluation %s failed: %s", eval_task_id, exc)
+            failed_rec = task_rec.model_copy(
+                update={
+                    "state": "FAILED",
+                    "updated_at": time.time(),
+                    "error_message": err_str,
+                    "summary_text": fail_msg,
+                }
+            )
+            try:
+                _, latest_gen = await asyncio.to_thread(
+                    self.state_store.read_text_with_generation, t_key
+                )
+                await asyncio.to_thread(
+                    self.state_store.write_text_cas,
+                    t_key,
+                    failed_rec.model_dump_json(indent=2),
+                    if_generation_match=latest_gen if latest_gen > 0 else None,
+                )
+            except Exception:
+                pass
+            await asyncio.to_thread(
+                self.finish_eval_lock, task_rec.eval_id, task_rec.eval_task_id, "FAILED"
+            )
+            update_eval_fn = getattr(
+                self.service.prompt_manager, "update_scheduled_eval_row", None
+            )
+            if callable(update_eval_fn):
+                await update_eval_fn(
+                    task_rec.row_index,
+                    trigger_action="FAILED",
+                    last_eval_report=fail_msg,
+                )
+            send_eval_fn = getattr(
+                self.service.reporter, "send_eval_completion_notification", None
+            )
+            if callable(send_eval_fn):
+                await send_eval_fn(
+                    eval_id=task_rec.eval_id,
+                    eval_name=task_rec.eval_name,
+                    run_id=task_rec.eval_task_id,
+                    prompt_tab_name=task_rec.prompt_tab_name,
+                    model_version=task_rec.model_version,
+                    supervisor_email=task_rec.supervisor_email,
+                    status="FAILED",
+                    error_message=err_str,
+                )
+            return failed_rec
+
+    async def _process_scheduled_eval_rows(self, effective_now: datetime) -> Dict[str, Any]:
+        """Scans `Tab3_黄金集评测工作台` for rows with `Trigger_Action == 'START_EVAL'`, runs fast preflight,
+        acquires the atomic eval lock, transitions `START_EVAL -> RUNNING`, and dispatches the Cloud Run Job.
+        """
+        load_eval_fn = getattr(self.service.prompt_manager, "load_scheduled_eval_rules", None)
+        if not callable(load_eval_fn):
+            return {"triggered_evals": [], "invalid_eval_rows": []}
+
+        update_eval_fn = getattr(self.service.prompt_manager, "update_scheduled_eval_row", None)
+        eval_rules = await load_eval_fn()
+        eval_errors = list(
+            getattr(self.service.prompt_manager, "last_scheduled_eval_errors", []) or []
+        )
+        invalid_eval_rows: List[int] = []
+        for err in eval_errors:
+            invalid_eval_rows.append(err.row_index)
+            if callable(update_eval_fn) and err.previous_report != err.error_message:
+                await update_eval_fn(
+                    err.row_index,
+                    trigger_action="FAILED",
+                    last_eval_report=err.error_message,
+                )
+
+        triggered_evals: List[Dict[str, Any]] = []
+        for rule in eval_rules:
+            if rule.trigger_action != "START_EVAL":
+                continue
+
+            passed, preflight_err, effective_folder_id = await self._preflight_scheduled_eval_rule(
+                rule
+            )
+            if not passed:
+                if callable(update_eval_fn):
+                    await update_eval_fn(
+                        rule.row_index,
+                        trigger_action="FAILED",
+                        last_eval_report=preflight_err,
+                    )
+                triggered_evals.append(
+                    {
+                        "eval_id": rule.eval_id,
+                        "eval_task_id": None,
+                        "status": "preflight_failed",
+                        "error": preflight_err,
+                    }
+                )
+                continue
+
+            eval_task_id = (
+                f"eval_{_safe_slug(rule.eval_id, 16)}_"
+                f"{effective_now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+            )
+            acquired = await asyncio.to_thread(
+                self.try_acquire_eval_lock,
+                rule.eval_id,
+                eval_task_id,
+                effective_now.timestamp(),
+            )
+            if not acquired:
+                continue
+
+            task_rec = ScheduledEvalTaskRecord(
+                eval_task_id=eval_task_id,
+                eval_id=rule.eval_id,
+                eval_name=rule.eval_name,
+                row_index=rule.row_index,
+                prompt_tab_name=rule.prompt_tab_name,
+                model_version=rule.model_version,
+                golden_sheet_url=rule.golden_sheet_url,
+                golden_source_id=rule.golden_source_id,
+                results_folder_url=rule.results_folder_url,
+                results_folder_id=effective_folder_id,
+                supervisor_email=rule.supervisor_email,
+                state="RUNNING",
+            )
+            await asyncio.to_thread(
+                self.state_store.write_text_cas,
+                self.state_store.eval_task_key(eval_task_id),
+                task_rec.model_dump_json(indent=2),
+                if_generation_match=0,
+            )
+            if callable(update_eval_fn):
+                await update_eval_fn(
+                    rule.row_index,
+                    trigger_action="RUNNING",
+                    last_eval_report=(
+                        f"⏳ 正在后台执行黄金集评测 ({eval_task_id})："
+                        f"SOP={rule.prompt_tab_name} | 模型={rule.model_version}"
+                    ),
+                )
+            await self.dispatch_eval_job(task_rec)
+            triggered_evals.append(
+                {
+                    "eval_id": rule.eval_id,
+                    "eval_task_id": eval_task_id,
+                    "status": "dispatched",
+                }
+            )
+
+        return {
+            "triggered_evals": triggered_evals,
+            "invalid_eval_rows": invalid_eval_rows,
+        }
+
     async def run_scheduled_tick(
         self, *, now_utc: Optional[datetime] = None
     ) -> Dict[str, Any]:
@@ -1156,6 +1647,10 @@ class ScheduledAuditEngine:
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("Non-fatal error ensuring master sheet validations: %s", exc)
 
+        eval_tick_res = await self._process_scheduled_eval_rows(effective_now)
+        triggered_evals = eval_tick_res["triggered_evals"]
+        invalid_eval_rows = eval_tick_res["invalid_eval_rows"]
+
         all_rules = await self.service.prompt_manager.load_scheduled_rules()
         row_errors = list(
             getattr(self.service.prompt_manager, "last_scheduled_rule_errors", []) or []
@@ -1171,10 +1666,12 @@ class ScheduledAuditEngine:
 
         if not all_rules:
             return {
-                "status": "no_rules",
+                "status": "triggered" if triggered_evals else "no_rules",
                 "evaluated_rules": 0,
                 "invalid_rows": invalid_rows,
                 "triggered_batches": [],
+                "triggered_evals": triggered_evals,
+                "invalid_eval_rows": invalid_eval_rows,
             }
 
         canonical_rules, shadowed_pairs = resolve_canonical_enabled_rules(all_rules)
@@ -1202,11 +1699,13 @@ class ScheduledAuditEngine:
 
         if not due_rules_with_date:
             return {
-                "status": "idle",
+                "status": "triggered" if triggered_evals else "idle",
                 "evaluated_rules": len(canonical_rules),
                 "invalid_rows": invalid_rows,
                 "shadowed_rules": shadowed_notices,
                 "triggered_batches": [],
+                "triggered_evals": triggered_evals,
+                "invalid_eval_rows": invalid_eval_rows,
             }
 
         # Group due Drive rules by supervisor_email to run bottom-up discovery once per identity,
@@ -1504,4 +2003,6 @@ class ScheduledAuditEngine:
             "invalid_rows": invalid_rows,
             "shadowed_rules": shadowed_notices,
             "triggered_batches": triggered_batches,
+            "triggered_evals": triggered_evals,
+            "invalid_eval_rows": invalid_eval_rows,
         }

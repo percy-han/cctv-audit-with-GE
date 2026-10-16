@@ -153,6 +153,88 @@ def load_folder_specs(golden_uri: str | Path | None = None) -> list[dict[str, An
     return folder_specs_from_golden(load_golden(materialize_golden(str(golden_uri or default_golden_uri()))))
 
 
+def resolve_eval_persistent_bucket(cfg: AuditConfig) -> str:
+    """Returns the persistent GCS bucket for eval media cache & history (`workspace_bucket` via `gcs_sop_uri`, fallback `staging_bucket`)."""
+    raw_sop_uri = str(getattr(cfg, "gcs_sop_uri", "") or os.environ.get("GCS_SOP_URI", "")).strip()
+    if raw_sop_uri.startswith("gs://"):
+        without_scheme = raw_sop_uri[len("gs://") :]
+        bucket_part = without_scheme.split("/", 1)[0].strip()
+        if bucket_part:
+            return bucket_part
+    return str(cfg.staging_bucket or "").strip()
+
+
+def sync_eval_history_from_gcs(
+    *,
+    bucket_name: str,
+    project_id: str,
+    history_jsonl: Path,
+    fallback_bucket: str = "",
+) -> int:
+    """Downloads `eval/rounds/eval_history.jsonl` from GCS and merges unseen `run_id` rows into `history_jsonl`."""
+    if not bucket_name and not fallback_bucket:
+        return 0
+    try:
+        from google.cloud import storage
+
+        st_client = storage.Client(project=project_id)
+        remote_lines: list[str] = []
+        for candidate_bkt in dict.fromkeys([b for b in (bucket_name, fallback_bucket) if b]):
+            blob = st_client.bucket(candidate_bkt).blob("eval/rounds/eval_history.jsonl")
+            if blob.exists():
+                remote_lines.extend(blob.download_as_text(encoding="utf-8").splitlines())
+        if not remote_lines:
+            return 0
+
+        existing_records: dict[str, dict[str, Any]] = {}
+        ordered_run_ids: list[str] = []
+        if history_jsonl.exists():
+            for raw in history_jsonl.read_text(encoding="utf-8").splitlines():
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                    rid = str(rec.get("run_id") or "")
+                    if rid:
+                        if rid not in existing_records:
+                            ordered_run_ids.append(rid)
+                        existing_records[rid] = rec
+                except Exception:
+                    continue
+
+        merged_count = 0
+        for raw in remote_lines:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw)
+                rid = str(rec.get("run_id") or "")
+                if rid and rid not in existing_records:
+                    ordered_run_ids.append(rid)
+                    existing_records[rid] = rec
+                    merged_count += 1
+            except Exception:
+                continue
+
+        if merged_count > 0:
+            history_jsonl.parent.mkdir(parents=True, exist_ok=True)
+            history_jsonl.write_text(
+                "\n".join(
+                    json.dumps(existing_records[rid], ensure_ascii=False)
+                    for rid in ordered_run_ids
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        return merged_count
+    except Exception as exc:
+        logger.warning("Non-fatal: failed to sync eval_history.jsonl from GCS: %s", exc)
+        return 0
+
+
+
 def archive_sop_tab_to_master_sheet(
     sheet_id: str,
     tab_name: str,
@@ -225,19 +307,21 @@ async def resolve_or_ingest_video_slice(
 
     def _check_gcs() -> tuple[str | None, dict[str, Any]]:
         storage_client = storage.Client(project=cfg.gcp_project)
-        bucket = storage_client.bucket(bucket_name)
+        candidate_buckets = list(dict.fromkeys([b for b in (bucket_name, cfg.staging_bucket) if b]))
         candidate_blob_paths = [
             f"eval/media/{file_id}/seg_0.mp4",
             *[f"jobs/media/{jid}/{file_id}/seg_0.mp4" for jid in candidate_job_ids],
         ]
-        for blob_path in candidate_blob_paths:
-            blob = bucket.blob(blob_path)
-            if blob.exists():
-                stored: dict[str, Any] = {}
-                meta_blob = bucket.blob(f"eval/media/{file_id}/meta.json")
-                if len(meta) < 3 and meta_blob.exists():
-                    stored = json.loads(meta_blob.download_as_text())
-                return f"gs://{bucket_name}/{blob_path}", stored
+        for cand_bucket_name in candidate_buckets:
+            bucket = storage_client.bucket(cand_bucket_name)
+            for blob_path in candidate_blob_paths:
+                blob = bucket.blob(blob_path)
+                if blob.exists():
+                    stored: dict[str, Any] = {}
+                    meta_blob = bucket.blob(f"eval/media/{file_id}/meta.json")
+                    if len(meta) < 3 and meta_blob.exists():
+                        stored = json.loads(meta_blob.download_as_text())
+                    return f"gs://{cand_bucket_name}/{blob_path}", stored
         return None, {}
 
     cached_uri, stored_meta = await asyncio.to_thread(_check_gcs)
@@ -422,7 +506,7 @@ async def evaluate_single_folder(
             continue
         seg = await resolve_or_ingest_video_slice(
             cfg=cfg,
-            bucket_name=cfg.staging_bucket,
+            bucket_name=resolve_eval_persistent_bucket(cfg),
             video_dict=vdict,
             candidate_job_ids=folder_spec["candidate_job_ids"],
             ingestor=ingestor,
@@ -664,6 +748,15 @@ async def run_round_async(args: argparse.Namespace) -> int:
         json.dumps(mon_record, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     history_jsonl = args.rounds_dir / "eval_history.jsonl"
+    persistent_bucket = resolve_eval_persistent_bucket(cfg)
+    if not args.skip_gcs_sync:
+        await asyncio.to_thread(
+            sync_eval_history_from_gcs,
+            bucket_name=persistent_bucket,
+            project_id=cfg.gcp_project,
+            history_jsonl=history_jsonl,
+            fallback_bucket=cfg.staging_bucket,
+        )
     append_eval_history_jsonl(mon_record, history_jsonl)
     write_round_averages_jsonl(
         history_jsonl,
@@ -731,11 +824,12 @@ async def run_round_async(args: argparse.Namespace) -> int:
         from google.cloud import storage
 
         st_client = storage.Client(project=cfg.gcp_project)
-        bucket = st_client.bucket(cfg.staging_bucket)
-        for fname in ("ledger.json", "ledger.md", "eval_history.jsonl", "eval_round_averages.jsonl"):
-            fpath = args.rounds_dir / fname
-            if fpath.exists():
-                bucket.blob(f"eval/rounds/{fname}").upload_from_filename(str(fpath))
+        for target_bkt in dict.fromkeys([b for b in (persistent_bucket, cfg.staging_bucket) if b]):
+            bucket = st_client.bucket(target_bkt)
+            for fname in ("ledger.json", "ledger.md", "eval_history.jsonl", "eval_round_averages.jsonl"):
+                fpath = args.rounds_dir / fname
+                if fpath.exists():
+                    bucket.blob(f"eval/rounds/{fname}").upload_from_filename(str(fpath))
 
     print(score_md)
     print("\n=== LOOP STATUS ===")
@@ -745,6 +839,218 @@ async def run_round_async(args: argparse.Namespace) -> int:
     )
     print(sheet_report_line)
     return 0
+
+
+async def run_sheet_triggered_eval(
+    *,
+    eval_id: str,
+    eval_name: str,
+    prompt_tab_name: str,
+    model_version: str,
+    golden_source_id: str,
+    results_folder_id: str = "",
+    supervisor_email: str = "",
+    eval_task_id: str = "",
+    master_sheet_id: str = "",
+    folder_concurrency: int = 2,
+    judge_model: str | None = None,
+    rounds_dir: Path = DEFAULT_ROUNDS_DIR,
+    results_dir: Path = DEFAULT_RESULTS_DIR,
+    skip_gcs_sync: bool = False,
+) -> dict[str, Any]:
+    """Executes a customer zero-code golden-set evaluation triggered from `Tab3_黄金集评测工作台`.
+
+    - Loads `PromptModelConfig` directly from `prompt_tab_name` + `model_version` on the Master Sheet
+      (without mutating `Tab0_版本总控与回滚开关`).
+    - Evaluates all folders/clips in `golden_source_id` (`gs://...jsonl` or Google Sheet ID) with
+      zero side-effects on the source video Drive folders (no `📊 AI稽核报告与Token账单` or 20s clips
+      written into the source video folders).
+    - Syncs `eval_history.jsonl` from the persistent GCS bucket (`workspace_bucket` via `gcs_sop_uri`,
+      fallback `staging_bucket`), appends the new run, generates the 5-tab Google Sheet report in
+      `results_folder_id`, uploads history & artifacts back to GCS, and returns the summary dict.
+    """
+    cfg = AuditConfig()
+    if not cfg.gcp_project:
+        raise RuntimeError("GCP_PROJECT is not set; cannot execute sheet-triggered evaluation.")
+
+    effective_sheet_id = master_sheet_id or cfg.master_prompt_sheet_id
+    sheet_client = GoogleSheetsConfigClient()
+    pm = PromptManager(sheet_client=sheet_client)
+    prompt_cfg = await pm.load_config_for_tab(
+        prompt_tab_name=prompt_tab_name,
+        model_version=model_version,
+        sheet_id=effective_sheet_id,
+    )
+
+    safe_eval = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in eval_id)[:24] or "eval"
+    round_id = safe_eval.lower()
+    run_id = eval_task_id or f"{round_id}_{datetime.now(timezone.utc).strftime('%m%d_%H%M%S')}"
+    effective_folder_id = (
+        str(results_folder_id or "").strip()
+        or os.environ.get("EVAL_RESULTS_FOLDER_ID", "").strip()
+    )
+
+    kind = "file" if str(golden_source_id).strip().startswith("gs://") else "sheet"
+    tmp_golden_dir = results_dir / f".golden_{run_id}"
+    _, golden = await asyncio.to_thread(
+        load_golden_source,
+        kind,
+        str(golden_source_id).strip(),
+        tmp_golden_dir,
+    )
+    res_dir = results_dir / run_id
+    res_dir.mkdir(parents=True, exist_ok=True)
+    golden_local = golden.write_snapshot(res_dir / "golden_snapshot")
+    folder_specs = folder_specs_from_golden(golden)
+
+    auditor = AgenticAuditor(gemini_concurrency=cfg.gemini_concurrency)
+    try:
+        gateway = GoogleWorkspaceGateway()
+        ingestor: VideoIngestor | None = VideoIngestor(drive_reader=gateway)
+    except Exception as exc:
+        logger.warning("Drive ingestor init skipped (%s); relying on cached GCS slices.", exc)
+        ingestor = None
+
+    ckpt = ClipCheckpointStore(
+        run_id=run_id,
+        bucket_name=cfg.staging_bucket,
+        project=cfg.gcp_project,
+        local_dir=results_dir / f".ckpt_{run_id}" if skip_gcs_sync else None,
+    )
+    sem = asyncio.Semaphore(max(1, int(folder_concurrency)))
+
+    async def _run_guarded(spec: dict[str, Any]) -> dict[str, Any]:
+        async with sem:
+            return await evaluate_single_folder(
+                folder_spec=spec,
+                run_id=run_id,
+                cfg=cfg,
+                auditor=auditor,
+                prompt_cfg=prompt_cfg,
+                ingestor=ingestor,
+                ckpt=ckpt,
+            )
+
+    job_docs = await asyncio.gather(*[_run_guarded(spec) for spec in folder_specs])
+    run_data_dir = THIS_DIR / "data" / "runs" / run_id
+    run_data_dir.mkdir(parents=True, exist_ok=True)
+    for doc in job_docs:
+        out_file = run_data_dir / f"job_{doc['baseline_job_id']}.json"
+        out_file.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    score_doc = await asyncio.to_thread(
+        score_run,
+        run_dir=run_data_dir,
+        golden_path=golden_local,
+        project=cfg.gcp_project,
+        run_label=run_id,
+        judge_model=judge_model,
+    )
+    score_doc.pop("_sdk_result", None)
+    if golden.origin:
+        score_doc.setdefault("golden", {}).update(
+            golden_source=golden.source,
+            golden_origin=dict(golden.origin),
+        )
+    score_md = render_markdown(run_id, score_doc)
+    (res_dir / "score.json").write_text(
+        json.dumps(score_doc, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (res_dir / "score.md").write_text(score_md, encoding="utf-8")
+
+    round_manifest = {
+        "round_id": round_id,
+        "eval_id": eval_id,
+        "eval_name": eval_name,
+        "sop_tab_name": prompt_cfg.active_prompt_version,
+        "hypothesis": f"Sheet Workbench Evaluation: {eval_name} ({eval_id})",
+    }
+    mon_record = build_eval_monitoring_record(
+        project_id=cfg.gcp_project,
+        round_id=round_id,
+        run_id=run_id,
+        model_version=str(prompt_cfg.active_model_version),
+        sop_version=str(prompt_cfg.active_prompt_version),
+        media_mode=str(cfg.video_media_processing),
+        score_doc=score_doc,
+        job_docs=job_docs,
+        round_manifest=round_manifest,
+    )
+    (res_dir / "monitoring_record.json").write_text(
+        json.dumps(mon_record, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    rounds_dir.mkdir(parents=True, exist_ok=True)
+    history_jsonl = rounds_dir / "eval_history.jsonl"
+    persistent_bucket = resolve_eval_persistent_bucket(cfg)
+    if not skip_gcs_sync:
+        await asyncio.to_thread(
+            sync_eval_history_from_gcs,
+            bucket_name=persistent_bucket,
+            project_id=cfg.gcp_project,
+            history_jsonl=history_jsonl,
+            fallback_bucket=cfg.staging_bucket,
+        )
+    append_eval_history_jsonl(mon_record, history_jsonl)
+    write_round_averages_jsonl(history_jsonl, rounds_dir / "eval_round_averages.jsonl")
+
+    sheet_outcome = await asyncio.to_thread(
+        publish_run_sheet_report_safely,
+        history_path=history_jsonl,
+        score_doc=score_doc,
+        run_record=mon_record,
+        golden_items=golden.items,
+        res_dir=res_dir,
+        folder_id=effective_folder_id,
+    )
+
+    if not skip_gcs_sync:
+        await asyncio.to_thread(
+            upload_directory_to_gcs,
+            cfg.staging_bucket,
+            cfg.gcp_project,
+            run_data_dir,
+            f"eval/runs/{run_id}",
+        )
+        await asyncio.to_thread(
+            upload_directory_to_gcs,
+            cfg.staging_bucket,
+            cfg.gcp_project,
+            res_dir,
+            f"eval/results/{run_id}",
+        )
+        from google.cloud import storage
+
+        st_client = storage.Client(project=cfg.gcp_project)
+        for target_bkt in dict.fromkeys([b for b in (persistent_bucket, cfg.staging_bucket) if b]):
+            bucket = st_client.bucket(target_bkt)
+            for fname in ("eval_history.jsonl", "eval_round_averages.jsonl"):
+                fpath = rounds_dir / fname
+                if fpath.exists():
+                    bucket.blob(f"eval/rounds/{fname}").upload_from_filename(str(fpath))
+
+    return {
+        "eval_id": eval_id,
+        "eval_name": eval_name,
+        "round_id": round_id,
+        "run_id": run_id,
+        "prompt_tab_name": str(prompt_cfg.active_prompt_version),
+        "model_version": str(prompt_cfg.active_model_version),
+        "overall_recall": float(mon_record.get("overall_recall", 0.0)),
+        "holdout_recall": float(mon_record.get("holdout_recall", 0.0)),
+        "dev_recall": float(mon_record.get("dev_recall", 0.0)),
+        "findings_per_clip": float(mon_record.get("findings_per_clip", 0.0)),
+        "hit_rate": float(mon_record.get("hit_rate", 0.0)),
+        "guardrails_passed": bool(mon_record.get("guardrails_passed", False)),
+        "total_cost_usd": float(mon_record.get("total_cost_usd", 0.0)),
+        "total_tokens": int(mon_record.get("total_tokens", 0)),
+        "spreadsheet_url": sheet_outcome.spreadsheet_url,
+        "spreadsheet_id": sheet_outcome.spreadsheet_id,
+        "sheet_error": sheet_outcome.error,
+        "sheet_status_line": sheet_outcome.status_line,
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -783,7 +1089,7 @@ def golden_setup_message(golden_uri: str, exc: BaseException) -> str:
     """Operator-facing explanation when the golden set is missing or malformed (printed, no traceback)."""
     return (
         f"无法加载黄金集（标准答案）：{golden_uri}\n  原因：{type(exc).__name__}: {exc}\n"
-        "  本仓库不附带客户的黄金集数据。请任选其一：\n"
+        "  请任选其一：\n"
         "  - 客户标注表：Terraform 设置 eval_golden_sheet_id = \"<标注表 ID>\"（表里需要「测评配置」页，"
         "Workspace 身份对表格和视频文件夹至少有查看权限），Cloud Build 传 _GOLDEN_SHEET_ID；"
         "先用 python -m eval.golden_sheet check --sheet-id <ID> 自检\n"
@@ -792,6 +1098,7 @@ def golden_setup_message(golden_uri: str, exc: BaseException) -> str:
         "  - 本地：python eval/run_gcp_round.py --golden <路径或 gs://...> ...\n"
         "  黄金集与可选的 <name>.manifest.json 格式见 eval/data/README.md。本次未调用任何模型，没有产生费用。"
     )
+
 
 
 if __name__ == "__main__":

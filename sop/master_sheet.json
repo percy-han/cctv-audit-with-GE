@@ -908,6 +908,33 @@
      "默认示例（未启用）"
     ]
    ]
+  },
+  {
+   "title": "Tab3_黄金集评测工作台",
+   "values": [
+    [
+     "Eval_ID",
+     "Eval_Name",
+     "Prompt_Tab_Name",
+     "Model_Version",
+     "Golden_Sheet_URL",
+     "Results_Folder_URL",
+     "Supervisor_Email",
+     "Trigger_Action",
+     "Last_Eval_Report"
+    ],
+    [
+     "EVAL-EXAMPLE-01",
+     "【示例】黄金标准集基准评测（填入黄金集 Sheet 链接并将 Trigger_Action 改为 START_EVAL 后自动在后台运行）",
+     "Prompt_v2.5_V10全量17条标准版",
+     "gemini-3.8-flash",
+     "https://docs.google.com/spreadsheets/d/1ExampleGoldenSheetIdReplaceMe0000/edit",
+     "https://drive.google.com/drive/folders/1ExampleEvalResultsFolderIdReplaceMe",
+     "auditor@example.com",
+     "IDLE",
+     "默认示例（未启动；选择 START_EVAL 后将在 15 分钟内自动执行）"
+    ]
+   ]
   }
  ]
 }

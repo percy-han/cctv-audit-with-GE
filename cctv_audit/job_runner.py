@@ -38,18 +38,39 @@ def _build_default_audit_service() -> AuditService:
 
 async def run_job_async(
     *,
-    job_id: str,
-    user_id: str,
+    job_id: str = "",
+    user_id: str = "",
     batch_id: str = "",
+    eval_task_id: str = "",
     service: Optional[AuditService] = None,
 ) -> int:
-    """Executes one store's scheduled `AuditJob` and returns the process exit code (0 or 1)."""
+    """Executes one store's scheduled `AuditJob` or one `ScheduledEvalTaskRecord` and returns the exit code."""
+    svc = service if service is not None else _build_default_audit_service()
+    engine = ScheduledAuditEngine(audit_service=svc)
+
+    if eval_task_id:
+        finished_eval = await engine.execute_scheduled_eval_task(eval_task_id)
+        if finished_eval is None:
+            logger.error("Scheduled eval task %s could not be loaded", eval_task_id)
+            return 1
+        if finished_eval.state == "DONE":
+            logger.info(
+                "Scheduled eval task %s completed: sheet=%s",
+                finished_eval.eval_task_id,
+                finished_eval.report_sheet_url,
+            )
+            return 0
+        logger.error(
+            "Scheduled eval task %s failed: %s",
+            finished_eval.eval_task_id,
+            finished_eval.error_message,
+        )
+        return 1
+
     if not job_id or not user_id:
         logger.error("Missing required CCTV_AUDIT_JOB_ID (%r) or CCTV_AUDIT_USER_ID (%r)", job_id, user_id)
         return 2
 
-    svc = service if service is not None else _build_default_audit_service()
-    engine = ScheduledAuditEngine(audit_service=svc)
     finished = await engine.execute_scheduled_store_job(
         job_id=job_id,
         user_id=user_id,
@@ -84,7 +105,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
-    parser = argparse.ArgumentParser(description="Chagee CCTV Scheduled Store Audit Job Runner")
+    parser = argparse.ArgumentParser(description="Chagee CCTV Scheduled Store Audit & Eval Job Runner")
     parser.add_argument(
         "--job-id",
         default=os.environ.get("CCTV_AUDIT_JOB_ID", "").strip(),
@@ -100,12 +121,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=os.environ.get("CCTV_AUDIT_BATCH_ID", "").strip(),
         help="Parent scheduled batch ID (default: env CCTV_AUDIT_BATCH_ID)",
     )
+    parser.add_argument(
+        "--eval-task-id",
+        default=os.environ.get("CCTV_EVAL_TASK_ID", "").strip(),
+        help="Target ScheduledEvalTaskRecord ID (default: env CCTV_EVAL_TASK_ID)",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
     return asyncio.run(
         run_job_async(
             job_id=args.job_id,
             user_id=args.user_id,
             batch_id=args.batch_id,
+            eval_task_id=args.eval_task_id,
         )
     )
 

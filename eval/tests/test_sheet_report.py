@@ -17,7 +17,7 @@ HISTORY = EVAL_DIR / "rounds" / "eval_history.jsonl"
 SCORE = EVAL_DIR / "results" / "r02_run2" / "score.json"
 GOLDEN = EVAL_DIR / "data" / "golden_v1.jsonl"
 NOW = datetime(2026, 10, 10, 1, 2, 3, tzinfo=timezone.utc)
-FOLDER = "0AbCdEfGhIjKlMnOpQrStUvWxYz_folder"
+FOLDER = "1ky221gNbzgIT83981ghVpFc03and4s-g"
 
 
 def _fixture():
@@ -241,6 +241,43 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(url, "https://docs.google.com/spreadsheets/d/SHEET123/edit")
         self.assertEqual(len(sheets.batch_updates), 3)
         self.assertEqual(len(sheets.value_updates), 1)
+
+    def test_chart_row_cap_keeps_header_and_latest_rounds_or_runs(self):
+        base_rows, score, _, golden = _fixture()
+        template = base_rows[-1]
+        many_records = []
+        for idx in range(20):
+            rec = dict(template)
+            rec["round_id"] = f"r{idx:02d}"
+            rec["run_id"] = f"r{idx:02d}_run1"
+            rec["sop_version"] = f"Prompt_v2.6_r{idx:02d}"
+            many_records.append(rec)
+        spec = srp.build_report_spec(
+            history=many_records,
+            score_doc=score,
+            run_record=many_records[-1],
+            golden_items=golden,
+            now_utc=NOW,
+            time_zone="Asia/Singapore",
+        )
+        # Full tables preserve all 20 rounds + 1 header = 21 rows
+        self.assertEqual(len(spec.tables[2].rows), 21)
+        self.assertEqual(len(spec.tables[3].rows), 21)
+        chart_reqs = spec.chart_requests
+        # Round chart (chart 0) caps to latest MAX_CHART_ROUNDS (12) while keeping row 0 header
+        round_domain_sources = chart_reqs[0]["addChart"]["chart"]["spec"]["basicChart"]["domains"][0]["domain"]["sourceRange"]["sources"]
+        self.assertEqual(len(round_domain_sources), 2)
+        self.assertEqual(round_domain_sources[0]["startRowIndex"], 0)
+        self.assertEqual(round_domain_sources[0]["endRowIndex"], 1)
+        self.assertEqual(round_domain_sources[1]["startRowIndex"], 21 - srp.MAX_CHART_ROUNDS)
+        self.assertEqual(round_domain_sources[1]["endRowIndex"], 21)
+        # Run chart (chart 3) caps to latest MAX_CHART_RUNS (15) while keeping row 0 header
+        run_domain_sources = chart_reqs[3]["addChart"]["chart"]["spec"]["basicChart"]["domains"][0]["domain"]["sourceRange"]["sources"]
+        self.assertEqual(len(run_domain_sources), 2)
+        self.assertEqual(run_domain_sources[0]["startRowIndex"], 0)
+        self.assertEqual(run_domain_sources[0]["endRowIndex"], 1)
+        self.assertEqual(run_domain_sources[1]["startRowIndex"], 21 - srp.MAX_CHART_RUNS)
+        self.assertEqual(run_domain_sources[1]["endRowIndex"], 21)
 
 
 if __name__ == "__main__":

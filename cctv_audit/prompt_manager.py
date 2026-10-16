@@ -139,6 +139,65 @@ class ScheduledRuleRowError(BaseModel):
     previous_status: str = Field(default="")
 
 
+TAB3_EVAL_TITLE = "Tab3_黄金集评测工作台"
+EVAL_WORKBENCH_HEADERS: tuple[str, ...] = (
+    "Eval_ID",
+    "Eval_Name",
+    "Prompt_Tab_Name",
+    "Model_Version",
+    "Golden_Sheet_URL",
+    "Results_Folder_URL",
+    "Supervisor_Email",
+    "Trigger_Action",
+    "Last_Eval_Report",
+)
+VALID_EVAL_TRIGGER_ACTIONS: tuple[str, ...] = (
+    "IDLE",
+    "START_EVAL",
+    "RUNNING",
+    "DONE",
+    "FAILED",
+)
+DEFAULT_TAB3_SAMPLE_ROW: tuple[str, ...] = (
+    "EVAL-EXAMPLE-01",
+    "【示例】黄金标准集基准评测（填入黄金集 Sheet 链接并将 Trigger_Action 改为 START_EVAL 后自动在后台运行）",
+    "Prompt_v2.5_V10全量17条标准版",
+    "gemini-3.8-flash",
+    "https://docs.google.com/spreadsheets/d/1ExampleGoldenSheetIdReplaceMe0000/edit",
+    "https://drive.google.com/drive/folders/1ExampleEvalResultsFolderIdReplaceMe",
+    "auditor@example.com",
+    "IDLE",
+    "默认示例（未启动；选择 START_EVAL 后将在 15 分钟内自动执行）",
+)
+
+
+class ScheduledEvalRule(BaseModel):
+    """One row from `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) in the Master SOP Sheet."""
+
+    row_index: int = Field(ge=2, description="1-based row number in Tab3_黄金集评测工作台")
+    eval_id: str = Field(description="Unique evaluation ID, e.g. EVAL-01")
+    eval_name: str = Field(default="", description="Human-readable evaluation name")
+    prompt_tab_name: str = Field(description="Target Prompt_* tab in Master Sheet to evaluate")
+    model_version: str = Field(description="Target Gemini model version to evaluate")
+    golden_sheet_url: str = Field(description="Golden Set Google Sheet URL/ID or gs://.../*.jsonl")
+    golden_source_id: str = Field(description="Normalized Golden Sheet ID or gs://.../*.jsonl URI")
+    results_folder_url: str = Field(default="", description="Optional Drive folder URL/ID for report Sheets")
+    results_folder_id: str = Field(default="", description="Normalized Drive folder ID for report Sheets")
+    supervisor_email: str = Field(description="Supervisor email for DWD and Chat @-mention")
+    trigger_action: str = Field(default="IDLE", description="IDLE, START_EVAL, RUNNING, DONE, or FAILED")
+    last_eval_report: str = Field(default="")
+
+
+class ScheduledEvalRowError(BaseModel):
+    """Diagnostic record for an invalid row in `Tab3_黄金集评测工作台`."""
+
+    row_index: int = Field(ge=2)
+    eval_id: str = Field(default="")
+    trigger_action: str = Field(default="IDLE")
+    error_message: str
+    previous_status: str = Field(default="")
+
+
 
 DEFAULT_VISUAL_SCAN_TARGETS: List[VisualScanTarget] = [
     VisualScanTarget(subject="人员", question="画面中一共出现过几个人？逐个描述性别、发型、衣着护具特征与所处工位。"),
@@ -1133,6 +1192,172 @@ def parse_scheduled_rules_from_rows(rows: List[List[str]]) -> List[ScheduledAudi
     return valid_rules
 
 
+def _extract_eval_golden_source_id(raw_url: str) -> str:
+    text = (raw_url or "").strip()
+    if not text or "/file/d/" in text or "/folders/" in text:
+        return ""
+    from .gcs_gateway import normalize_gcs_target
+
+    try:
+        gcs_uri = normalize_gcs_target(text)
+    except ValueError:
+        gcs_uri = None
+    if gcs_uri:
+        return gcs_uri
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]{10,})", text)
+    if m:
+        return m.group(1)
+    if _RAW_DRIVE_ID_RE.match(text):
+        return text
+    return ""
+
+
+def parse_scheduled_eval_rules_with_diagnostics(
+    rows: List[List[str]],
+    *,
+    available_prompt_tabs: Optional[Sequence[str]] = None,
+) -> tuple[List[ScheduledEvalRule], List[ScheduledEvalRowError]]:
+    """Parses `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) rows into `(valid_rules, row_errors)`."""
+    if not rows or len(rows) < 2:
+        return [], []
+    parsed: List[ScheduledEvalRule] = []
+    errors: List[ScheduledEvalRowError] = []
+    seen_eval_ids: dict[str, int] = {}
+    prompt_tab_set = (
+        {str(t).strip() for t in available_prompt_tabs if str(t).strip()}
+        if available_prompt_tabs
+        else set()
+    )
+
+    for idx, raw_row in enumerate(rows[1:], start=2):
+        padded = [str(c).strip() for c in raw_row] + [""] * max(0, 9 - len(raw_row))
+        (
+            eval_id,
+            eval_name,
+            prompt_tab,
+            model_ver,
+            golden_url,
+            results_folder_url,
+            sup_email,
+            trigger_raw,
+            last_report,
+        ) = padded[:9]
+
+        if not any(padded[:8]):
+            continue
+
+        norm_trigger = (trigger_raw or "IDLE").upper()
+
+        def _fail(msg: str) -> None:
+            logger.warning("Skipping Tab3 row %d (%s): %s", idx, eval_id or "<empty>", msg)
+            errors.append(
+                ScheduledEvalRowError(
+                    row_index=idx,
+                    eval_id=eval_id,
+                    trigger_action=norm_trigger,
+                    error_message=msg,
+                    previous_status=last_report,
+                )
+            )
+
+        if not eval_id:
+            _fail("❌ 评测配置错误：Eval_ID（A列）不能为空")
+            continue
+
+        if eval_id in seen_eval_ids:
+            _fail(
+                f"❌ 评测配置错误：Eval_ID '{eval_id}' 与第 {seen_eval_ids[eval_id]} 行重复，每行 Eval_ID 必须唯一"
+            )
+            continue
+        seen_eval_ids[eval_id] = idx
+
+        if norm_trigger not in VALID_EVAL_TRIGGER_ACTIONS:
+            _fail(
+                f"❌ 评测配置错误：Trigger_Action（H列）'{trigger_raw}' 无效，请从下拉框选择 IDLE 或 START_EVAL"
+            )
+            continue
+
+        if not prompt_tab or not prompt_tab.startswith("Prompt_"):
+            _fail(
+                f"❌ 评测配置错误：Prompt_Tab_Name（C列）'{prompt_tab}' 必须选择以 Prompt_ 开头的 SOP 规则分表名称"
+            )
+            continue
+
+        if prompt_tab_set and prompt_tab not in prompt_tab_set:
+            _fail(
+                f"❌ 评测配置错误：Prompt_Tab_Name（C列）'{prompt_tab}' 在总控表中不存在，"
+                f"可选分表：{', '.join(sorted(prompt_tab_set))}"
+            )
+            continue
+
+        if not model_ver or model_ver.upper() == "AUTO_LATEST_FLASH":
+            _fail(
+                f"❌ 评测配置错误：Model_Version（D列）'{model_ver}' 无效，请选择明确的 Gemini 模型版本（严禁 AUTO_LATEST_FLASH）"
+            )
+            continue
+
+        if "/folders/" in golden_url or "/file/d/" in golden_url:
+            _fail(
+                "❌ 评测配置错误：Golden_Sheet_URL（E列）请填写黄金集标注 Google Sheet 链接（/spreadsheets/d/...）或 gs://.../*.jsonl 路径，不能填写文件夹或单个视频链接"
+            )
+            continue
+
+        golden_source_id = _extract_eval_golden_source_id(golden_url)
+        if not golden_source_id:
+            _fail(
+                f"❌ 评测配置错误：Golden_Sheet_URL（E列）'{golden_url}' 不是合法的 Google Sheet 链接或 gs:// 路径"
+            )
+            continue
+
+        results_folder_id = ""
+        if results_folder_url:
+            if "/file/d/" in results_folder_url or "/spreadsheets/d/" in results_folder_url:
+                _fail(
+                    "❌ 评测配置错误：Results_Folder_URL（F列）请填写用于存放测评报告的 Google Drive 文件夹链接（/folders/...），或留空使用默认评测目录"
+                )
+                continue
+            results_folder_id = _extract_scheduled_folder_id(results_folder_url)
+            if not results_folder_id or results_folder_id.startswith("gs://"):
+                _fail(
+                    f"❌ 评测配置错误：Results_Folder_URL（F列）'{results_folder_url}' 不是合法的 Google Drive 文件夹链接"
+                )
+                continue
+
+        if sup_email and not _EMAIL_RE.match(sup_email):
+            _fail(f"❌ 评测配置错误：Supervisor_Email（G列）'{sup_email}' 不是合法的邮箱地址")
+            continue
+
+        parsed.append(
+            ScheduledEvalRule(
+                row_index=idx,
+                eval_id=eval_id,
+                eval_name=eval_name or eval_id,
+                prompt_tab_name=prompt_tab,
+                model_version=model_ver,
+                golden_sheet_url=golden_url,
+                golden_source_id=golden_source_id,
+                results_folder_url=results_folder_url,
+                results_folder_id=results_folder_id,
+                supervisor_email=sup_email or "scheduled-auditor@chagee.com",
+                trigger_action=norm_trigger,
+                last_eval_report=last_report,
+            )
+        )
+    return parsed, errors
+
+
+def parse_scheduled_eval_rules_from_rows(
+    rows: List[List[str]],
+    *,
+    available_prompt_tabs: Optional[Sequence[str]] = None,
+) -> List[ScheduledEvalRule]:
+    """Parses `[Tab 3: 黄金集评测工作台]` rows into validated `ScheduledEvalRule` items."""
+    valid_rules, _ = parse_scheduled_eval_rules_with_diagnostics(
+        rows, available_prompt_tabs=available_prompt_tabs
+    )
+    return valid_rules
+
+
 def _nearest_quarter_minute(mm: int) -> str:
     quarters = (0, 15, 30, 45)
     best = min(quarters, key=lambda q: abs(q - mm))
@@ -1507,6 +1732,86 @@ def build_master_sheet_validation_requests(
             ]
         )
 
+    # 4. Tab 3 (`Tab3_黄金集评测工作台`):
+    #    - Col C (index 2): Prompt_Tab_Name dropdown (all Prompt_* tabs)
+    #    - Col D (index 3): Model_Version dropdown
+    #    - Col G (index 6): Supervisor_Email TEXT_IS_EMAIL
+    #    - Col H (index 7): Trigger_Action dropdown (IDLE, START_EVAL, RUNNING, DONE, FAILED)
+    tab3_id = title_to_id.get(TAB3_EVAL_TITLE)
+    if tab3_id is not None:
+        if effective_prompt_versions:
+            requests.append(
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": tab3_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 200,
+                            "startColumnIndex": 2,
+                            "endColumnIndex": 3,
+                        },
+                        "rule": _one_of_list_rule(
+                            effective_prompt_versions,
+                            "请选择要评测的 Prompt_* 规则分表名称",
+                        ),
+                    }
+                }
+            )
+        if effective_models:
+            requests.append(
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": tab3_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 200,
+                            "startColumnIndex": 3,
+                            "endColumnIndex": 4,
+                        },
+                        "rule": _one_of_list_rule(
+                            effective_models,
+                            "请选择要评测的受控 Gemini 模型版本（严禁填写 AUTO_LATEST_FLASH）",
+                        ),
+                    }
+                }
+            )
+        requests.extend(
+            [
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": tab3_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 200,
+                            "startColumnIndex": 6,
+                            "endColumnIndex": 7,
+                        },
+                        "rule": {
+                            "condition": {"type": "TEXT_IS_EMAIL"},
+                            "inputMessage": "请填写合法的督导邮箱地址（如 user@domain.com）",
+                            "strict": True,
+                            "showCustomUi": False,
+                        },
+                    }
+                },
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": tab3_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 200,
+                            "startColumnIndex": 7,
+                            "endColumnIndex": 8,
+                        },
+                        "rule": _one_of_list_rule(
+                            VALID_EVAL_TRIGGER_ACTIONS,
+                            "选择 START_EVAL 将在下一次定时巡检（15分钟内）自动启动黄金集评测；评测启动后系统会自动改为 RUNNING -> DONE/FAILED",
+                        ),
+                    }
+                },
+            ]
+        )
+
     return requests
 
 
@@ -1528,6 +1833,7 @@ class GoogleSheetsConfigClient:
 
     TAB0_TITLE = "Tab0_版本总控与回滚开关"
     TAB2_SCHEDULED_TITLE = TAB2_SCHEDULED_TITLE
+    TAB3_EVAL_TITLE = TAB3_EVAL_TITLE
 
     def __init__(self, gcs_gateway: Optional[object] = None) -> None:
         # Zero-GWS: `gs://` sheet IDs are read from GCS (`GcsStorageGateway.download_object_bytes`).
@@ -1667,11 +1973,93 @@ class GoogleSheetsConfigClient:
         valid_rules, _ = await self.read_scheduled_rules_with_diagnostics(sheet_id)
         return valid_rules
 
+    async def read_scheduled_eval_rules_with_diagnostics(
+        self, sheet_id: str
+    ) -> tuple[List[ScheduledEvalRule], List[ScheduledEvalRowError]]:
+        """Reads `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) rows and returns `(valid_rules, row_errors)`."""
+        if not sheet_id:
+            return [], []
+        if sheet_id.startswith("gs://"):
+            tabs = await self._read_gcs_workbook_tabs(sheet_id)
+            rows = tabs.get(self.TAB3_EVAL_TITLE, [])
+            prompt_tabs = [t for t in tabs.keys() if t.startswith("Prompt_")]
+            return parse_scheduled_eval_rules_with_diagnostics(
+                rows, available_prompt_tabs=prompt_tabs
+            )
+        try:
+            a1 = f"{self.TAB3_EVAL_TITLE}!A1:I200"
+            _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{a1}", None)
+            rows = await self._read_range(sheet_id, a1)
+            return parse_scheduled_eval_rules_with_diagnostics(rows)
+        except Exception as exc:
+            logger.info(
+                "Scheduled eval tab %s not present or unreadable on %s: %s",
+                self.TAB3_EVAL_TITLE,
+                sheet_id,
+                exc,
+            )
+            return [], []
+
+    async def read_scheduled_eval_rules(self, sheet_id: str) -> List[ScheduledEvalRule]:
+        """Reads `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) rows; returns `[]` if the tab does not exist yet."""
+        valid_rules, _ = await self.read_scheduled_eval_rules_with_diagnostics(sheet_id)
+        return valid_rules
+
+    async def update_scheduled_eval_row(
+        self,
+        sheet_id: str,
+        row_index: int,
+        *,
+        trigger_action: Optional[str] = None,
+        last_eval_report: Optional[str] = None,
+    ) -> None:
+        """Writes `trigger_action` (Col H) and/or `last_eval_report` (Col I) back to `Tab3_黄金集评测工作台` at `row_index`."""
+        if not sheet_id or sheet_id.startswith("gs://") or row_index < 2:
+            return
+        if trigger_action is None and last_eval_report is None:
+            return
+
+        def _update() -> None:
+            svc = self._sheets_service().spreadsheets().values()
+            if trigger_action is not None and last_eval_report is not None:
+                svc.update(
+                    spreadsheetId=sheet_id,
+                    range=f"'{self.TAB3_EVAL_TITLE}'!H{row_index}:I{row_index}",
+                    valueInputOption="USER_ENTERED",
+                    body={"values": [[trigger_action, last_eval_report]]},
+                ).execute(num_retries=3)
+            elif trigger_action is not None:
+                svc.update(
+                    spreadsheetId=sheet_id,
+                    range=f"'{self.TAB3_EVAL_TITLE}'!H{row_index}",
+                    valueInputOption="USER_ENTERED",
+                    body={"values": [[trigger_action]]},
+                ).execute(num_retries=3)
+            else:
+                svc.update(
+                    spreadsheetId=sheet_id,
+                    range=f"'{self.TAB3_EVAL_TITLE}'!I{row_index}",
+                    valueInputOption="USER_ENTERED",
+                    body={"values": [[last_eval_report]]},
+                ).execute(num_retries=3)
+
+        try:
+            await asyncio.to_thread(_update)
+            _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB3_EVAL_TITLE}!A1:I200", None)
+        except Exception as exc:
+            logger.warning(
+                "Failed to update Tab3 row %d on %s: %s",
+                row_index,
+                sheet_id,
+                exc,
+            )
+
     async def ensure_master_sheet_validations(
         self, sheet_id: str, *, force: bool = False
     ) -> bool:
-        """Idempotently migrates legacy `Tab2_定时巡检配置表` rows to the UTC dropdown schema and
-        applies native Google Sheets `setDataValidation` rules across Tab 0, Prompt_*, and Tab 2.
+        """Idempotently migrates legacy `Tab2_定时巡检配置表` rows to the UTC dropdown schema,
+        auto-creates `Tab3_黄金集评测工作台` if missing, and applies native Google Sheets
+        `setDataValidation` rules across Tab 0, Prompt_*, Tab 2, and Tab 3.
         """
         if not sheet_id or sheet_id.startswith("gs://"):
             return False
@@ -1707,6 +2095,35 @@ class GoogleSheetsConfigClient:
                         body={"values": migrated_rows},
                     ).execute(num_retries=3)
 
+            if self.TAB3_EVAL_TITLE not in tab_titles:
+                svc.spreadsheets().batchUpdate(
+                    spreadsheetId=sheet_id,
+                    body={
+                        "requests": [
+                            {
+                                "addSheet": {
+                                    "properties": {
+                                        "title": self.TAB3_EVAL_TITLE,
+                                        "gridProperties": {"frozenRowCount": 1},
+                                    }
+                                }
+                            }
+                        ]
+                    },
+                ).execute(num_retries=3)
+                svc.spreadsheets().values().update(
+                    spreadsheetId=sheet_id,
+                    range=f"'{self.TAB3_EVAL_TITLE}'!A1",
+                    valueInputOption="RAW",
+                    body={
+                        "values": [
+                            list(EVAL_WORKBENCH_HEADERS),
+                            list(DEFAULT_TAB3_SAMPLE_ROW),
+                        ]
+                    },
+                ).execute(num_retries=3)
+                meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute(num_retries=3)
+
             reqs = build_master_sheet_validation_requests(meta)
             if reqs:
                 svc.spreadsheets().batchUpdate(
@@ -1720,6 +2137,7 @@ class GoogleSheetsConfigClient:
             if ok:
                 _VALID_SHEET_CACHE.add(sheet_id)
                 _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB2_SCHEDULED_TITLE}!A1:I200", None)
+                _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB3_EVAL_TITLE}!A1:I200", None)
             return ok
         except Exception as exc:
             logger.warning(
@@ -1773,6 +2191,7 @@ class PromptManager:
             set(known_valid_models) if known_valid_models else {config.fallback_model_version}
         )
         self.last_scheduled_rule_errors: List[ScheduledRuleRowError] = []
+        self.last_scheduled_eval_errors: List[ScheduledEvalRowError] = []
 
     async def _probe_single_model(self, candidate: str) -> bool:
         if not candidate:
@@ -1976,3 +2395,105 @@ class PromptManager:
         if not callable(updater):
             return
         await asyncio.wait_for(updater(target_sheet_id, row_index, status_text), timeout=10.0)
+
+    async def load_config_for_tab(
+        self,
+        prompt_tab_name: str,
+        model_version: str,
+        sheet_id: Optional[str] = None,
+    ) -> PromptModelConfig:
+        """Loads a specific `Prompt_*` tab and `model_version` directly from the Master SOP Sheet.
+
+        Used by `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) so customer-created `Prompt_*`
+        tabs in Google Sheets can be evaluated without requiring a local `eval/rounds/` directory.
+        """
+        target_sheet_id = self._resolve_target_sheet_id(sheet_id)
+        clean_tab = (prompt_tab_name or "").strip()
+        clean_model = (model_version or "").strip() or config.fallback_model_version
+        scan_targets, bundled_rules = await asyncio.to_thread(load_rules_from_yaml, self._yaml_path)
+
+        rules: List[SopRuleItem] = []
+        if target_sheet_id and self._sheet_client is not None:
+            tab_rules = await asyncio.wait_for(
+                self._sheet_client.read_prompt_tab_rules(target_sheet_id, clean_tab),
+                timeout=15.0,
+            )
+            if tab_rules:
+                rules = tab_rules
+        elif clean_tab == config.default_prompt_version:
+            rules = bundled_rules
+
+        if not rules:
+            raise ValueError(
+                f"未在总控表中找到名为 '{clean_tab}' 的有效 SOP 规则分表（或分表内容为空）"
+            )
+
+        resolved_model, model_warning = await self.resolve_and_probe_model(
+            clean_model, config.fallback_model_version
+        )
+        sys_instruction = render_v25_system_instruction(
+            clean_tab, rules, visual_scan_targets=scan_targets
+        )
+        return PromptModelConfig(
+            active_prompt_version=clean_tab,
+            active_model_version=resolved_model,
+            fallback_model_version=config.fallback_model_version,
+            model_fallback_warning=model_warning,
+            visual_scan_targets=scan_targets,
+            rules=rules,
+            system_instruction=sys_instruction,
+        )
+
+    async def load_scheduled_eval_rules_with_diagnostics(
+        self, sheet_id: Optional[str] = None
+    ) -> tuple[List[ScheduledEvalRule], List[ScheduledEvalRowError]]:
+        """Loads all rows from `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) along with any row validation errors."""
+        target_sheet_id = self._resolve_target_sheet_id(sheet_id)
+        if not target_sheet_id or self._sheet_client is None:
+            self.last_scheduled_eval_errors = []
+            return [], []
+        diag_reader = getattr(self._sheet_client, "read_scheduled_eval_rules_with_diagnostics", None)
+        if callable(diag_reader):
+            rules, errors = await asyncio.wait_for(diag_reader(target_sheet_id), timeout=15.0)
+            self.last_scheduled_eval_errors = list(errors)
+            return rules, errors
+        reader = getattr(self._sheet_client, "read_scheduled_eval_rules", None)
+        if callable(reader):
+            rules = await asyncio.wait_for(reader(target_sheet_id), timeout=15.0)
+            self.last_scheduled_eval_errors = []
+            return rules, []
+        self.last_scheduled_eval_errors = []
+        return [], []
+
+    async def load_scheduled_eval_rules(
+        self, sheet_id: Optional[str] = None
+    ) -> List[ScheduledEvalRule]:
+        """Loads all rows from `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`)."""
+        rules, errors = await self.load_scheduled_eval_rules_with_diagnostics(sheet_id)
+        self.last_scheduled_eval_errors = list(errors)
+        return rules
+
+    async def update_scheduled_eval_row(
+        self,
+        row_index: int,
+        *,
+        trigger_action: Optional[str] = None,
+        last_eval_report: Optional[str] = None,
+        sheet_id: Optional[str] = None,
+    ) -> None:
+        """Updates `Trigger_Action` (Col H) and/or `Last_Eval_Report` (Col I) in `[Tab 3: 黄金集评测工作台]`."""
+        target_sheet_id = self._resolve_target_sheet_id(sheet_id)
+        if not target_sheet_id or self._sheet_client is None:
+            return
+        updater = getattr(self._sheet_client, "update_scheduled_eval_row", None)
+        if not callable(updater):
+            return
+        await asyncio.wait_for(
+            updater(
+                target_sheet_id,
+                row_index,
+                trigger_action=trigger_action,
+                last_eval_report=last_eval_report,
+            ),
+            timeout=10.0,
+        )

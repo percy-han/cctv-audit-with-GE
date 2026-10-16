@@ -741,3 +741,121 @@ class WorkspaceReporter:
         except Exception as exc:
             logger.warning("Failed to send Google Chat batch summary notification: %s", exc)
             return False
+
+    async def send_eval_completion_notification(
+        self,
+        *,
+        eval_id: str,
+        eval_name: str,
+        run_id: str,
+        prompt_tab_name: str,
+        model_version: str,
+        supervisor_email: str,
+        status: str,
+        summary: dict[str, Any] | None = None,
+        error_message: str = "",
+    ) -> bool:
+        """Sends a Google Chat card notification for a Sheet-triggered golden-set evaluation (`Tab3_黄金集评测工作台`)."""
+        webhook_url = config.google_chat_webhook_url
+        if not webhook_url:
+            logger.info("No GOOGLE_CHAT_WEBHOOK_URL configured; skipping eval notification for %s.", eval_id)
+            return False
+
+        is_done = str(status).upper() == "DONE"
+        summary = summary or {}
+        sheet_url = str(summary.get("spreadsheet_url") or "")
+        overall_recall = float(summary.get("overall_recall", 0.0)) * 100.0
+        holdout_recall = float(summary.get("holdout_recall", 0.0)) * 100.0
+        dev_recall = float(summary.get("dev_recall", 0.0)) * 100.0
+        findings_per_clip = float(summary.get("findings_per_clip", 0.0))
+        hit_rate = float(summary.get("hit_rate", 0.0)) * 100.0
+        total_cost_usd = float(summary.get("total_cost_usd", 0.0))
+        total_tokens = int(summary.get("total_tokens", 0))
+        guardrails_ok = bool(summary.get("guardrails_passed", False))
+
+        widgets: list[dict[str, Any]] = [
+            {
+                "decoratedText": {
+                    "topLabel": "评测负责人 / 配方版本",
+                    "text": f"<b>{supervisor_email or '督导'}</b> · SOP: <code>{prompt_tab_name}</code> · 模型: <code>{model_version}</code>",
+                }
+            },
+        ]
+        if is_done:
+            widgets.append(
+                {
+                    "decoratedText": {
+                        "topLabel": "核心召回率指标 (Recall)",
+                        "text": (
+                            f"总体召回率: <b>{overall_recall:.1f}%</b> | "
+                            f"留出集 (Holdout): <b>{holdout_recall:.1f}%</b> | "
+                            f"开发集 (Dev): <b>{dev_recall:.1f}%</b>"
+                        ),
+                    }
+                }
+            )
+            widgets.append(
+                {
+                    "decoratedText": {
+                        "topLabel": "护栏与成本指标 (Guardrails & FinOps)",
+                        "text": (
+                            f"护栏状态: <b>{'✅ 通过' if guardrails_ok else '⚠️ 触发护栏'}</b> | "
+                            f"告警密度: <b>{findings_per_clip:.2f} 条/段</b> | "
+                            f"片段命中率: <b>{hit_rate:.1f}%</b> | "
+                            f"成本: <b>${total_cost_usd:.2f}</b> ({total_tokens:,} Tokens)"
+                        ),
+                        **(
+                            {
+                                "button": {
+                                    "text": "📊 打开 5-Tab 黄金集测评报告 Sheet",
+                                    "onClick": {"openLink": {"url": sheet_url}},
+                                }
+                            }
+                            if sheet_url
+                            else {}
+                        ),
+                    }
+                }
+            )
+        else:
+            widgets.append(
+                {
+                    "decoratedText": {
+                        "topLabel": "失败原因 (Failure Details)",
+                        "text": f"❌ <b>{(error_message or '评测任务执行异常')[:260]}</b>",
+                    }
+                }
+            )
+
+        header_title = (
+            f"✅ 黄金集评测已完成：{eval_name} ({eval_id})"
+            if is_done
+            else f"⚠️ 黄金集评测未通过/执行异常：{eval_name} ({eval_id})"
+        )
+        payload = {
+            "cardsV2": [
+                {
+                    "cardId": f"scheduled-eval-{run_id or eval_id}",
+                    "card": {
+                        "header": {
+                            "title": header_title,
+                            "subtitle": f"Run ID: {run_id} · SOP: {prompt_tab_name} · 模型: {model_version}",
+                        },
+                        "sections": [
+                            {
+                                "header": "黄金集评测结果摘要（零污染源视频目录，已归档至专属测评文件夹）",
+                                "widgets": widgets,
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(webhook_url, json=payload)
+                resp.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.warning("Failed to send Google Chat eval notification: %s", exc)
+            return False

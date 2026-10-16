@@ -600,6 +600,13 @@ resource "google_cloud_run_v2_service" "cctv_audit_worker" {
           value = env.value
         }
       }
+      dynamic "env" {
+        for_each = var.eval_results_folder_id == "" ? [] : [var.eval_results_folder_id]
+        content {
+          name  = "EVAL_RESULTS_FOLDER_ID"
+          value = env.value
+        }
+      }
     }
   }
 
@@ -711,6 +718,13 @@ resource "google_cloud_run_v2_job" "cctv_audit_job_worker" {
           for_each = var.enable_google_chat_notification && var.google_chat_webhook_url != "" ? [var.google_chat_webhook_url] : []
           content {
             name  = "GOOGLE_CHAT_WEBHOOK_URL"
+            value = env.value
+          }
+        }
+        dynamic "env" {
+          for_each = var.eval_results_folder_id == "" ? [] : [var.eval_results_folder_id]
+          content {
+            name  = "EVAL_RESULTS_FOLDER_ID"
             value = env.value
           }
         }
