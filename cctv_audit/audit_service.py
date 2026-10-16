@@ -142,6 +142,7 @@ class AuditService:
                     "state": JobState.REJECTED,
                     "folder_name": detected_folder_name or job.folder_name,
                     "preflight_report": rejected,
+                    "error_message": rejected.message_to_user,
                 }
             )
             return await self.jobs.save(job)
@@ -155,6 +156,7 @@ class AuditService:
                 "state": new_state,
                 "folder_name": detected_folder_name or job.folder_name,
                 "preflight_report": inspect_res,
+                "error_message": None if inspect_res.passed else inspect_res.message_to_user,
             }
         )
         saved_job = await self.jobs.save(job)

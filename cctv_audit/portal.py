@@ -677,7 +677,16 @@ async def load_portal_payload(
                     ),
                     "report_sheet_url": st_sheet,
                     "error_message": (
-                        (live_job.error_message or t.error_message)
+                        (
+                            live_job.error_message
+                            or (
+                                live_job.preflight_report.message_to_user
+                                if live_job.preflight_report is not None
+                                and not live_job.preflight_report.passed
+                                else ""
+                            )
+                            or t.error_message
+                        )
                         if live_job is not None
                         else t.error_message
                     ),
@@ -783,7 +792,15 @@ async def load_portal_payload(
         "job_state": target_job.state.value.upper(),
         "completed_segments_count": len(target_job.completed_segments),
         "planned_segments_count": total_segs,
-        "error_message": target_job.error_message or "",
+        "error_message": (
+            target_job.error_message
+            or (
+                target_job.preflight_report.message_to_user
+                if target_job.preflight_report is not None
+                and not target_job.preflight_report.passed
+                else ""
+            )
+        ),
         "folder_id": target_job.folder_id,
         "folder_url": folder_url,
         "sheet_url": target_job.report_sheet_url or "",

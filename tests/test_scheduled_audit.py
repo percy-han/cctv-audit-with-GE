@@ -1875,6 +1875,124 @@ def test_migrate_tab2_rows_and_build_master_sheet_validations() -> None:
     assert len(reqs) == 12
 
 
+def test_preflight_rejected_store_preserves_error_message_in_batch_and_portal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a store's videos fail preflight (`< 720P` resolution gate), `finalize_store_in_batch`
+    must preserve the detailed preflight rejection message instead of overwriting it with `""`,
+    and `load_portal_payload` must expose it in both `error_message` and `batch_stores[*].error_message`.
+    """
+
+    async def _run() -> None:
+        job_store = UserScopedJobStore(state_dir=tmp_path / "jobs")
+        state_store = ScheduledStateStore(local_dir=tmp_path / "sched_state")
+        svc = AuditService(job_store=job_store)
+
+        async def _no_setup_problem_with_name(folder_id: str) -> tuple[str, str]:
+            return "", "test03"
+
+        monkeypatch.setattr(svc, "_workspace_setup_problem_with_name", _no_setup_problem_with_name)
+
+        status_updates: Dict[int, str] = {}
+        batch_summary_notifications: List[Dict[str, Any]] = []
+
+        async def _update_rule_status(
+            row_index: int, status_text: str, sheet_id: Optional[str] = None
+        ) -> None:
+            status_updates[row_index] = status_text
+
+        async def _fake_send_batch_summary(**kwargs: Any) -> bool:
+            batch_summary_notifications.append(kwargs)
+            return True
+
+        monkeypatch.setattr(svc.prompt_manager, "update_scheduled_rule_status", _update_rule_status)
+        monkeypatch.setattr(
+            svc.reporter, "send_batch_summary_notification", _fake_send_batch_summary
+        )
+
+        rule = _make_sample_rule(
+            row_index=2,
+            rule_id="SCHED-All",
+            root_folder_id="folder_root",
+            trigger_time="12:45",
+            timezone="UTC",
+        )
+
+        async def _load_rules(sheet_id: Optional[str] = None) -> List[ScheduledAuditRule]:
+            return [rule]
+
+        monkeypatch.setattr(svc.prompt_manager, "load_scheduled_rules", _load_rules)
+
+        folders = {
+            "folder_root": {"id": "folder_root", "name": "Root", "parents": [], "trashed": False},
+            "folder_test03": {
+                "id": "folder_test03",
+                "name": "test03",
+                "parents": ["folder_root"],
+                "trashed": False,
+            },
+        }
+        videos = [
+            {
+                "id": "vid_low1",
+                "name": "low_res_clip1.mp4",
+                "mimeType": "video/mp4",
+                "size": "1000000",
+                "parents": ["folder_test03"],
+                "createdTime": "2026-10-16T12:40:00Z",
+                "videoMediaMetadata": {"width": 960, "height": 540, "durationMillis": 300000},
+            },
+            {
+                "id": "vid_low2",
+                "name": "low_res_clip2.mp4",
+                "mimeType": "video/mp4",
+                "size": "1000000",
+                "parents": ["folder_test03"],
+                "createdTime": "2026-10-16T12:41:00Z",
+                "videoMediaMetadata": {"width": 960, "height": 540, "durationMillis": 300000},
+            },
+        ]
+        fake_drive = _FakeDriveService(video_files=videos, folders=folders)
+        engine = ScheduledAuditEngine(
+            audit_service=svc,
+            state_store=state_store,
+            drive_service_factory=lambda email: fake_drive,
+            cloud_run_job_dispatcher=lambda j: None,
+        )
+
+        tick_res = await engine.run_scheduled_tick(
+            now_utc=dt.datetime(2026, 10, 16, 12, 45, tzinfo=dt.timezone.utc)
+        )
+        assert tick_res["status"] == "triggered"
+        batch_id = tick_res["triggered_batches"][0]["batch_id"]
+        assert len(batch_summary_notifications) == 1
+        st_summary = batch_summary_notifications[0]["store_summaries"][0]
+        assert st_summary["state"] == "REJECTED"
+        assert "REJECTED_LOW_RESOLUTION" in st_summary["error_message"]
+        assert "low_res_clip1.mp4" in st_summary["error_message"]
+
+        import time
+        from cctv_audit.portal import compute_portal_signature, load_portal_payload
+
+        exp = int(time.time()) + 3600
+        sig = compute_portal_signature(batch_id=batch_id, exp=exp)
+        payload = await load_portal_payload(
+            audit_service=svc,
+            job_store=job_store,
+            state_store=state_store,
+            batch_id=batch_id,
+            exp=exp,
+            sig=sig,
+        )
+        assert payload["job_state"] == "REJECTED"
+        assert "REJECTED_LOW_RESOLUTION" in payload["error_message"]
+        assert "low_res_clip1.mp4" in payload["error_message"]
+        assert "REJECTED_LOW_RESOLUTION" in payload["batch_stores"][0]["error_message"]
+
+    asyncio.run(_run())
+
+
+
 
 
 

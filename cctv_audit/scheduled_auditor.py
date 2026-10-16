@@ -1025,6 +1025,17 @@ class ScheduledAuditEngine:
                     ),
                     4,
                 )
+                resolved_err = (
+                    finished_job.error_message
+                    or (
+                        finished_job.preflight_report.message_to_user[:200]
+                        if finished_job.preflight_report is not None
+                        and not finished_job.preflight_report.passed
+                        else ""
+                    )
+                    or task_entry.error_message
+                    or ""
+                )
                 task_entry = task_entry.model_copy(
                     update={
                         "state": finished_job.state.value.upper(),
@@ -1032,7 +1043,7 @@ class ScheduledAuditEngine:
                         "total_tokens": finished_job.total_tokens_used,
                         "cost_usd": cost_usd,
                         "report_sheet_url": finished_job.report_sheet_url or "",
-                        "error_message": finished_job.error_message or "",
+                        "error_message": resolved_err,
                     }
                 )
                 batch.store_tasks[finished_job.job_id] = task_entry
