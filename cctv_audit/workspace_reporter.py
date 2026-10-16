@@ -529,11 +529,17 @@ class WorkspaceReporter:
             st_state = str(st.get("state") or "RUNNING").upper()
             v_cnt = int(st.get("video_count") or 0)
             st_job_id = str(st.get("job_id") or "")
-            err_msg = str(st.get("error_message") or "")
+            err_msg = str(st.get("error_message") or "").replace("\n", " ")
+            skipped_low_res = list(st.get("skipped_low_res_videos") or [])
+            skipped_note = (
+                f"<br>⚠️ 已自动跳过 {len(skipped_low_res)} 支 &lt;720P 低清视频：{', '.join(skipped_low_res[:3])}"
+                if skipped_low_res and st_state == "RUNNING"
+                else ""
+            )
             detail_txt = (
-                f"<b>{fname}</b> — 新增视频 {v_cnt} 支（后台稽核中）"
+                f"<b>{fname}</b> — 新增视频 {v_cnt} 支（后台稽核中）{skipped_note}"
                 if st_state == "RUNNING"
-                else f"<b>{fname}</b> — 预检拦截（{err_msg[:80] or '详见日志'}）"
+                else f"<b>{fname}</b> — ❌ 预检拦截：{err_msg[:220] or '详见日志'}"
             )
             widgets.append(
                 {
@@ -648,7 +654,13 @@ class WorkspaceReporter:
             viol_cnt = int(st.get("violations_found") or 0)
             tok_cnt = int(st.get("total_tokens") or 0)
             s_url = str(st.get("report_sheet_url") or "")
-            err_msg = str(st.get("error_message") or "")
+            err_msg = str(st.get("error_message") or "").replace("\n", " ")
+            skipped_low_res = list(st.get("skipped_low_res_videos") or [])
+            skipped_note = (
+                f"<br>⚠️ 已自动跳过 {len(skipped_low_res)} 支 &lt;720P 低清视频：{', '.join(skipped_low_res[:3])}"
+                if skipped_low_res and st_state == "DONE"
+                else ""
+            )
             store_portal_url = (
                 build_portal_url(batch_id=batch_id, store_job_id=st_job_id)
                 if st_job_id
@@ -664,11 +676,18 @@ class WorkspaceReporter:
                 if store_portal_url.startswith("http")
                 else "📊 打开报告 Sheet"
             )
-            row_text = (
-                f"<b>{fname}</b> — 视频 {v_cnt} 支 | 待复核 {viol_cnt} 项 | {tok_cnt:,} Tokens"
-                if st_state == "DONE"
-                else f"<b>{fname}</b> — 执行失败（{err_msg[:80] or '详见日志'}）"
-            )
+            if st_state == "DONE":
+                row_text = (
+                    f"<b>{fname}</b> — 视频 {v_cnt} 支 | 待复核 {viol_cnt} 项 | {tok_cnt:,} Tokens{skipped_note}"
+                )
+            elif st_state == "REJECTED":
+                row_text = (
+                    f"<b>{fname}</b> — ❌ <b>预检未通过（0 Token 消耗）</b><br>{err_msg[:220] or '视频分辨率低于 720P 或目录缺少编辑权限'}"
+                )
+            else:
+                row_text = (
+                    f"<b>{fname}</b> — ❌ <b>执行异常中断</b><br>{err_msg[:220] or '详见日志'}"
+                )
             widgets.append(
                 {
                     "decoratedText": {
@@ -688,13 +707,20 @@ class WorkspaceReporter:
                 }
             )
 
+        if succeeded_stores == total_stores:
+            header_title = f"✅ 定时巡检已完成：{rule_name} ({rule_id})"
+        elif succeeded_stores == 0:
+            header_title = f"⚠️ 定时巡检未通过预检/执行异常：{rule_name} ({rule_id})"
+        else:
+            header_title = f"⚠️ 定时巡检部分完成（含预检拦截）：{rule_name} ({rule_id})"
+
         payload = {
             "cardsV2": [
                 {
                     "cardId": f"scheduled-batch-{batch_id}",
                     "card": {
                         "header": {
-                            "title": f"✅ 定时巡检已完成：{rule_name} ({rule_id})",
+                            "title": header_title,
                             "subtitle": f"Batch ID: {batch_id} · 覆盖 {total_stores} 家门店 / {total_videos} 支视频 · 待复核 {total_violations} 项",
                         },
                         "sections": [

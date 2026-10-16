@@ -56,10 +56,11 @@ class FileLedgerState(str, Enum):
     DISPATCHED = "DISPATCHED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    REJECTED_LOW_RES = "REJECTED_LOW_RES"
 
 
 class FileLedgerEntry(BaseModel):
-    """Per-video 3-state deduplication ledger stored at `schedules/ledgers/files/{safe_file_id}.json`."""
+    """Per-video deduplication ledger stored at `schedules/ledgers/files/{safe_file_id}.json`."""
 
     file_id: str
     filename: str
@@ -83,6 +84,7 @@ class ScheduledStoreTask(BaseModel):
     folder_name: str
     video_file_ids: List[str] = Field(default_factory=list)
     video_count: int = 0
+    skipped_low_res_videos: List[str] = Field(default_factory=list)
     state: str = "RUNNING"
     violations_found: int = 0
     total_tokens: int = 0
@@ -765,7 +767,10 @@ class ScheduledAuditEngine:
             existing = None
 
         if existing is not None:
-            if existing.state == FileLedgerState.COMPLETED:
+            if existing.state in (
+                FileLedgerState.COMPLETED,
+                FileLedgerState.REJECTED_LOW_RES,
+            ):
                 return False
             if existing.state == FileLedgerState.DISPATCHED:
                 prev_job = await self.service.jobs.get(existing.user_id, existing.job_id)
@@ -822,9 +827,15 @@ class ScheduledAuditEngine:
         job_id: str,
         succeeded: bool,
         error_message: str = "",
+        terminal_state: Optional[FileLedgerState] = None,
     ) -> None:
-        """Transitions a file's ledger entry to `COMPLETED` or `FAILED` when its store job finishes."""
+        """Transitions a file's ledger entry to `COMPLETED`, `REJECTED_LOW_RES`, or `FAILED` when its store job finishes."""
         key = self.state_store.file_ledger_key(file_id)
+        target_state = (
+            terminal_state
+            if terminal_state is not None
+            else (FileLedgerState.COMPLETED if succeeded else FileLedgerState.FAILED)
+        )
         for _ in range(3):
             raw, gen = await asyncio.to_thread(self.state_store.read_text_with_generation, key)
             if raw is None:
@@ -833,14 +844,22 @@ class ScheduledAuditEngine:
                 entry = FileLedgerEntry.model_validate_json(raw)
             except Exception:
                 return
-            if entry.job_id and entry.job_id != job_id and entry.state == FileLedgerState.COMPLETED:
+            if (
+                entry.job_id
+                and entry.job_id != job_id
+                and entry.state in (FileLedgerState.COMPLETED, FileLedgerState.REJECTED_LOW_RES)
+            ):
                 return
             updated = entry.model_copy(
                 update={
                     "job_id": job_id,
-                    "state": FileLedgerState.COMPLETED if succeeded else FileLedgerState.FAILED,
+                    "state": target_state,
                     "updated_at": time.time(),
-                    "error_message": "" if succeeded else (error_message or "")[:240],
+                    "error_message": (
+                        ""
+                        if target_state == FileLedgerState.COMPLETED
+                        else (error_message or "")[:240]
+                    ),
                 }
             )
             try:
@@ -1028,7 +1047,7 @@ class ScheduledAuditEngine:
                 resolved_err = (
                     finished_job.error_message
                     or (
-                        finished_job.preflight_report.message_to_user[:200]
+                        finished_job.preflight_report.message_to_user[:300]
                         if finished_job.preflight_report is not None
                         and not finished_job.preflight_report.passed
                         else ""
@@ -1043,7 +1062,7 @@ class ScheduledAuditEngine:
                         "total_tokens": finished_job.total_tokens_used,
                         "cost_usd": cost_usd,
                         "report_sheet_url": finished_job.report_sheet_url or "",
-                        "error_message": resolved_err,
+                        "error_message": resolved_err[:300],
                     }
                 )
                 batch.store_tasks[finished_job.job_id] = task_entry
@@ -1095,12 +1114,26 @@ class ScheduledAuditEngine:
         total_videos = sum(int(s["video_count"]) for s in summaries)
         total_viol = sum(int(s["violations_found"]) for s in summaries)
         total_tok = sum(int(s["total_tokens"]) for s in summaries)
+        skipped_low_res_cnt = sum(
+            len(s.get("skipped_low_res_videos") or [])
+            for s in summaries
+            if s["state"] == "DONE"
+        )
+        failed_notes = [
+            f"[{s['folder_name']}] {(s.get('error_message') or '预检/执行未通过').replace(chr(10), ' ')[:140]}"
+            for s in summaries
+            if s["state"] != "DONE"
+        ]
         prefix_icon = "✅" if ok_stores == total_stores else "⚠️"
         status_msg = (
             f"{prefix_icon} {final_batch.local_date} 批次 {final_batch.batch_id} 完成："
             f"门店 {ok_stores}/{total_stores} 家（共 {total_videos} 支视频），"
             f"检出 {total_viol} 项，总计 {total_tok:,} Tokens"
         )
+        if skipped_low_res_cnt > 0:
+            status_msg += f"（另已自动跳过 {skipped_low_res_cnt} 支 <720P 低清视频）"
+        if failed_notes:
+            status_msg += f"；未通过原因：{'；'.join(failed_notes)}"
         await self.service.prompt_manager.update_scheduled_rule_status(
             final_batch.row_index, status_msg
         )
@@ -1275,6 +1308,16 @@ class ScheduledAuditEngine:
             jobs_to_dispatch: List[AuditJob] = []
 
             for leaf_id, (leaf_name, leaf_cands) in claimed_by_leaf.items():
+                valid_cands = [c for c in leaf_cands if min(c.width, c.height) >= 720]
+                low_res_cands = [c for c in leaf_cands if min(c.width, c.height) < 720]
+                skipped_low_res_labels = [
+                    f"{c.filename} ({c.width}x{c.height})" for c in low_res_cands
+                ]
+
+                # Option A: If a folder contains both >=720P and <720P videos, skip only the <720P
+                # videos (marking them REJECTED_LOW_RES in the file ledger so they are not re-claimed
+                # on subsequent days) and audit the remaining >=720P videos normally.
+                cands_for_preflight = valid_cands if valid_cands else low_res_cands
                 preloaded = [
                     VideoMetadataItem(
                         file_id=c.file_id,
@@ -1285,7 +1328,7 @@ class ScheduledAuditEngine:
                         mime_type=c.mime_type,
                         size_bytes=c.size_bytes,
                     )
-                    for c in leaf_cands
+                    for c in cands_for_preflight
                 ]
                 job = await self.service.preflight(
                     user_id=rule.supervisor_email,
@@ -1293,29 +1336,50 @@ class ScheduledAuditEngine:
                     session_id=f"sched_{batch_id}_{_safe_slug(leaf_id, 12)}",
                     preloaded_items=preloaded,
                 )
-                if job.state != JobState.READY:
-                    # Release/mark file ledgers as FAILED so operator can fix folder permissions or resolution
-                    err_reason = (
-                        job.preflight_report.message_to_user
-                        if job.preflight_report
-                        else "预检未通过"
+
+                for low_c in low_res_cands:
+                    await self.mark_file_ledger_terminal(
+                        low_c.file_id,
+                        job_id=job.job_id,
+                        succeeded=False,
+                        error_message=(
+                            f"视频分辨率 {low_c.width}x{low_c.height} 低于 720P 门禁 ({low_c.filename})"
+                        ),
+                        terminal_state=FileLedgerState.REJECTED_LOW_RES,
                     )
-                    for c in leaf_cands:
+
+                if job.state != JobState.READY:
+                    err_reason = (
+                        (
+                            job.preflight_report.message_to_user
+                            if job.preflight_report
+                            else job.error_message
+                        )
+                        or "预检未通过"
+                    )
+                    is_low_res_err = "REJECTED_LOW_RESOLUTION" in err_reason
+                    for c in valid_cands:
                         await self.mark_file_ledger_terminal(
                             c.file_id,
                             job_id=job.job_id,
                             succeeded=False,
                             error_message=err_reason,
+                            terminal_state=(
+                                FileLedgerState.REJECTED_LOW_RES
+                                if is_low_res_err
+                                else FileLedgerState.FAILED
+                            ),
                         )
                     store_tasks[job.job_id] = ScheduledStoreTask(
                         job_id=job.job_id,
                         user_id=rule.supervisor_email,
                         folder_id=leaf_id,
                         folder_name=leaf_name,
-                        video_file_ids=[c.file_id for c in leaf_cands],
-                        video_count=len(leaf_cands),
-                        state="FAILED",
-                        error_message=err_reason[:200],
+                        video_file_ids=[c.file_id for c in cands_for_preflight],
+                        video_count=len(cands_for_preflight),
+                        skipped_low_res_videos=skipped_low_res_labels,
+                        state=job.state.value.upper(),
+                        error_message=err_reason[:300],
                     )
                     continue
 
@@ -1330,8 +1394,8 @@ class ScheduledAuditEngine:
                 )
                 job = await self.service.jobs.save(job)
 
-                # Bind the real job_id into each claimed video's ledger entry
-                for c in leaf_cands:
+                # Bind the real job_id into each claimed >=720P video's ledger entry
+                for c in valid_cands:
                     f_key = self.state_store.file_ledger_key(c.file_id)
                     raw_f, gen_f = await asyncio.to_thread(
                         self.state_store.read_text_with_generation, f_key
@@ -1355,8 +1419,9 @@ class ScheduledAuditEngine:
                     user_id=rule.supervisor_email,
                     folder_id=leaf_id,
                     folder_name=leaf_name,
-                    video_file_ids=[c.file_id for c in leaf_cands],
-                    video_count=len(leaf_cands),
+                    video_file_ids=[c.file_id for c in valid_cands],
+                    video_count=len(valid_cands),
+                    skipped_low_res_videos=skipped_low_res_labels,
                     state="RUNNING",
                 )
                 jobs_to_dispatch.append(job)

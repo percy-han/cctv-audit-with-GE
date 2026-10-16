@@ -1988,6 +1988,65 @@ def test_preflight_rejected_store_preserves_error_message_in_batch_and_portal(
         assert "REJECTED_LOW_RESOLUTION" in payload["error_message"]
         assert "low_res_clip1.mp4" in payload["error_message"]
         assert "REJECTED_LOW_RESOLUTION" in payload["batch_stores"][0]["error_message"]
+        assert "未通过原因：[test03]" in status_updates[2]
+
+        # Verify both low-res videos are permanently marked REJECTED_LOW_RES and NOT re-claimed on Day 2!
+        for vid_id in ("vid_low1", "vid_low2"):
+            raw_l, _ = state_store.read_text_with_generation(state_store.file_ledger_key(vid_id))
+            assert raw_l is not None
+            assert (
+                FileLedgerEntry.model_validate_json(raw_l).state
+                == FileLedgerState.REJECTED_LOW_RES
+            )
+
+        videos[0]["createdTime"] = "2026-10-17T12:40:00Z"
+        videos[1]["createdTime"] = "2026-10-17T12:41:00Z"
+        tick_day2 = await engine.run_scheduled_tick(
+            now_utc=dt.datetime(2026, 10, 17, 12, 45, tzinfo=dt.timezone.utc)
+        )
+        assert tick_day2["triggered_batches"][0]["status"] == "no_new_videos"
+
+        # Option A: Now upload 1 HD (1080P) video + 1 new low-res (540P) video into the same folder ->
+        # the 540P video is skipped (REJECTED_LOW_RES) while the 1080P video passes preflight and dispatches!
+        videos.extend(
+            [
+                {
+                    "id": "vid_hd_new",
+                    "name": "hd_clip3.mp4",
+                    "mimeType": "video/mp4",
+                    "size": "2000000",
+                    "parents": ["folder_test03"],
+                    "createdTime": "2026-10-18T12:40:00Z",
+                    "videoMediaMetadata": {"width": 1920, "height": 1080, "durationMillis": 300000},
+                },
+                {
+                    "id": "vid_low_new",
+                    "name": "low_res_clip4.mp4",
+                    "mimeType": "video/mp4",
+                    "size": "1000000",
+                    "parents": ["folder_test03"],
+                    "createdTime": "2026-10-18T12:41:00Z",
+                    "videoMediaMetadata": {"width": 960, "height": 540, "durationMillis": 300000},
+                },
+            ]
+        )
+        dispatched: List[AuditJob] = []
+        engine._cloud_run_job_dispatcher = lambda j: dispatched.append(j)
+        tick_day3 = await engine.run_scheduled_tick(
+            now_utc=dt.datetime(2026, 10, 18, 12, 45, tzinfo=dt.timezone.utc)
+        )
+        assert tick_day3["triggered_batches"][0]["status"] == "dispatched"
+        assert len(dispatched) == 1
+        assert dispatched[0].preflight_report.total_videos == 1
+        assert dispatched[0].preflight_report.videos[0].filename == "hd_clip3.mp4"
+        raw_low_new, _ = state_store.read_text_with_generation(
+            state_store.file_ledger_key("vid_low_new")
+        )
+        assert raw_low_new is not None
+        assert (
+            FileLedgerEntry.model_validate_json(raw_low_new).state
+            == FileLedgerState.REJECTED_LOW_RES
+        )
 
     asyncio.run(_run())
 
