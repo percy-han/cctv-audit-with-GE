@@ -854,7 +854,9 @@ def test_resolve_chat_user_id_and_completion_notification_mention(monkeypatch):
             )
         )
         assert ok is True
-        assert "<users/104120710022716991580> (`test-1@example.com`)" in posted[-1][1]["text"]
+        assert "text" not in posted[-1][1]
+        p1_str = json.dumps(posted[-1][1], ensure_ascii=False)
+        assert "<users/104120710022716991580> (<code>test-1@example.com</code>)" in p1_str
 
         # When DWD is absent or fails for an unknown user, falls back gracefully to plain email
         monkeypatch.delenv("WORKSPACE_DWD_SERVICE_ACCOUNT", raising=False)
@@ -868,8 +870,10 @@ def test_resolve_chat_user_id_and_completion_notification_mention(monkeypatch):
             )
         )
         assert ok2 is True
-        assert "• **发起督导**：`other@example.com`" in posted[-1][1]["text"]
-        assert "<users/" not in posted[-1][1]["text"]
+        assert "text" not in posted[-1][1]
+        p2_str = json.dumps(posted[-1][1], ensure_ascii=False)
+        assert "<b>发起督导</b>：<code>other@example.com</code>" in p2_str
+        assert "<users/" not in p2_str
 
         # When ENABLE_GOOGLE_CHAT_NOTIFICATION=false, send_completion_notification skips posting
         # even when webhook_url is configured.

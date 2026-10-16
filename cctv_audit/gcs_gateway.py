@@ -120,11 +120,18 @@ def _staging_bucket_name() -> str:
 
 
 def _assert_not_internal_state_prefix(bucket: str, prefix: str) -> None:
-    """Rejects ANY path in the service's staging bucket (videos, reports, evidence and SOP workbooks).
+    """Rejects ANY path in the service's staging bucket or internal `config/` prefix.
 
     The staging bucket holds job state (`jobs/`, `eval/`, `smoke/`, ...) and has a 30-day
     `age = 30 -> Delete` lifecycle rule, so customer files placed there would silently vanish.
     """
+    norm_prefix = (prefix or "").strip("/")
+    if norm_prefix == "config" or norm_prefix.startswith("config/"):
+        shown = f"gs://{bucket}/{norm_prefix}"
+        raise WorkspaceAccessError(
+            f"`{shown}` 位于本稽核服务的内部配置目录（`config/`），"
+            "不能存放门店视频、稽核报告或 SOP 配置文件：请改用门店目录（例如 `gs://<客户存储桶>/stores/门店名/`）"
+        )
     staging = _staging_bucket_name()
     if not staging or bucket.lower() != staging:
         return
@@ -155,6 +162,7 @@ TAB1_HEADERS = [
     "AI稽核证据描述 (Evidence_Description)",
     "20秒证据视频链接 (Evidence_Drive_URL)",
     "人工复核状态 (Human_Review_Status)",
+    "人工复核备注 (Human_Review_Note)",
 ]
 TAB2_HEADERS = [
     "稽核单号 (Audit_ID)",
@@ -173,7 +181,7 @@ TAB2_HEADERS = [
     "检出事件数 (Flagged_Events)",
     "降级告警 (Fallback_Warning)",
 ]
-TAB1_WIDTHS = [22, 28, 16, 14, 16, 12, 10, 60, 48, 28]
+TAB1_WIDTHS = [22, 28, 16, 14, 16, 12, 10, 60, 48, 28, 36]
 TAB2_WIDTHS = [22, 36, 28, 12, 12, 22, 30, 12, 12, 12, 12, 12, 14, 12, 30]
 TAB1_STATUS_COL = 4  # 判定类型 (Disposition)
 TAB1_LINK_COL = 8  # 20秒证据视频链接
@@ -197,6 +205,88 @@ def disposition_status_label(value: Any) -> str:
     return _DISPOSITION_STATUS.get(text.upper(), "")
 
 
+def build_incident_composite_key(
+    audit_id: str,
+    video_filename: str,
+    timestamp_in_clip: str,
+    rule_id: str,
+    occ_idx: int = 0,
+) -> str:
+    """Deterministic composite key for a Tab-1 row (`{audit_id}::{video}::{ts}::{rule_id}::{occ_idx}`)."""
+    return (
+        f"{str(audit_id or '').strip()}::"
+        f"{str(video_filename or '').strip()}::"
+        f"{str(timestamp_in_clip or '').strip()}::"
+        f"{str(rule_id or '').strip()}::"
+        f"{int(occ_idx)}"
+    )
+
+
+def match_and_apply_tab1_reviews(
+    raw_rows: Sequence[Sequence[Any]],
+    updates: Sequence[Dict[str, Any]],
+) -> Tuple[List[List[Any]], List[Tuple[int, str, str]]]:
+    """Matches `updates` against `Tab 1` data rows (excluding header) by composite key.
+
+    Returns `(updated_rows, patches)` where each patch is `(sheet_row_1based, new_status, new_note)`.
+    """
+    padded_rows: List[List[Any]] = []
+    base_key_counts: Dict[str, int] = {}
+    full_key_to_idx: Dict[str, int] = {}
+    base_key_to_indices: Dict[str, List[int]] = {}
+
+    for idx, r in enumerate(raw_rows):
+        row = [str(c) for c in list(r)[:11]] + [""] * max(0, 11 - len(r))
+        try:
+            row[6] = float(row[6] or 0.0)
+        except (TypeError, ValueError):
+            row[6] = 0.0
+        padded_rows.append(row)
+        base_key = (
+            f"{row[0].strip()}::{row[1].strip()}::{row[2].strip()}::{row[3].strip()}"
+        )
+        occ_idx = base_key_counts.get(base_key, 0)
+        base_key_counts[base_key] = occ_idx + 1
+        full_key = f"{base_key}::{occ_idx}"
+        full_key_to_idx[full_key] = idx
+        base_key_to_indices.setdefault(base_key, []).append(idx)
+
+    patches_by_idx: Dict[int, Tuple[str, str]] = {}
+    for u in updates:
+        inc_id = str(u.get("incident_id") or "").strip()
+        if not inc_id and u.get("audit_id") and u.get("rule_id"):
+            inc_id = build_incident_composite_key(
+                str(u.get("audit_id") or ""),
+                str(u.get("video_filename") or ""),
+                str(u.get("timestamp_in_clip") or ""),
+                str(u.get("rule_id") or ""),
+                int(u.get("occ_idx") or 0),
+            )
+        if not inc_id:
+            continue
+        target_idx = full_key_to_idx.get(inc_id)
+        if target_idx is None:
+            parts = inc_id.split("::")
+            if len(parts) == 4:
+                candidates = base_key_to_indices.get(inc_id) or []
+                if candidates:
+                    target_idx = candidates[0]
+        if target_idx is None:
+            continue
+        row = padded_rows[target_idx]
+        if "human_review_status" in u and u["human_review_status"] is not None:
+            row[9] = str(u["human_review_status"])
+        if "human_review_note" in u and u["human_review_note"] is not None:
+            row[10] = str(u["human_review_note"])
+        patches_by_idx[target_idx] = (str(row[9]), str(row[10]))
+
+    patches = [
+        (idx + 2, status_val, note_val)
+        for idx, (status_val, note_val) in sorted(patches_by_idx.items())
+    ]
+    return padded_rows, patches
+
+
 def build_tab1_values(tab1_rows: Sequence[Any]) -> List[List[Any]]:
     values: List[List[Any]] = [list(TAB1_HEADERS)]
     for r in tab1_rows:
@@ -212,6 +302,7 @@ def build_tab1_values(tab1_rows: Sequence[Any]) -> List[List[Any]]:
                 str(getattr(r, "evidence_description", "")),
                 str(getattr(r, "evidence_drive_url", "")),
                 str(getattr(r, "human_review_status", "")),
+                str(getattr(r, "human_review_note", "") or ""),
             ]
         )
     return values
@@ -1018,15 +1109,85 @@ class GcsStorageGateway:
         *,
         reuse_suffix: str = "",
     ) -> Tuple[str, str]:
-        """Writes the dual-tab `.xlsx` report into the prefix (fixed name: re-publishing overwrites)."""
+        """Writes the dual-tab `.xlsx` report into the prefix, preserving historical rows from
+        previously audited videos in the same folder (Method 1: Same-Sheet Smart Append).
+        """
         bucket, prefix = parse_gcs_uri(parent_folder_id)
         _assert_not_internal_state_prefix(bucket, prefix)
         fname = re.sub(r'[\\/:*?"<>|]+', "_", title) + reuse_suffix + ".xlsx"
         obj = f"{prefix}/{fname}" if prefix else fname
         uri = f"gs://{bucket}/{obj}"
-        payload = build_dual_tab_xlsx_bytes(tab1_rows, tab2_rows)
+        audited_video_filenames = {
+            str(getattr(r, "video_filename", "")).strip()
+            for r in (*tab1_rows, *tab2_rows)
+            if str(getattr(r, "video_filename", "")).strip()
+        }
 
         def _write() -> Tuple[str, str]:
+            kept_tab1_rows: List[List[Any]] = []
+            kept_tab2_rows: List[List[Any]] = []
+            if audited_video_filenames:
+                try:
+                    ex_status, ex_body = self._request("GET", self._media_url(bucket, obj), timeout=20.0)
+                    if ex_status == 200 and ex_body:
+                        ex_sheets = read_xlsx_sheets(ex_body)
+                        for raw_row in (ex_sheets.get(TAB1_TITLE) or [])[1:]:
+                            if (
+                                len(raw_row) > 1
+                                and str(raw_row[1]).strip()
+                                and str(raw_row[1]).strip() not in audited_video_filenames
+                            ):
+                                padded = [str(c) for c in raw_row[:11]] + [""] * max(0, 11 - len(raw_row))
+                                try:
+                                    padded[6] = float(padded[6] or 0.0)
+                                except (TypeError, ValueError):
+                                    padded[6] = 0.0
+                                kept_tab1_rows.append(padded)
+                        for raw_row in (ex_sheets.get(TAB2_TITLE) or [])[1:]:
+                            if (
+                                len(raw_row) > 2
+                                and str(raw_row[2]).strip()
+                                and str(raw_row[2]).strip() not in audited_video_filenames
+                            ):
+                                padded2: List[Any] = [str(c) for c in raw_row[:15]] + [""] * max(
+                                    0, 15 - len(raw_row)
+                                )
+                                for f_idx in (3, 11):
+                                    try:
+                                        padded2[f_idx] = float(padded2[f_idx] or 0.0)
+                                    except (TypeError, ValueError):
+                                        padded2[f_idx] = 0.0
+                                for i_idx in (7, 8, 9, 10, 12, 13):
+                                    try:
+                                        padded2[i_idx] = int(float(padded2[i_idx] or 0))
+                                    except (TypeError, ValueError):
+                                        padded2[i_idx] = 0
+                                kept_tab2_rows.append(padded2)
+                except Exception as exc:
+                    logger.warning(
+                        "Non-fatal warning reading existing GCS report %s for smart append: %s",
+                        uri,
+                        exc,
+                    )
+
+            if kept_tab1_rows or kept_tab2_rows:
+                t1_vals = [list(TAB1_HEADERS), *kept_tab1_rows, *build_tab1_values(tab1_rows)[1:]]
+                t2_vals = [list(TAB2_HEADERS), *kept_tab2_rows, *build_tab2_values(tab2_rows)[1:]]
+                payload = build_xlsx_bytes(
+                    [
+                        {
+                            "name": TAB1_TITLE,
+                            "rows": t1_vals,
+                            "widths": TAB1_WIDTHS,
+                            "status_col": TAB1_STATUS_COL,
+                            "link_cols": (TAB1_LINK_COL,),
+                        },
+                        {"name": TAB2_TITLE, "rows": t2_vals, "widths": TAB2_WIDTHS},
+                    ]
+                )
+            else:
+                payload = build_dual_tab_xlsx_bytes(tab1_rows, tab2_rows)
+
             status, body = self._request(
                 "POST",
                 self._upload_url(bucket, obj),
@@ -1039,6 +1200,102 @@ class GcsStorageGateway:
             return uri, build_gcs_console_object_url(uri)
 
         return await asyncio.to_thread(_write)
+
+    def _resolve_report_object(self, parent_folder_id: str, sheet_id_or_url: str) -> Tuple[str, str]:
+        if sheet_id_or_url and is_gcs_target(sheet_id_or_url):
+            return parse_gcs_uri(sheet_id_or_url)
+        bucket, prefix = parse_gcs_uri(parent_folder_id)
+        _assert_not_internal_state_prefix(bucket, prefix)
+        fname = "📊 AI稽核报告与Token账单.xlsx"
+        obj = f"{prefix}/{fname}" if prefix else fname
+        return bucket, obj
+
+    async def read_report_sheet_data(
+        self,
+        parent_folder_id: str,
+        sheet_id_or_url: str = "",
+    ) -> Tuple[List[List[str]], List[List[str]]]:
+        """Reads `(tab1_rows_without_header, tab2_rows_without_header)` from a GCS `.xlsx` report."""
+        bucket, obj = self._resolve_report_object(parent_folder_id, sheet_id_or_url)
+
+        def _read() -> Tuple[List[List[str]], List[List[str]]]:
+            status, body = self._request("GET", self._media_url(bucket, obj), timeout=20.0)
+            if status == 404 or not body:
+                return [], []
+            self._check(status, body, bucket, obj, "读取")
+            sheets = read_xlsx_sheets(body)
+            t1 = [
+                [str(c) for c in r[:11]] + [""] * max(0, 11 - len(r))
+                for r in (sheets.get(TAB1_TITLE) or [])[1:]
+                if any(str(c).strip() for c in r)
+            ]
+            t2 = [
+                [str(c) for c in r[:15]] + [""] * max(0, 15 - len(r))
+                for r in (sheets.get(TAB2_TITLE) or [])[1:]
+                if any(str(c).strip() for c in r)
+            ]
+            return t1, t2
+
+        return await asyncio.to_thread(_read)
+
+    async def update_report_human_reviews(
+        self,
+        parent_folder_id: str,
+        sheet_id_or_url: str,
+        updates: Sequence[Dict[str, Any]],
+    ) -> int:
+        """Applies human review status & note updates to `Tab 1` of a GCS `.xlsx` report by composite key."""
+        if not updates:
+            return 0
+        bucket, obj = self._resolve_report_object(parent_folder_id, sheet_id_or_url)
+
+        def _update() -> int:
+            status, body = self._request("GET", self._media_url(bucket, obj), timeout=20.0)
+            self._check(status, body, bucket, obj, "读取")
+            ex_sheets = read_xlsx_sheets(body)
+            raw_t1 = (ex_sheets.get(TAB1_TITLE) or [])[1:]
+            raw_t2 = (ex_sheets.get(TAB2_TITLE) or [])[1:]
+            updated_t1, patches = match_and_apply_tab1_reviews(raw_t1, updates)
+            if not patches:
+                return 0
+            t2_rows: List[List[Any]] = []
+            for r in raw_t2:
+                padded2: List[Any] = [str(c) for c in r[:15]] + [""] * max(0, 15 - len(r))
+                for f_idx in (3, 11):
+                    try:
+                        padded2[f_idx] = float(padded2[f_idx] or 0.0)
+                    except (TypeError, ValueError):
+                        padded2[f_idx] = 0.0
+                for i_idx in (7, 8, 9, 10, 12, 13):
+                    try:
+                        padded2[i_idx] = int(float(padded2[i_idx] or 0))
+                    except (TypeError, ValueError):
+                        padded2[i_idx] = 0
+                t2_rows.append(padded2)
+            payload = build_xlsx_bytes(
+                [
+                    {
+                        "name": TAB1_TITLE,
+                        "rows": [list(TAB1_HEADERS), *updated_t1],
+                        "widths": TAB1_WIDTHS,
+                        "status_col": TAB1_STATUS_COL,
+                        "link_cols": (TAB1_LINK_COL,),
+                    },
+                    {"name": TAB2_TITLE, "rows": [list(TAB2_HEADERS), *t2_rows], "widths": TAB2_WIDTHS},
+                ]
+            )
+            up_status, up_body = self._request(
+                "POST",
+                self._upload_url(bucket, obj),
+                body=payload,
+                content_type=XLSX_CONTENT_TYPE,
+                content_length=len(payload),
+                timeout=60.0,
+            )
+            self._check(up_status, up_body, bucket, obj, "写入")
+            return len(patches)
+
+        return await asyncio.to_thread(_update)
 
 
 class RoutingStorageGateway:
@@ -1096,6 +1353,25 @@ class RoutingStorageGateway:
     ) -> Tuple[str, str]:
         return await self._for(parent_folder_id).create_dual_tab_report_sheet(
             parent_folder_id, title, tab1_rows, tab2_rows, reuse_suffix=reuse_suffix
+        )
+
+    async def read_report_sheet_data(
+        self,
+        parent_folder_id: str,
+        sheet_id_or_url: str = "",
+    ) -> Tuple[List[List[str]], List[List[str]]]:
+        target = sheet_id_or_url if is_gcs_target(sheet_id_or_url) else parent_folder_id
+        return await self._for(target).read_report_sheet_data(parent_folder_id, sheet_id_or_url)
+
+    async def update_report_human_reviews(
+        self,
+        parent_folder_id: str,
+        sheet_id_or_url: str,
+        updates: Sequence[Dict[str, Any]],
+    ) -> int:
+        target = sheet_id_or_url if is_gcs_target(sheet_id_or_url) else parent_folder_id
+        return await self._for(target).update_report_human_reviews(
+            parent_folder_id, sheet_id_or_url, updates
         )
 
     def __getattr__(self, name: str) -> Any:

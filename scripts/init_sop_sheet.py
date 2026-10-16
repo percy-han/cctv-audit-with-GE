@@ -267,6 +267,17 @@ def write_tabs(service: Any, sheet_id: str, tabs: list[dict[str, Any]], overwrit
             spreadsheetId=sheet_id, body={"requests": [{"deleteSheet": {"sheetId": placeholder[0]}}]}
         ).execute()
 
+    # Apply native Google Sheets dropdown & formula validations across Tab0, Prompt_*, and Tab2.
+    _import_cctv_audit()
+    from cctv_audit.prompt_manager import build_master_sheet_validation_requests
+
+    updated_meta = service.spreadsheets().get(spreadsheetId=sheet_id, fields="sheets.properties").execute()
+    val_requests = build_master_sheet_validation_requests(updated_meta)
+    if val_requests:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id, body={"requests": val_requests}
+        ).execute()
+
 
 def verify(service: Any, sheet_id: str, tabs: list[dict[str, Any]]) -> None:
     """Read every tab back and compare cell by cell (trailing empty cells ignored)."""

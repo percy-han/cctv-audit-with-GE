@@ -274,14 +274,14 @@ variable "enable_google_chat_notification" {
 }
 
 variable "google_chat_webhook_url" {
-  description = "Google Chat incoming webhook URL (`https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=...`) used when `enable_google_chat_notification = true`."
+  description = "Google Chat incoming webhook URL (`https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=...`) or a `gs://<bucket>/<object>` URI whose content is the webhook URL, used when `enable_google_chat_notification = true`."
   type        = string
   default     = ""
   sensitive   = true
 
   validation {
-    condition     = var.google_chat_webhook_url == "" || can(regex("^https://chat\\.googleapis\\.com/", var.google_chat_webhook_url))
-    error_message = "google_chat_webhook_url must be empty or a https://chat.googleapis.com/... incoming webhook URL."
+    condition     = var.google_chat_webhook_url == "" || can(regex("^(https://chat\\.googleapis\\.com/|gs://[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]/.+)", var.google_chat_webhook_url))
+    error_message = "google_chat_webhook_url must be empty, a https://chat.googleapis.com/... incoming webhook URL, or a gs://<bucket>/<object> URI storing the webhook URL."
   }
 }
 
@@ -293,9 +293,11 @@ locals {
   # Every per-stack name, derived from var.name_prefix (overrides only where old names are adopted).
   # The worker SA and the image repository are created by bootstrap/ with the same derivation.
   artifact_repository_id = var.artifact_repository_id != "" ? var.artifact_repository_id : "${var.name_prefix}-images"
-  worker_account_id      = "${var.name_prefix}-worker"
-  worker_service_name    = "${var.name_prefix}-worker"
-  watchdog_job_name      = "${var.name_prefix}-watchdog"
+  worker_account_id       = "${var.name_prefix}-worker"
+  worker_service_name     = "${var.name_prefix}-worker"
+  worker_job_name         = "${var.name_prefix}-worker-job"
+  watchdog_job_name       = "${var.name_prefix}-watchdog"
+  scheduled_tick_job_name = "${var.name_prefix}-scheduled-tick"
   staging_bucket_name    = var.staging_bucket_name != "" ? var.staging_bucket_name : "${var.project_id}-${var.name_prefix}-staging"
   workspace_bucket_name  = var.workspace_bucket_name != "" ? var.workspace_bucket_name : "${var.project_id}-${var.name_prefix}-workspace"
   gcs_sop_uri            = "gs://${local.workspace_bucket_name}/sop/master_sheet.xlsx"
@@ -507,11 +509,12 @@ resource "google_artifact_registry_repository_iam_member" "worker_image_puller" 
 # Scales from 0 to 20 instances (strictly 1 active job per container via `max_instance_request_concurrency = 1`
 # + `hold_connection = true`, up to 20 x 5 = 100 concurrent video slice streams across the audit team).
 resource "google_cloud_run_v2_service" "cctv_audit_worker" {
-  count               = var.enable_standalone_cloud_run ? 1 : 0
-  name                = local.worker_service_name
-  location            = var.region
-  ingress             = "INGRESS_TRAFFIC_ALL"
-  deletion_protection = false
+  count                = var.enable_standalone_cloud_run ? 1 : 0
+  name                 = local.worker_service_name
+  location             = var.region
+  ingress              = "INGRESS_TRAFFIC_ALL"
+  invoker_iam_disabled = true
+  deletion_protection  = false
 
   template {
     service_account                  = data.google_service_account.audit_worker_sa.email
@@ -564,8 +567,16 @@ resource "google_cloud_run_v2_service" "cctv_audit_worker" {
         value = "https://${local.worker_service_name}-${data.google_project.current.number}.${var.region}.run.app"
       }
       env {
+        name  = "CLOUD_RUN_JOB_NAME"
+        value = local.worker_job_name
+      }
+      env {
         name  = "ENABLE_BACKGROUND_WATCHDOG"
         value = "false"
+      }
+      env {
+        name  = "ENFORCE_INTERNAL_OIDC_AUTH"
+        value = "true"
       }
       env {
         name  = "WORKSPACE_DWD_SERVICE_ACCOUNT"
@@ -619,6 +630,103 @@ resource "google_cloud_run_v2_service_iam_member" "reasoning_engine_worker_invok
   location = var.region
   name     = google_cloud_run_v2_service.cctv_audit_worker[0].name
   role     = "roles/run.invoker"
+  member   = "serviceAccount:${data.google_service_account.audit_worker_sa.email}"
+}
+
+# 4b. Tier 2 Batch Compute: Cloud Run Jobs (`timeout = "86400s"` = 24 hours) for Scheduled Store Audits (REQ-009)
+# Reuses the identical digest-pinned container image (`python3 -m cctv_audit.job_runner`), isolating each
+# store folder into its own 24-hour execution so 10+ hour store video backlogs never hit the 60-minute
+# Cloud Run Service HTTP timeout.
+resource "google_cloud_run_v2_job" "cctv_audit_job_worker" {
+  count               = var.enable_standalone_cloud_run ? 1 : 0
+  name                = local.worker_job_name
+  location            = var.region
+  deletion_protection = false
+
+  template {
+    template {
+      service_account = data.google_service_account.audit_worker_sa.email
+      timeout         = "86400s"
+      max_retries     = 1
+
+      containers {
+        image   = var.container_image
+        command = ["python3", "-m", "cctv_audit.job_runner"]
+
+        resources {
+          limits = {
+            cpu    = "4"
+            memory = "16Gi"
+          }
+        }
+
+        env {
+          name  = "GCP_PROJECT"
+          value = var.project_id
+        }
+        env {
+          name  = "GCP_LOCATION"
+          value = var.region
+        }
+        env {
+          name  = "VERTEX_MODEL_LOCATION"
+          value = var.vertex_model_location
+        }
+        env {
+          name  = "STAGING_BUCKET"
+          value = google_storage_bucket.staging_bucket.name
+        }
+        env {
+          name  = "MASTER_PROMPT_SHEET_ID"
+          value = var.master_prompt_sheet_id
+        }
+        env {
+          name  = "GCS_SOP_URI"
+          value = "gs://${google_storage_bucket.workspace_bucket.name}/sop/master_sheet.xlsx"
+        }
+        env {
+          name  = "CLOUD_RUN_WORKER_URL"
+          value = "https://${local.worker_service_name}-${data.google_project.current.number}.${var.region}.run.app"
+        }
+        env {
+          name  = "ENABLE_BACKGROUND_WATCHDOG"
+          value = "false"
+        }
+        env {
+          name  = "WORKSPACE_DWD_SERVICE_ACCOUNT"
+          value = data.google_service_account.audit_worker_sa.email
+        }
+        dynamic "env" {
+          for_each = var.workspace_impersonate_user == "" ? [] : [var.workspace_impersonate_user]
+          content {
+            name  = "WORKSPACE_IMPERSONATE_USER"
+            value = env.value
+          }
+        }
+        env {
+          name  = "ENABLE_GOOGLE_CHAT_NOTIFICATION"
+          value = tostring(var.enable_google_chat_notification)
+        }
+        dynamic "env" {
+          for_each = var.enable_google_chat_notification && var.google_chat_webhook_url != "" ? [var.google_chat_webhook_url] : []
+          content {
+            name  = "GOOGLE_CHAT_WEBHOOK_URL"
+            value = env.value
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [google_project_service.required, terraform_data.stack_teardown]
+}
+
+resource "google_cloud_run_v2_job_iam_member" "worker_job_executor" {
+  count    = var.enable_standalone_cloud_run ? 1 : 0
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_job.cctv_audit_job_worker[0].name
+  role     = "roles/run.jobsExecutorWithOverrides"
   member   = "serviceAccount:${data.google_service_account.audit_worker_sa.email}"
 }
 
@@ -798,6 +906,32 @@ resource "google_cloud_scheduler_job" "cctv_audit_watchdog" {
     google_project_service.cloud_scheduler_api,
     google_cloud_run_v2_service.cctv_audit_worker,
     google_cloud_run_v2_service_iam_member.reasoning_engine_worker_invoker,
+  ]
+}
+
+resource "google_cloud_scheduler_job" "cctv_audit_scheduled_tick" {
+  count       = var.enable_standalone_cloud_run ? 1 : 0
+  name        = local.scheduled_tick_job_name
+  description = "Evaluates Tab2 scheduled CCTV audit rules every 15 minutes and dispatches per-store Cloud Run Jobs."
+  schedule    = "*/15 * * * *"
+  time_zone   = var.scheduler_time_zone
+  region      = var.region
+
+  http_target {
+    http_method = "POST"
+    uri         = "${google_cloud_run_v2_service.cctv_audit_worker[0].uri}/internal/jobs/scheduled-tick"
+    oidc_token {
+      service_account_email = data.google_service_account.audit_worker_sa.email
+      audience              = google_cloud_run_v2_service.cctv_audit_worker[0].uri
+    }
+  }
+
+  depends_on = [
+    google_project_service.cloud_scheduler_api,
+    google_cloud_run_v2_service.cctv_audit_worker,
+    google_cloud_run_v2_service_iam_member.reasoning_engine_worker_invoker,
+    google_cloud_run_v2_job.cctv_audit_job_worker,
+    google_cloud_run_v2_job_iam_member.worker_job_executor,
   ]
 }
 

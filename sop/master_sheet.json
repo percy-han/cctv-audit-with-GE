@@ -870,6 +870,44 @@
      "加冰与配料顺序错误、未使用量杯、未刮除多余泡沫或雪克杯内液体果肉未完全倒净"
     ]
    ]
+  },
+  {
+   "title": "Tab2_定时巡检配置表",
+   "values": [
+    [
+     "Rule_ID",
+     "Rule_Name",
+     "Root_Folder_URL",
+     "Trigger_Hour_UTC",
+     "Trigger_Minute_UTC",
+     "Lookback_Days",
+     "Supervisor_Email",
+     "Enabled",
+     "Last_Run_Status"
+    ],
+    [
+     "SCHED-EXAMPLE-DRIVE",
+     "【示例】大区每日自动巡检（填入根文件夹链接并将 Enabled 改为 ENABLED 后生效）",
+     "https://drive.google.com/drive/folders/1ExampleRootFolderIdReplaceMe0000",
+     "18",
+     "00",
+     "1",
+     "auditor@example.com",
+     "PAUSED",
+     "默认示例（未启用）"
+    ],
+    [
+     "SCHED-EXAMPLE-GCS",
+     "【示例】Zero-GWS 存储桶每日自动巡检（填入 gs:// 根目录并将 Enabled 改为 ENABLED 后生效）",
+     "gs://example-workspace-bucket/stores",
+     "19",
+     "00",
+     "1",
+     "auditor@example.com",
+     "PAUSED",
+     "默认示例（未启用）"
+    ]
+   ]
   }
  ]
 }

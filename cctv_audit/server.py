@@ -42,14 +42,29 @@ from typing import Any, Dict, List, Optional
 
 try:
     from fastapi import FastAPI, Request
-    from fastapi.responses import StreamingResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 except ImportError:  # Graceful fallback when running unit tests without fastapi installed
 
     class Request:  # type: ignore[no-redef]
         base_url: str = "http://localhost:8080/"
+        query_params: Dict[str, str] = {}
 
         async def json(self) -> Dict[str, Any]:
             return {}
+
+    class HTMLResponse:  # type: ignore[no-redef]
+        def __init__(self, content: str, status_code: int = 200) -> None:
+            self.body = content.encode("utf-8")
+            self.content = content
+            self.status_code = status_code
+            self.media_type = "text/html"
+
+    class JSONResponse:  # type: ignore[no-redef]
+        def __init__(self, content: Any, status_code: int = 200) -> None:
+            self.body = json.dumps(content, ensure_ascii=False).encode("utf-8")
+            self.content = content
+            self.status_code = status_code
+            self.media_type = "application/json"
 
     class StreamingResponse:  # type: ignore[no-redef]
         def __init__(self, content: Any, media_type: str = "application/x-ndjson") -> None:
@@ -79,6 +94,13 @@ logger = logging.getLogger("cctv_audit.server")
 app = FastAPI(title="Chagee CCTV AI Audit Worker (Zero-DB Workspace + Serverless)")
 
 from .gcs_gateway import RoutingStorageGateway, build_gcs_console_folder_url, is_gcs_target
+from .portal import (
+    apply_portal_reviews,
+    build_portal_url,
+    load_portal_payload,
+    render_supervisor_portal_html,
+    set_detected_base_url,
+)
 from .workspace_reporter import WorkspaceReporter
 # `gs://` targets go to GcsStorageGateway (Zero-GWS mode); everything else to GoogleWorkspaceGateway.
 _gw = RoutingStorageGateway()
@@ -126,6 +148,83 @@ def _header_value(request: Any, name: str) -> str:
                 value = candidate
                 break
     return str(value).strip() if value else ""
+
+
+def _capture_external_base_url(request: Any) -> None:
+    """Captures the public Cloud Run `.run.app` base URL from incoming request headers so
+    outbound Google Chat notification cards and `/portal` links resolve to the real HTTPS host
+    even when `CLOUD_RUN_WORKER_URL` is not explicitly set on the Cloud Run Service container.
+    """
+    if request is None:
+        return
+    host = (
+        _header_value(request, "x-forwarded-host")
+        or _header_value(request, "host")
+    ).strip()
+    if host and (".run.app" in host or not host.startswith(("localhost", "127.0.0.1"))):
+        proto = (_header_value(request, "x-forwarded-proto") or "https").split(",")[0].strip()
+        set_detected_base_url(f"{proto}://{host}")
+        return
+    base = str(getattr(request, "base_url", "") or "").strip().rstrip("/")
+    if base and (".run.app" in base or not base.startswith(("http://localhost", "http://127.0.0.1"))):
+        set_detected_base_url(base)
+
+
+def _verify_internal_oidc_request(request: Any) -> Optional[JSONResponse]:
+    """[P0-2] Mandatory endpoint isolation when `/portal` is publicly reachable on Cloud Run:
+    When `ENFORCE_INTERNAL_OIDC_AUTH=true`, requires a valid Google-signed OIDC Bearer token
+    on `/internal/*`, `/a2a`, `/inspect`, and `/execute` endpoints.
+    """
+    enforce = os.environ.get("ENFORCE_INTERNAL_OIDC_AUTH", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if not enforce:
+        return None
+    auth_header = _header_value(request, "authorization")
+    if not auth_header.lower().startswith("bearer "):
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Unauthorized: missing Bearer OIDC token"},
+        )
+    token = auth_header[7:].strip()
+    if not token:
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Unauthorized: empty Bearer OIDC token"},
+        )
+    try:
+        from google.auth.transport import requests as google_requests
+        from google.oauth2 import id_token
+
+        claims = id_token.verify_oauth2_token(token, google_requests.Request())
+        issuer = str(claims.get("iss") or "")
+        if issuer not in ("https://accounts.google.com", "accounts.google.com"):
+            return JSONResponse(
+                status_code=403,
+                content={"error": f"Forbidden: untrusted token issuer {issuer!r}"},
+            )
+        allowed_emails_raw = os.environ.get("ALLOWED_INTERNAL_INVOKER_EMAILS", "").strip()
+        if allowed_emails_raw:
+            allowed = {
+                e.strip().lower() for e in allowed_emails_raw.split(",") if e.strip()
+            }
+            caller_email = str(claims.get("email") or "").strip().lower()
+            if caller_email not in allowed and not caller_email.endswith(
+                ".gserviceaccount.com"
+            ):
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": f"Forbidden: principal {caller_email!r} not authorized"},
+                )
+        return None
+    except Exception as exc:
+        logger.warning("Rejected invalid OIDC token on internal endpoint: %s", exc)
+        return JSONResponse(
+            status_code=403,
+            content={"error": f"Forbidden: invalid OIDC token ({exc})"},
+        )
 
 
 def extract_proxy_asserted_user(request: Any) -> tuple[str, str]:
@@ -328,11 +427,18 @@ async def _handle_conversation_turn(
                 f"• 尚未启动后台 AI 稽核，请直接回复「**确认开始**」立即启动（单号 `{job.job_id}`）。"
             )
         if job.state.value == "done":
+            portal_url = build_portal_url(job_id=job.job_id, user_id=job.user_id)
+            portal_line = (
+                f"• 🖥️ **HTML 督导复核工作台**：[点击打开复核工作台]({portal_url})\n"
+                if portal_url
+                else ""
+            )
             report_lines = (
+                f"{portal_line}"
                 f"• 📊 **稽核报告（Excel .xlsx）**：{job.report_sheet_url}\n"
                 f"• 📁 **GCS 报告与违规证据切片目录**：[点击打开 Google Cloud Storage 目录]({build_gcs_console_folder_url(job.folder_id)})"
                 if gcs_job
-                else f"• 专属报告 Sheet：{job.report_sheet_url}"
+                else f"{portal_line}• 专属报告 Sheet：{job.report_sheet_url}"
             )
             return (
                 f"✅ **任务 `{job.job_id}` 已完成！**\n"
@@ -434,7 +540,7 @@ def build_jsonrpc_error(rpc_id: Any, code: int, message: str) -> Dict[str, Any]:
 
 
 @app.post("/a2a")
-async def a2a_jsonrpc_endpoint(request: Request) -> Dict[str, Any]:
+async def a2a_jsonrpc_endpoint(request: Request) -> Any:
     """Handles Gemini Enterprise A2A JSON-RPC 2.0 (`message/send` / `tasks/send`) requests on Cloud Run.
 
     Hardening notes (see module docstring):
@@ -446,6 +552,10 @@ async def a2a_jsonrpc_endpoint(request: Request) -> Dict[str, Any]:
     * The tenant key prefers the Cloud Run IAM / IAP asserted header over `params.metadata`, which
       is caller-controlled and is the sole key guarding `UserScopedJobStore` (`REQ-008`).
     """
+    _capture_external_base_url(request)
+    oidc_err = _verify_internal_oidc_request(request)
+    if oidc_err is not None:
+        return oidc_err
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001 - any decode failure is a JSON-RPC parse error
@@ -533,7 +643,11 @@ async def a2a_jsonrpc_endpoint(request: Request) -> Dict[str, Any]:
 
 
 @app.post("/inspect")
-async def http_inspect(payload: InspectRequestPayload) -> Dict[str, Any]:
+async def http_inspect(payload: InspectRequestPayload, request: Request = None) -> Any:  # type: ignore[assignment]
+    _capture_external_base_url(request)
+    oidc_err = _verify_internal_oidc_request(request)
+    if oidc_err is not None:
+        return oidc_err
     job = await audit_service.preflight(
         user_id=payload.user_email,
         drive_url=payload.drive_url,
@@ -544,7 +658,11 @@ async def http_inspect(payload: InspectRequestPayload) -> Dict[str, Any]:
 
 
 @app.post("/execute")
-async def http_execute(payload: ExecuteRequestPayload) -> Dict[str, Any]:
+async def http_execute(payload: ExecuteRequestPayload, request: Request = None) -> Any:  # type: ignore[assignment]
+    _capture_external_base_url(request)
+    oidc_err = _verify_internal_oidc_request(request)
+    if oidc_err is not None:
+        return oidc_err
     job = await audit_service.start_audit(
         user_id=payload.user_email,
         job_id=payload.job_id,
@@ -772,7 +890,9 @@ class InternalJobExecuteRequest(BaseModel):
 
 
 @app.post("/internal/jobs/execute")
-async def internal_execute_job(req: InternalJobExecuteRequest) -> Any:
+async def internal_execute_job(
+    req: InternalJobExecuteRequest, request: Request = None  # type: ignore[assignment]
+) -> Any:
     """Elastic Cloud Run Worker Pool endpoint invoked by ReasoningEngine (`CLOUD_RUN_WORKER_URL`).
 
     Rehydrates `AuditJob` from `gs://${STAGING_BUCKET}/jobs/{user_slug}/{job_id}.json`,
@@ -781,7 +901,10 @@ async def internal_execute_job(req: InternalJobExecuteRequest) -> Any:
     Enforces strict 1-job-per-container isolation (`--concurrency=1`): if this container already has
     an active job running, returns HTTP 429 so the caller/load-balancer routes to a fresh instance.
     """
-    from fastapi.responses import JSONResponse
+    _capture_external_base_url(request)
+    oidc_err = _verify_internal_oidc_request(request)
+    if oidc_err is not None:
+        return oidc_err
 
     if audit_service.has_active_work():
         return JSONResponse(
@@ -808,7 +931,7 @@ async def internal_execute_job(req: InternalJobExecuteRequest) -> Any:
 
 
 @app.post("/internal/jobs/sweep")
-async def internal_sweep_stale_jobs() -> Dict[str, Any]:
+async def internal_sweep_stale_jobs(request: Request = None) -> Any:  # type: ignore[assignment]
     """Unattended Watchdog endpoint (`POST /internal/jobs/sweep`), invoked every 2 minutes by
     Google Cloud Scheduler (main.tf `<name_prefix>-watchdog`) and the Tier-1 background watchdog loop.
 
@@ -816,6 +939,10 @@ async def internal_sweep_stale_jobs() -> Dict[str, Any]:
     this sweep detects the stale `heartbeat_at` (`> 180s`) or `FAILED` status in GCS and automatically
     resumes the job from the last completed 30-minute `SegmentCheckpoint` with zero human intervention.
     """
+    _capture_external_base_url(request)
+    oidc_err = _verify_internal_oidc_request(request)
+    if oidc_err is not None:
+        return oidc_err
     resumed = await audit_service.sweep_and_resume_stale_jobs()
     return {
         "swept": True,
@@ -830,6 +957,166 @@ async def internal_sweep_stale_jobs() -> Dict[str, Any]:
             for j in resumed
         ],
     }
+
+
+@app.post("/internal/jobs/scheduled-tick")
+async def internal_scheduled_tick(request: Request = None) -> Any:  # type: ignore[assignment]
+    """Daily Scheduled Auto-Audit Tick endpoint (`POST /internal/jobs/scheduled-tick`), invoked
+    every 15 minutes by Google Cloud Scheduler (`<name_prefix>-scheduled-tick`).
+
+    Evaluates `[Tab 2: 定时巡检配置表]` (`Tab2_定时巡检配置表`), acquires per-rule daily locks in GCS,
+    discovers incremental videos across nested folders via Time-Agnostic Closest-Ancestor Carve-Out,
+    and dispatches 24-hour Cloud Run Jobs per leaf store folder.
+    """
+    _capture_external_base_url(request)
+    oidc_err = _verify_internal_oidc_request(request)
+    if oidc_err is not None:
+        return oidc_err
+    return await audit_service.run_scheduled_tick()
+
+
+class PortalReviewUpdateItem(BaseModel):
+    incident_id: str = Field(description="Composite primary key of the incident row")
+    status: str = Field(default="待复核", description="Supervisor review decision")
+    note: str = Field(default="", description="Optional supervisor review note")
+
+
+class PortalReviewRequestPayload(BaseModel):
+    job_id: str = Field(default="")
+    job: str = Field(default="")
+    batch_id: str = Field(default="")
+    batch: str = Field(default="")
+    store_job_id: str = Field(default="")
+    store: str = Field(default="")
+    user_id: str = Field(default="")
+    user: str = Field(default="")
+    exp: int = Field(default=0)
+    sig: str = Field(default="")
+    reviews: List[PortalReviewUpdateItem] = Field(default_factory=list)
+    updates: List[PortalReviewUpdateItem] = Field(default_factory=list)
+
+
+def _query_param(request: Any, name: str) -> str:
+    params = getattr(request, "query_params", None)
+    if params is None:
+        return ""
+    getter = getattr(params, "get", None)
+    if callable(getter):
+        val = getter(name)
+        return str(val).strip() if val is not None else ""
+    return ""
+
+
+@app.get("/portal")
+async def supervisor_portal_page(request: Request) -> HTMLResponse:
+    """Serves the interactive HTML Supervisor Audit Portal (`REQ-015`) for either a single-store
+    `job` or a multi-store scheduled `batch`, guarded by HMAC-SHA256 signature verification.
+    """
+    _capture_external_base_url(request)
+    job_id = _query_param(request, "job") or _query_param(request, "job_id")
+    batch_id = _query_param(request, "batch") or _query_param(request, "batch_id")
+    store_job_id = _query_param(request, "store") or _query_param(request, "store_job_id")
+    user_id = _query_param(request, "user") or _query_param(request, "user_id")
+    sig = _query_param(request, "sig")
+    raw_exp = _query_param(request, "exp")
+    try:
+        exp = int(raw_exp) if raw_exp else 0
+    except ValueError:
+        exp = 0
+
+    try:
+        payload = await load_portal_payload(
+            audit_service=audit_service,
+            gateway=_gw,
+            job_id=job_id,
+            batch_id=batch_id,
+            store_job_id=store_job_id,
+            user_id=user_id,
+            exp=exp,
+            sig=sig,
+        )
+        return HTMLResponse(content=render_supervisor_portal_html(payload), status_code=200)
+    except PermissionError as exc:
+        return HTMLResponse(
+            content=(
+                "<!DOCTYPE html><html lang='zh-CN'><head><meta charset='UTF-8'><title>访问受限</title></head>"
+                "<body style='font-family:sans-serif;padding:48px;background:#FBF8F3;color:#1C1613;'>"
+                f"<h2>🔒 督导复核工作台访问受限 (403)</h2><p>{exc}</p>"
+                "<p>请从最新的 Google Chat 通知卡片中点击按钮重新打开。</p></body></html>"
+            ),
+            status_code=403,
+        )
+    except LookupError as exc:
+        return HTMLResponse(
+            content=(
+                "<!DOCTYPE html><html lang='zh-CN'><head><meta charset='UTF-8'><title>未找到任务</title></head>"
+                "<body style='font-family:sans-serif;padding:48px;background:#FBF8F3;color:#1C1613;'>"
+                f"<h2>🔍 未找到稽核任务或批次 (404)</h2><p>{exc}</p></body></html>"
+            ),
+            status_code=404,
+        )
+
+
+@app.get("/api/portal/data")
+async def supervisor_portal_data_api(request: Request) -> Any:
+    """Returns JSON data for the HTML Supervisor Audit Portal (`REQ-015`)."""
+    _capture_external_base_url(request)
+    job_id = _query_param(request, "job") or _query_param(request, "job_id")
+    batch_id = _query_param(request, "batch") or _query_param(request, "batch_id")
+    store_job_id = _query_param(request, "store") or _query_param(request, "store_job_id")
+    user_id = _query_param(request, "user") or _query_param(request, "user_id")
+    sig = _query_param(request, "sig")
+    raw_exp = _query_param(request, "exp")
+    try:
+        exp = int(raw_exp) if raw_exp else 0
+    except ValueError:
+        exp = 0
+
+    try:
+        return await load_portal_payload(
+            audit_service=audit_service,
+            gateway=_gw,
+            job_id=job_id,
+            batch_id=batch_id,
+            store_job_id=store_job_id,
+            user_id=user_id,
+            exp=exp,
+            sig=sig,
+        )
+    except PermissionError as exc:
+        return JSONResponse(status_code=403, content={"error": str(exc)})
+    except LookupError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+
+
+@app.post("/api/portal/review")
+async def supervisor_portal_review_api(
+    payload: PortalReviewRequestPayload, request: Request = None  # type: ignore[assignment]
+) -> Any:
+    """Writes supervisor human-review decisions (`✅ 已确认违规` / `❌ 误报予以剔除`) and notes
+    back to the underlying Google Sheet `Tab 1` (Columns J & K) using composite-key row matching (`[P0-1]`).
+    """
+    _capture_external_base_url(request)
+    eff_items = payload.updates if payload.updates else payload.reviews
+    try:
+        return await apply_portal_reviews(
+            audit_service=audit_service,
+            gateway=_gw,
+            job_id=payload.job_id or payload.job,
+            batch_id=payload.batch_id or payload.batch,
+            store_job_id=payload.store_job_id or payload.store,
+            user_id=payload.user_id or payload.user,
+            exp=payload.exp,
+            sig=payload.sig,
+            updates=[r.model_dump() for r in eff_items],
+        )
+    except PermissionError as exc:
+        return JSONResponse(status_code=403, content={"ok": False, "error": str(exc)})
+    except LookupError as exc:
+        return JSONResponse(status_code=404, content={"ok": False, "error": str(exc)})
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
+
 
 
 async def _tier1_unattended_watchdog_loop() -> None:

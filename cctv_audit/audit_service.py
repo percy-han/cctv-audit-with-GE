@@ -119,7 +119,7 @@ class AuditService:
         )
         await self.jobs.save(job)
 
-        setup_problem = await self._workspace_setup_problem(folder_id)
+        setup_problem, detected_folder_name = await self._workspace_setup_problem_with_name(folder_id)
         if setup_problem:
             rejected = InspectFolderResponse(
                 folder_id=folder_id,
@@ -138,7 +138,11 @@ class AuditService:
                 ),
             )
             job = job.model_copy(
-                update={"state": JobState.REJECTED, "preflight_report": rejected}
+                update={
+                    "state": JobState.REJECTED,
+                    "folder_name": detected_folder_name or job.folder_name,
+                    "preflight_report": rejected,
+                }
             )
             return await self.jobs.save(job)
 
@@ -149,6 +153,7 @@ class AuditService:
         job = job.model_copy(
             update={
                 "state": new_state,
+                "folder_name": detected_folder_name or job.folder_name,
                 "preflight_report": inspect_res,
             }
         )
@@ -157,19 +162,12 @@ class AuditService:
             self._schedule_prompt_config_warmup(folder_id)
         return saved_job
 
-    async def _workspace_setup_problem(self, folder_id: str) -> str:
-        """'' when the Workspace identity can write `folder_id` and read the SOP Sheet.
-
-        Otherwise the operator-actionable reason (who to share with / DWD not authorised / bot has
-        no Drive storage). Transient API faults propagate unchanged: they are not setup problems.
-        """
+    async def _workspace_setup_problem_with_name(self, folder_id: str) -> tuple[str, str]:
+        """Returns `(problem_message, folder_name)` after probing `folder_id` and SOP Sheet."""
         gateway = self.reporter._gateway
         if gateway is None:
-            return ""
+            return "", ""
         checks = [asyncio.wait_for(gateway.probe_write_access(folder_id), timeout=30.0)]
-        # Any configured SOP source is verified before spend; the routing gateway sends a
-        # `gs://.../master_sheet.xlsx|.json` to GCS and a Google Sheet ID to Workspace (also for
-        # hybrid deployments with videos in GCS). "" = Zero-GWS built-in rules, nothing to check.
         sop_id = config.effective_sop_source(folder_id)
         if sop_id:
             checks.append(
@@ -179,10 +177,20 @@ class AuditService:
         for res in results:
             if isinstance(res, WorkspaceConfigError):
                 logger.warning("Workspace setup check failed for folder %s: %s", folder_id, res)
-                return str(res)
+                return str(res), ""
             if isinstance(res, BaseException):
                 raise res
-        return ""
+        folder_name = str(results[0]).strip() if results and isinstance(results[0], str) else ""
+        return "", folder_name
+
+    async def _workspace_setup_problem(self, folder_id: str) -> str:
+        """'' when the Workspace identity can write `folder_id` and read the SOP Sheet.
+
+        Otherwise the operator-actionable reason (who to share with / DWD not authorised / bot has
+        no Drive storage). Transient API faults propagate unchanged: they are not setup problems.
+        """
+        problem, _ = await self._workspace_setup_problem_with_name(folder_id)
+        return problem
 
     async def start_audit(
         self,
@@ -245,6 +253,9 @@ class AuditService:
         # Every restart of a FAILED / stale-RUNNING job counts toward MAX_AUTO_RESUMES -- including one
         # that failed before its first checkpoint; otherwise the watchdog would retry it forever.
         is_restart = job.state in (JobState.FAILED, JobState.RUNNING)
+        should_send_start = (
+            not job.start_notification_sent and not is_restart and not job.batch_id
+        )
         prompt_cfg = await self.prompt_manager.load_active_config(
             sheet_id=config.effective_sop_source(job.folder_id)
         )
@@ -256,9 +267,40 @@ class AuditService:
                 "resume_count": job.resume_count + (1 if is_restart else 0),
                 "error_message": None,
                 "needs_operator_fix": False,
+                "start_notification_sent": job.start_notification_sent or should_send_start,
             }
         )
         job = await self.jobs.save(job)
+
+        if should_send_start:
+            try:
+                await self.reporter.send_job_start_notification(
+                    user_email=job.user_id,
+                    audit_id=job.job_id,
+                    folder_id=job.folder_id,
+                    folder_name=job.folder_name,
+                    video_count=(
+                        job.preflight_report.total_videos if job.preflight_report else 0
+                    ),
+                    total_duration_sec=(
+                        job.preflight_report.total_duration_sec
+                        if job.preflight_report
+                        else 0.0
+                    ),
+                    estimated_minutes=(
+                        job.preflight_report.estimated_minutes
+                        if job.preflight_report
+                        else 0.0
+                    ),
+                    model_version=prompt_cfg.active_model_version,
+                    prompt_version=prompt_cfg.active_prompt_version,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "Non-fatal error sending job start notification for %s: %s",
+                    job.job_id,
+                    exc,
+                )
 
         if wait_for_completion:
             await self._run_detached_audit(job, prompt_cfg)
@@ -651,6 +693,7 @@ class AuditService:
                 parent_folder_id=job.folder_id,
                 findings_by_video=findings_by_video,
                 ledger_rows=ledger_rows,
+                suppress_notification=bool(getattr(job, "batch_id", "")),
             )
             done_job = job.model_copy(
                 update={
@@ -811,5 +854,13 @@ class AuditService:
     def has_active_work(self) -> bool:
         """True if any detached background audit or preflight probe is in flight in this process."""
         return self.active_jobs_count() > 0
+
+    async def run_scheduled_tick(self, *, now_utc: Optional[Any] = None) -> dict[str, Any]:
+        """Executes one daily scheduled auto-audit tick (`REQ-009`)."""
+        from .scheduled_auditor import ScheduledAuditEngine
+
+        engine = ScheduledAuditEngine(audit_service=self)
+        return await engine.run_scheduled_tick(now_utc=now_utc)
+
 
 

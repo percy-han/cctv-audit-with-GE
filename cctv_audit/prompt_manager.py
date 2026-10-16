@@ -23,9 +23,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from pathlib import Path
-from typing import List, Optional, Protocol
+from typing import List, Optional, Protocol, Sequence
 
 import yaml
 from pydantic import BaseModel, Field
@@ -77,6 +78,66 @@ class PromptModelConfig(BaseModel):
     visual_scan_targets: List[VisualScanTarget] = Field(default_factory=list)
     rules: List[SopRuleItem] = Field(default_factory=list)
     system_instruction: str = Field(default="")
+
+
+TAB2_SCHEDULED_TITLE = "Tab2_定时巡检配置表"
+SCHEDULED_RULE_HEADERS: tuple[str, ...] = (
+    "Rule_ID",
+    "Rule_Name",
+    "Root_Folder_URL",
+    "Trigger_Hour_UTC",
+    "Trigger_Minute_UTC",
+    "Lookback_Days",
+    "Supervisor_Email",
+    "Enabled",
+    "Last_Run_Status",
+)
+LEGACY_SCHEDULED_RULE_HEADERS: tuple[str, ...] = (
+    "Rule_ID",
+    "Rule_Name",
+    "Root_Folder_URL",
+    "Trigger_Time",
+    "Timezone",
+    "Lookback_Hours",
+    "Supervisor_Email",
+    "Enabled",
+    "Last_Run_Status",
+)
+VALID_TRIGGER_HOURS_UTC: tuple[str, ...] = tuple(f"{h:02d}" for h in range(24))
+VALID_TRIGGER_MINUTES_UTC: tuple[str, ...] = ("00", "15", "30", "45")
+VALID_LOOKBACK_DAYS_OPTIONS: tuple[str, ...] = ("0.5", "1", "2", "3", "4", "5", "6", "7")
+VALID_LOOKBACK_DAYS_VALUES: frozenset[float] = frozenset({0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0})
+VALID_ENABLED_DROPDOWN_OPTIONS: tuple[str, ...] = ("ENABLED", "PAUSED")
+_VALID_SHEET_CACHE: set[str] = set()
+
+
+class ScheduledAuditRule(BaseModel):
+    """One row from `[Tab 2: 定时巡检配置表]` (`Tab2_定时巡检配置表`) in the Master SOP Sheet."""
+
+    row_index: int = Field(ge=2, description="1-based row number in Tab2_定时巡检配置表")
+    rule_id: str = Field(description="Unique schedule rule ID, e.g. SCHED-SG-01")
+    rule_name: str = Field(default="", description="Human-readable rule name")
+    root_folder_url: str = Field(description="Google Drive root folder URL/ID or gs:// prefix")
+    root_folder_id: str = Field(description="Normalized Google Drive folder ID or gs:// prefix")
+    trigger_time: str = Field(default="02:00", description="Daily trigger time in HH:MM (24h)")
+    timezone: str = Field(default="UTC", description="IANA timezone name (defaults to UTC)")
+    lookback_days: float = Field(
+        default=1.0, ge=0.01, le=30.0, description="Lookback window in days (0.5 to 7)"
+    )
+    lookback_hours: float = Field(default=24.0, ge=1.0, le=720.0)
+    supervisor_email: str = Field(description="Supervisor email for DWD and Chat @-mention")
+    enabled: bool = Field(default=True)
+    last_run_status: str = Field(default="")
+
+
+class ScheduledRuleRowError(BaseModel):
+    """Diagnostic record for an invalid row in `Tab2_定时巡检配置表` so the engine can write a loud error back to Column I (`Last_Run_Status`)."""
+
+    row_index: int = Field(ge=2)
+    rule_id: str = Field(default="")
+    error_message: str
+    previous_status: str = Field(default="")
+
 
 
 DEFAULT_VISUAL_SCAN_TARGETS: List[VisualScanTarget] = [
@@ -866,6 +927,589 @@ def render_v25_system_instruction(
     )
 
 
+_TRIGGER_TIME_RE = re.compile(r"^\s*([01]?\d|2[0-3]):([0-5]\d)\s*$")
+_DRIVE_FOLDER_ID_RE = re.compile(r"/folders/([a-zA-Z0-9_-]{10,})")
+_RAW_DRIVE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{10,}$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_TRUTHY_ENABLED_TOKENS = frozenset({"TRUE", "ENABLED", "YES", "1", "ON", "启用", "Y"})
+_FALSY_ENABLED_TOKENS = frozenset(
+    {"FALSE", "PAUSED", "DISABLED", "NO", "0", "OFF", "暂停", "禁用", "N", ""}
+)
+
+
+def _extract_scheduled_folder_id(raw_url: str) -> str:
+    text = (raw_url or "").strip()
+    if not text or "/file/d/" in text:
+        return ""
+    from .gcs_gateway import normalize_gcs_target
+
+    try:
+        gcs_uri = normalize_gcs_target(text)
+    except ValueError:
+        gcs_uri = None
+    if gcs_uri:
+        return gcs_uri
+    m = _DRIVE_FOLDER_ID_RE.search(text)
+    if m:
+        return m.group(1)
+    if _RAW_DRIVE_ID_RE.match(text):
+        return text
+    return ""
+
+
+def _is_legacy_tab2_header(header_row: List[str]) -> bool:
+    if not header_row:
+        return False
+    col3 = str(header_row[3]).strip().lower() if len(header_row) > 3 else ""
+    col5 = str(header_row[5]).strip().lower() if len(header_row) > 5 else ""
+    return col3 == "trigger_time" or col5 == "lookback_hours"
+
+
+def parse_scheduled_rules_with_diagnostics(
+    rows: List[List[str]],
+) -> tuple[List[ScheduledAuditRule], List[ScheduledRuleRowError]]:
+    """Parses `[Tab 2: 定时巡检配置表]` rows into `(valid_rules, row_errors)`.
+
+    Supports both:
+    - The simplified UTC schema (`Trigger_Hour_UTC`, `Trigger_Minute_UTC`, `Lookback_Days`,
+      with default `UTC` timezone, hours `00`–`23`, minutes `00`/`15`/`30`/`45`, and
+      lookback days `0.5` or `1`–`7` converted to `lookback_hours = days * 24.0`).
+    - The legacy schema (`Trigger_Time`, `Timezone`, `Lookback_Hours`) for backward compatibility.
+    """
+    from zoneinfo import ZoneInfo
+
+    if not rows or len(rows) < 2:
+        return [], []
+    is_legacy = _is_legacy_tab2_header(rows[0])
+    parsed: List[ScheduledAuditRule] = []
+    errors: List[ScheduledRuleRowError] = []
+    seen_rule_ids: dict[str, int] = {}
+
+    for idx, raw_row in enumerate(rows[1:], start=2):
+        padded = [str(c).strip() for c in raw_row] + [""] * max(0, 9 - len(raw_row))
+        (
+            rule_id,
+            rule_name,
+            root_url,
+            col_d,
+            col_e,
+            col_f,
+            sup_email,
+            enabled_raw,
+            last_status,
+        ) = padded[:9]
+
+        if not any(padded[:8]):
+            continue
+
+        def _fail(msg: str) -> None:
+            logger.warning("Skipping Tab2 row %d (%s): %s", idx, rule_id or "<empty>", msg)
+            errors.append(
+                ScheduledRuleRowError(
+                    row_index=idx,
+                    rule_id=rule_id,
+                    error_message=msg,
+                    previous_status=last_status,
+                )
+            )
+
+        if not rule_id:
+            _fail("❌ 配置错误：Rule_ID（A列）不能为空")
+            continue
+
+        if rule_id in seen_rule_ids:
+            _fail(
+                f"❌ 配置错误：Rule_ID '{rule_id}' 与第 {seen_rule_ids[rule_id]} 行重复，每行 Rule_ID 必须唯一"
+            )
+            continue
+        seen_rule_ids[rule_id] = idx
+
+        if "/file/d/" in root_url:
+            _fail(
+                "❌ 配置错误：Root_Folder_URL（C列）不能填写单个视频文件链接（/file/d/），"
+                "请填写 Google Drive 文件夹链接（/folders/...）或 gs:// 路径"
+            )
+            continue
+
+        folder_id = _extract_scheduled_folder_id(root_url)
+        if not folder_id:
+            _fail(
+                f"❌ 配置错误：Root_Folder_URL（C列）'{root_url}' 不是合法的 Google Drive 文件夹链接或 gs:// 路径"
+            )
+            continue
+
+        if is_legacy:
+            t_match = _TRIGGER_TIME_RE.match(col_d or "02:00")
+            if not t_match:
+                _fail(f"❌ 配置错误：Trigger_Time '{col_d}' 格式无效，请填写 HH:MM（00:00–23:59）")
+                continue
+            normalized_time = f"{int(t_match.group(1)):02d}:{int(t_match.group(2)):02d}"
+            tz_clean = col_e or "Asia/Singapore"
+            try:
+                ZoneInfo(tz_clean)
+            except Exception:
+                _fail(f"❌ 配置错误：Timezone '{tz_clean}' 不是合法的 IANA 时区")
+                continue
+            try:
+                lookback_hours = float(col_f or 24.0)
+                if lookback_hours <= 0.0:
+                    raise ValueError("lookback_hours must be > 0")
+                lookback_hours = max(1.0, min(720.0, lookback_hours))
+            except (TypeError, ValueError):
+                _fail(f"❌ 配置错误：Lookback_Hours '{col_f}' 不是有效的小时数")
+                continue
+            lookback_days = round(lookback_hours / 24.0, 4)
+        else:
+            raw_hour = col_d if col_d != "" else "02"
+            raw_min = col_e if col_e != "" else "00"
+            try:
+                hh = int(raw_hour)
+                if hh < 0 or hh > 23:
+                    raise ValueError("hour out of range")
+            except (TypeError, ValueError):
+                _fail(
+                    f"❌ 配置错误：Trigger_Hour_UTC（D列）'{col_d}' 无效，请从下拉框选择 00–23（UTC 小时）"
+                )
+                continue
+            try:
+                mm = int(raw_min)
+                if f"{mm:02d}" not in VALID_TRIGGER_MINUTES_UTC:
+                    raise ValueError("minute not in {00, 15, 30, 45}")
+            except (TypeError, ValueError):
+                _fail(
+                    f"❌ 配置错误：Trigger_Minute_UTC（E列）'{col_e}' 无效，仅支持从下拉框选择 00、15、30、45 四档分钟"
+                )
+                continue
+            normalized_time = f"{hh:02d}:{mm:02d}"
+            tz_clean = "UTC"
+
+            raw_days = col_f if col_f != "" else "1"
+            try:
+                lb_days = float(raw_days)
+                if lb_days not in VALID_LOOKBACK_DAYS_VALUES:
+                    raise ValueError("lookback_days not in allowed options")
+            except (TypeError, ValueError):
+                _fail(
+                    f"❌ 配置错误：Lookback_Days（F列）'{col_f}' 无效，请从下拉框选择 0.5（12小时）或 1–7 天"
+                )
+                continue
+            lookback_days = lb_days
+            lookback_hours = round(lb_days * 24.0, 2)
+
+        if sup_email and not _EMAIL_RE.match(sup_email):
+            _fail(f"❌ 配置错误：Supervisor_Email（G列）'{sup_email}' 不是合法的邮箱地址")
+            continue
+
+        enabled_upper = enabled_raw.upper()
+        if enabled_upper not in _TRUTHY_ENABLED_TOKENS and enabled_upper not in _FALSY_ENABLED_TOKENS:
+            _fail(
+                f"❌ 配置错误：Enabled（H列）'{enabled_raw}' 无效，请从下拉框选择 ENABLED 或 PAUSED"
+            )
+            continue
+        enabled_flag = enabled_upper in _TRUTHY_ENABLED_TOKENS
+
+        parsed.append(
+            ScheduledAuditRule(
+                row_index=idx,
+                rule_id=rule_id,
+                rule_name=rule_name or rule_id,
+                root_folder_url=root_url,
+                root_folder_id=folder_id,
+                trigger_time=normalized_time,
+                timezone=tz_clean,
+                lookback_days=lookback_days,
+                lookback_hours=lookback_hours,
+                supervisor_email=sup_email or "scheduled-auditor@chagee.com",
+                enabled=enabled_flag,
+                last_run_status=last_status,
+            )
+        )
+    return parsed, errors
+
+
+def parse_scheduled_rules_from_rows(rows: List[List[str]]) -> List[ScheduledAuditRule]:
+    """Parses `[Tab 2: 定时巡检配置表]` rows into validated `ScheduledAuditRule` items."""
+    valid_rules, _ = parse_scheduled_rules_with_diagnostics(rows)
+    return valid_rules
+
+
+def _nearest_quarter_minute(mm: int) -> str:
+    quarters = (0, 15, 30, 45)
+    best = min(quarters, key=lambda q: abs(q - mm))
+    return f"{best:02d}"
+
+
+def _nearest_lookback_days_str(hours_raw: str) -> str:
+    try:
+        h = float(hours_raw or 24.0)
+    except (TypeError, ValueError):
+        return "1"
+    days = h / 24.0
+    options = (0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0)
+    best = min(options, key=lambda d: abs(d - days))
+    return "0.5" if best == 0.5 else str(int(best))
+
+
+def migrate_tab2_rows_to_utc_schema(rows: List[List[str]]) -> tuple[bool, List[List[str]]]:
+    """Converts legacy `Tab2_定时巡检配置表` rows (`Trigger_Time`, `Timezone`, `Lookback_Hours`)
+    into the simplified UTC schema (`Trigger_Hour_UTC`, `Trigger_Minute_UTC`, `Lookback_Days`).
+
+    Returns `(changed, migrated_rows)`.
+    """
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    if not rows:
+        return True, [list(SCHEDULED_RULE_HEADERS)]
+
+    is_legacy = _is_legacy_tab2_header(rows[0])
+    current_hdr = [str(c).strip() for c in rows[0][:9]]
+    changed = current_hdr != list(SCHEDULED_RULE_HEADERS)
+    out_rows: List[List[str]] = [list(SCHEDULED_RULE_HEADERS)]
+
+    for raw_row in rows[1:]:
+        padded = [str(c).strip() for c in raw_row] + [""] * max(0, 9 - len(raw_row))
+        rule_id, rule_name, root_url, col_d, col_e, col_f, sup_email, enabled_raw, last_status = padded[:9]
+        if not any(padded[:8]):
+            continue
+
+        if is_legacy or ":" in col_d:
+            changed = True
+            t_match = _TRIGGER_TIME_RE.match(col_d or "02:00")
+            local_hh = int(t_match.group(1)) if t_match else 2
+            local_mm = int(t_match.group(2)) if t_match else 0
+            tz_name = col_e or "Asia/Singapore"
+            try:
+                tz = ZoneInfo(tz_name)
+                ref_local = datetime(2026, 10, 16, local_hh, local_mm, tzinfo=tz)
+                ref_utc = ref_local.astimezone(timezone.utc)
+                utc_hh_str = f"{ref_utc.hour:02d}"
+                utc_mm_str = _nearest_quarter_minute(ref_utc.minute)
+            except Exception:
+                utc_hh_str = f"{local_hh:02d}"
+                utc_mm_str = _nearest_quarter_minute(local_mm)
+            lb_days_str = _nearest_lookback_days_str(col_f)
+        else:
+            try:
+                hh_val = max(0, min(23, int(col_d or "2")))
+                utc_hh_str = f"{hh_val:02d}"
+            except ValueError:
+                utc_hh_str = col_d
+            try:
+                mm_val = int(col_e or "0")
+                utc_mm_str = f"{mm_val:02d}" if f"{mm_val:02d}" in VALID_TRIGGER_MINUTES_UTC else col_e
+            except ValueError:
+                utc_mm_str = col_e
+            lb_days_str = col_f or "1"
+            if (utc_hh_str, utc_mm_str, lb_days_str) != (col_d, col_e, col_f):
+                changed = True
+
+        norm_enabled = (
+            "ENABLED"
+            if enabled_raw.upper() in _TRUTHY_ENABLED_TOKENS
+            else ("PAUSED" if enabled_raw.upper() in _FALSY_ENABLED_TOKENS else enabled_raw)
+        )
+        if norm_enabled != enabled_raw:
+            changed = True
+
+        out_rows.append(
+            [
+                rule_id,
+                rule_name,
+                root_url,
+                utc_hh_str,
+                utc_mm_str,
+                lb_days_str,
+                sup_email,
+                norm_enabled,
+                last_status,
+            ]
+        )
+
+    return changed, out_rows
+
+
+def build_master_sheet_validation_requests(
+    sheet_meta: dict,
+    *,
+    prompt_versions: Optional[Sequence[str]] = None,
+    model_versions: Optional[Sequence[str]] = None,
+) -> list[dict]:
+    """Builds Google Sheets API v4 `batchUpdate` requests to enforce strict dropdowns (`ONE_OF_LIST`),
+    email validation (`TEXT_IS_EMAIL`), folder URL formula validation (`CUSTOM_FORMULA`), and `@` plain
+    text formatting on `Trigger_Hour_UTC` / `Trigger_Minute_UTC` across the Master Config Sheet.
+    """
+    sheets_info = sheet_meta.get("sheets", []) or []
+    title_to_id: dict[str, int] = {}
+    discovered_prompt_tabs: list[str] = []
+    for s in sheets_info:
+        props = s.get("properties") or {}
+        title = str(props.get("title") or "")
+        sid = props.get("sheetId")
+        if title and sid is not None:
+            title_to_id[title] = int(sid)
+            if title.startswith("Prompt_"):
+                discovered_prompt_tabs.append(title)
+
+    effective_prompt_versions = list(prompt_versions or discovered_prompt_tabs or [config.default_prompt_version])
+    effective_models = list(
+        dict.fromkeys(
+            list(
+                model_versions
+                or [
+                    config.fallback_model_version,
+                    "gemini-3-flash-preview",
+                    "gemini-2.5-flash",
+                ]
+            )
+        )
+    )
+
+    def _one_of_list_rule(options: Sequence[str], input_msg: str) -> dict:
+        return {
+            "condition": {
+                "type": "ONE_OF_LIST",
+                "values": [{"userEnteredValue": str(opt)} for opt in options],
+            },
+            "inputMessage": input_msg,
+            "strict": True,
+            "showCustomUi": True,
+        }
+
+    requests: list[dict] = []
+
+    # 1. Tab 0: Active_Prompt_Version (B2), Active_Model_Version (B3), Fallback_Model_Version (B4)
+    tab0_id = title_to_id.get(GoogleSheetsConfigClient.TAB0_TITLE)
+    if tab0_id is not None:
+        if effective_prompt_versions:
+            requests.append(
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": tab0_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 2,
+                            "startColumnIndex": 1,
+                            "endColumnIndex": 2,
+                        },
+                        "rule": _one_of_list_rule(
+                            effective_prompt_versions,
+                            "请选择已存在的 Prompt_* 规则分表名称",
+                        ),
+                    }
+                }
+            )
+        if effective_models:
+            requests.append(
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": tab0_id,
+                            "startRowIndex": 2,
+                            "endRowIndex": 4,
+                            "startColumnIndex": 1,
+                            "endColumnIndex": 2,
+                        },
+                        "rule": _one_of_list_rule(
+                            effective_models,
+                            "请选择受控 Gemini Flash 模型版本（严禁填写 AUTO_LATEST_FLASH）",
+                        ),
+                    }
+                }
+            )
+
+    # 2. Prompt_* tabs: severity (D), detection_type (E), requires_full_context (F)
+    for p_title in discovered_prompt_tabs:
+        p_sid = title_to_id[p_title]
+        requests.extend(
+            [
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": p_sid,
+                            "startRowIndex": 1,
+                            "endRowIndex": 100,
+                            "startColumnIndex": 3,
+                            "endColumnIndex": 4,
+                        },
+                        "rule": _one_of_list_rule(
+                            ("RED_LINE", "NORMAL"),
+                            "请选择 RED_LINE（红线违规）或 NORMAL（一般偏差）",
+                        ),
+                    }
+                },
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": p_sid,
+                            "startRowIndex": 1,
+                            "endRowIndex": 100,
+                            "startColumnIndex": 4,
+                            "endColumnIndex": 5,
+                        },
+                        "rule": _one_of_list_rule(
+                            ("presence", "absence"),
+                            "请选择 presence（出现即触发）或 absence（缺失即触发）",
+                        ),
+                    }
+                },
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": p_sid,
+                            "startRowIndex": 1,
+                            "endRowIndex": 100,
+                            "startColumnIndex": 5,
+                            "endColumnIndex": 6,
+                        },
+                        "rule": _one_of_list_rule(
+                            ("TRUE", "FALSE"),
+                            "请选择 TRUE 或 FALSE",
+                        ),
+                    }
+                },
+            ]
+        )
+
+    # 3. Tab 2 (`Tab2_定时巡检配置表`):
+    #    - Col C (index 2): Root_Folder_URL custom formula validation (rejects /file/d/)
+    #    - Col D..E (index 3..5): Plain text `@` format so "00"-"09" keep leading zeros
+    #    - Col D (index 3): Trigger_Hour_UTC dropdown (00..23)
+    #    - Col E (index 4): Trigger_Minute_UTC dropdown (00, 15, 30, 45)
+    #    - Col F (index 5): Lookback_Days dropdown (0.5, 1..7)
+    #    - Col G (index 6): Supervisor_Email TEXT_IS_EMAIL
+    #    - Col H (index 7): Enabled dropdown (ENABLED, PAUSED)
+    tab2_id = title_to_id.get(TAB2_SCHEDULED_TITLE)
+    if tab2_id is not None:
+        requests.extend(
+            [
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": tab2_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 200,
+                            "startColumnIndex": 3,
+                            "endColumnIndex": 5,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "numberFormat": {"type": "TEXT", "pattern": "@"}
+                            }
+                        },
+                        "fields": "userEnteredFormat.numberFormat",
+                    }
+                },
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": tab2_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 200,
+                            "startColumnIndex": 2,
+                            "endColumnIndex": 3,
+                        },
+                        "rule": {
+                            "condition": {
+                                "type": "CUSTOM_FORMULA",
+                                "values": [
+                                    {
+                                        "userEnteredValue": (
+                                            '=AND(NOT(REGEXMATCH(TO_TEXT(C2), "/file/d/")), '
+                                            'REGEXMATCH(TO_TEXT(C2), "^(https://drive\\.google\\.com/.*folders/[a-zA-Z0-9_-]{10,}|gs://[a-z0-9._-]+.*|[a-zA-Z0-9_-]{10,})$"))'
+                                        )
+                                    }
+                                ],
+                            },
+                            "inputMessage": "请填写 Google Drive 根文件夹链接（含 /folders/...）或 gs:// 存储桶路径，严禁填写单个视频文件链接（/file/d/）",
+                            "strict": True,
+                            "showCustomUi": False,
+                        },
+                    }
+                },
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": tab2_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 200,
+                            "startColumnIndex": 3,
+                            "endColumnIndex": 4,
+                        },
+                        "rule": _one_of_list_rule(
+                            VALID_TRIGGER_HOURS_UTC,
+                            "请选择每日触发小时（UTC 时区，00–23）",
+                        ),
+                    }
+                },
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": tab2_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 200,
+                            "startColumnIndex": 4,
+                            "endColumnIndex": 5,
+                        },
+                        "rule": _one_of_list_rule(
+                            VALID_TRIGGER_MINUTES_UTC,
+                            "请选择触发分钟（UTC 时区，仅支持 00、15、30、45 四档）",
+                        ),
+                    }
+                },
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": tab2_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 200,
+                            "startColumnIndex": 5,
+                            "endColumnIndex": 6,
+                        },
+                        "rule": _one_of_list_rule(
+                            VALID_LOOKBACK_DAYS_OPTIONS,
+                            "请选择回溯天数（0.5 天=12小时，或 1–7 天）",
+                        ),
+                    }
+                },
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": tab2_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 200,
+                            "startColumnIndex": 6,
+                            "endColumnIndex": 7,
+                        },
+                        "rule": {
+                            "condition": {"type": "TEXT_IS_EMAIL"},
+                            "inputMessage": "请填写合法的督导邮箱地址（如 user@domain.com）",
+                            "strict": True,
+                            "showCustomUi": False,
+                        },
+                    }
+                },
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": tab2_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 200,
+                            "startColumnIndex": 7,
+                            "endColumnIndex": 8,
+                        },
+                        "rule": _one_of_list_rule(
+                            VALID_ENABLED_DROPDOWN_OPTIONS,
+                            "请选择 ENABLED（启用）或 PAUSED（暂停）",
+                        ),
+                    }
+                },
+            ]
+        )
+
+    return requests
+
+
 class SheetClientProtocol(Protocol):
     """Protocol for reading and updating the Master Prompt & Model Config Google Sheet."""
 
@@ -883,6 +1527,7 @@ class GoogleSheetsConfigClient:
     """
 
     TAB0_TITLE = "Tab0_版本总控与回滚开关"
+    TAB2_SCHEDULED_TITLE = TAB2_SCHEDULED_TITLE
 
     def __init__(self, gcs_gateway: Optional[object] = None) -> None:
         # Zero-GWS: `gs://` sheet IDs are read from GCS (`GcsStorageGateway.download_object_bytes`).
@@ -993,6 +1638,121 @@ class GoogleSheetsConfigClient:
         except Exception as exc:
             logger.warning("Failed to append candidate models to %s: %s", sheet_id, exc)
 
+    async def read_scheduled_rules_with_diagnostics(
+        self, sheet_id: str
+    ) -> tuple[List[ScheduledAuditRule], List[ScheduledRuleRowError]]:
+        """Reads `[Tab 2: 定时巡检配置表]` (`Tab2_定时巡检配置表`) rows and returns `(valid_rules, row_errors)`."""
+        if not sheet_id:
+            return [], []
+        if sheet_id.startswith("gs://"):
+            tabs = await self._read_gcs_workbook_tabs(sheet_id)
+            rows = tabs.get(self.TAB2_SCHEDULED_TITLE, [])
+            return parse_scheduled_rules_with_diagnostics(rows)
+        try:
+            a1 = f"{self.TAB2_SCHEDULED_TITLE}!A1:I200"
+            _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{a1}", None)
+            rows = await self._read_range(sheet_id, a1)
+            return parse_scheduled_rules_with_diagnostics(rows)
+        except Exception as exc:
+            logger.info(
+                "Scheduled rules tab %s not present or unreadable on %s: %s",
+                self.TAB2_SCHEDULED_TITLE,
+                sheet_id,
+                exc,
+            )
+            return [], []
+
+    async def read_scheduled_rules(self, sheet_id: str) -> List[ScheduledAuditRule]:
+        """Reads `[Tab 2: 定时巡检配置表]` (`Tab2_定时巡检配置表`) rows; returns `[]` if the tab does not exist yet."""
+        valid_rules, _ = await self.read_scheduled_rules_with_diagnostics(sheet_id)
+        return valid_rules
+
+    async def ensure_master_sheet_validations(
+        self, sheet_id: str, *, force: bool = False
+    ) -> bool:
+        """Idempotently migrates legacy `Tab2_定时巡检配置表` rows to the UTC dropdown schema and
+        applies native Google Sheets `setDataValidation` rules across Tab 0, Prompt_*, and Tab 2.
+        """
+        if not sheet_id or sheet_id.startswith("gs://"):
+            return False
+        if not force and sheet_id in _VALID_SHEET_CACHE:
+            return True
+
+        def _migrate_and_validate_sync() -> bool:
+            svc = self._sheets_service()
+            meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute(num_retries=3)
+            tab_titles = {
+                str((s.get("properties") or {}).get("title") or "")
+                for s in (meta.get("sheets") or [])
+            }
+            if self.TAB2_SCHEDULED_TITLE in tab_titles:
+                resp = (
+                    svc.spreadsheets()
+                    .values()
+                    .get(spreadsheetId=sheet_id, range=f"'{self.TAB2_SCHEDULED_TITLE}'!A1:I200")
+                    .execute(num_retries=3)
+                )
+                raw_rows = [[str(c) for c in r] for r in resp.get("values", [])]
+                changed, migrated_rows = migrate_tab2_rows_to_utc_schema(raw_rows)
+                if changed and migrated_rows:
+                    svc.spreadsheets().values().clear(
+                        spreadsheetId=sheet_id,
+                        range=f"'{self.TAB2_SCHEDULED_TITLE}'!A1:I200",
+                        body={},
+                    ).execute(num_retries=3)
+                    svc.spreadsheets().values().update(
+                        spreadsheetId=sheet_id,
+                        range=f"'{self.TAB2_SCHEDULED_TITLE}'!A1",
+                        valueInputOption="RAW",
+                        body={"values": migrated_rows},
+                    ).execute(num_retries=3)
+
+            reqs = build_master_sheet_validation_requests(meta)
+            if reqs:
+                svc.spreadsheets().batchUpdate(
+                    spreadsheetId=sheet_id,
+                    body={"requests": reqs},
+                ).execute(num_retries=3)
+            return True
+
+        try:
+            ok = await asyncio.to_thread(_migrate_and_validate_sync)
+            if ok:
+                _VALID_SHEET_CACHE.add(sheet_id)
+                _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB2_SCHEDULED_TITLE}!A1:I200", None)
+            return ok
+        except Exception as exc:
+            logger.warning(
+                "Could not apply master sheet validations on %s: %s", sheet_id, exc
+            )
+            return False
+
+    async def update_scheduled_rule_status(
+        self, sheet_id: str, row_index: int, status_text: str
+    ) -> None:
+        """Writes `status_text` back to column I (`Last_Run_Status`) of `Tab2_定时巡检配置表` at `row_index`."""
+        if not sheet_id or sheet_id.startswith("gs://") or row_index < 2:
+            return
+
+        def _update() -> None:
+            self._sheets_service().spreadsheets().values().update(
+                spreadsheetId=sheet_id,
+                range=f"'{self.TAB2_SCHEDULED_TITLE}'!I{row_index}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [[status_text]]},
+            ).execute(num_retries=3)
+
+        try:
+            await asyncio.to_thread(_update)
+            _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB2_SCHEDULED_TITLE}!A1:I200", None)
+        except Exception as exc:
+            logger.warning(
+                "Failed to update Tab2 Last_Run_Status at row %d on %s: %s",
+                row_index,
+                sheet_id,
+                exc,
+            )
+
 
 class PromptManager:
     """Loads active Prompt & Model versions from Google Sheets with 0.1s rollback."""
@@ -1012,6 +1772,7 @@ class PromptManager:
         self._known_valid_models: set[str] = (
             set(known_valid_models) if known_valid_models else {config.fallback_model_version}
         )
+        self.last_scheduled_rule_errors: List[ScheduledRuleRowError] = []
 
     async def _probe_single_model(self, candidate: str) -> bool:
         if not candidate:
@@ -1155,3 +1916,63 @@ class PromptManager:
                 timeout=10.0,
             )
         return newly_found
+
+    def _resolve_target_sheet_id(self, sheet_id: Optional[str] = None) -> str:
+        if sheet_id is None:
+            return config.master_prompt_sheet_id or ""
+        if sheet_id.strip():
+            return extract_spreadsheet_id(sheet_id)
+        return ""
+
+    async def ensure_master_sheet_validations(
+        self, sheet_id: Optional[str] = None, *, force: bool = False
+    ) -> bool:
+        """Ensures `Tab2_定时巡检配置表` is migrated to the UTC schema and native Google Sheets
+        dropdown/formula validations are applied across the Master Config Sheet.
+        """
+        target_sheet_id = self._resolve_target_sheet_id(sheet_id)
+        if not target_sheet_id or self._sheet_client is None:
+            return False
+        ensurer = getattr(self._sheet_client, "ensure_master_sheet_validations", None)
+        if not callable(ensurer):
+            return False
+        return await asyncio.wait_for(ensurer(target_sheet_id, force=force), timeout=20.0)
+
+    async def load_scheduled_rules_with_diagnostics(
+        self, sheet_id: Optional[str] = None
+    ) -> tuple[List[ScheduledAuditRule], List[ScheduledRuleRowError]]:
+        """Loads all rows from `[Tab 2: 定时巡检配置表]` (`Tab2_定时巡检配置表`) along with any row validation errors."""
+        target_sheet_id = self._resolve_target_sheet_id(sheet_id)
+        if not target_sheet_id or self._sheet_client is None:
+            self.last_scheduled_rule_errors = []
+            return [], []
+        diag_reader = getattr(self._sheet_client, "read_scheduled_rules_with_diagnostics", None)
+        if callable(diag_reader):
+            rules, errors = await asyncio.wait_for(diag_reader(target_sheet_id), timeout=15.0)
+            self.last_scheduled_rule_errors = list(errors)
+            return rules, errors
+        reader = getattr(self._sheet_client, "read_scheduled_rules", None)
+        if callable(reader):
+            rules = await asyncio.wait_for(reader(target_sheet_id), timeout=15.0)
+            self.last_scheduled_rule_errors = []
+            return rules, []
+        self.last_scheduled_rule_errors = []
+        return [], []
+
+    async def load_scheduled_rules(self, sheet_id: Optional[str] = None) -> List[ScheduledAuditRule]:
+        """Loads all rows from `[Tab 2: 定时巡检配置表]` (`Tab2_定时巡检配置表`)."""
+        rules, errors = await self.load_scheduled_rules_with_diagnostics(sheet_id)
+        self.last_scheduled_rule_errors = list(errors)
+        return rules
+
+    async def update_scheduled_rule_status(
+        self, row_index: int, status_text: str, sheet_id: Optional[str] = None
+    ) -> None:
+        """Updates column I (`Last_Run_Status`) for a rule row in `[Tab 2: 定时巡检配置表]`."""
+        target_sheet_id = self._resolve_target_sheet_id(sheet_id)
+        if not target_sheet_id or self._sheet_client is None:
+            return
+        updater = getattr(self._sheet_client, "update_scheduled_rule_status", None)
+        if not callable(updater):
+            return
+        await asyncio.wait_for(updater(target_sheet_id, row_index, status_text), timeout=10.0)

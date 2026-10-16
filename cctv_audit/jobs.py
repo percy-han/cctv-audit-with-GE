@@ -108,6 +108,26 @@ class AuditJob(BaseModel):
     total_tokens_used: int = 0
     violations_found: int = 0
     error_message: Optional[str] = None
+    batch_id: str = Field(
+        default="",
+        description="Optional parent batch ID for scheduled multi-store audit runs",
+    )
+    rule_id: str = Field(
+        default="",
+        description="Optional scheduled rule ID from Tab2_定时巡检配置表",
+    )
+    execution_backend: str = Field(
+        default="",
+        description="Execution backend ('cloud_run_job' for 24h Cloud Run Jobs; '' for interactive Cloud Run Service)",
+    )
+    folder_name: str = Field(
+        default="",
+        description="Human-readable folder/store display name when available",
+    )
+    start_notification_sent: bool = Field(
+        default=False,
+        description="Idempotency guard ensuring Google Chat start notification is sent at most once per job",
+    )
     needs_operator_fix: bool = Field(
         default=False,
         description=(
@@ -357,6 +377,22 @@ class UserScopedJobStore:
         await asyncio.to_thread(self._sync_from_local, user_id)
         return self._by_user.get(user_id.lower(), {}).get(job_id)
 
+    async def get_by_job_id(self, job_id: str, user_id: str = "") -> Optional[AuditJob]:
+        """Resolves an `AuditJob` by `job_id` (using `user_id` when supplied, or scanning tenant buckets)."""
+        clean_id = (job_id or "").strip()
+        if not clean_id:
+            return None
+        clean_user = (user_id or "").strip()
+        if clean_user:
+            found = await self.get(clean_user, clean_id)
+            if found is not None:
+                return found
+        await asyncio.to_thread(self._sync_all_jobs_sync)
+        for bucket in self._by_user.values():
+            if clean_id in bucket:
+                return bucket[clean_id]
+        return None
+
     async def latest_for_session(self, user_id: str, session_id: str) -> Optional[AuditJob]:
         """Newest job (by creation) created in `session_id`; None for a missing/placeholder session.
 
@@ -471,6 +507,9 @@ class UserScopedJobStore:
         recoverable: List[AuditJob] = []
         for bucket in self._by_user.values():
             for job in bucket.values():
+                if getattr(job, "execution_backend", "") == "cloud_run_job":
+                    # Cloud Run Jobs have native 24h timeout and task retry; never pull into 60m HTTP Service watchdog.
+                    continue
                 if job.resume_count >= max_auto_resumes:
                     continue
                 if job.needs_operator_fix:

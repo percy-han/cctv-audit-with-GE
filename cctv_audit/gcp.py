@@ -265,30 +265,78 @@ def _explain_refresh_error(exc: Exception, subject: str, dwd_sa: str) -> str:
 _workspace_creds_lock = threading.Lock()
 _workspace_creds: Any = None
 _workspace_creds_identity: Optional[tuple[str, str]] = None
+_workspace_creds_dwd_sa: Optional[str] = None
+_workspace_creds_by_identity: dict[tuple[str, str], Any] = {}
 
 
-def workspace_credentials() -> Any:
-    """Returns the single process-wide credentials object used for every Drive / Sheets call.
+def workspace_credentials(impersonate_user: Optional[str] = None) -> Any:
+    """Returns the process-wide credentials object used for Drive / Sheets calls.
 
     Built once per identity and refreshed in place under a lock, so DWD costs one signJwt + token
     exchange per hour instead of per API call. Raises `WorkspaceAuthError` with an operator-
     actionable message when a token cannot be obtained.
     """
-    global _workspace_creds, _workspace_creds_identity
-    identity = workspace_identity()
+    global _workspace_creds, _workspace_creds_identity, _workspace_creds_dwd_sa
+    default_subject, dwd_sa = workspace_identity()
+    custom_subject = (impersonate_user or "").strip()
+    if not custom_subject or custom_subject.lower() == default_subject.lower():
+        identity = (default_subject, dwd_sa)
+        with _workspace_creds_lock:
+            if _workspace_creds is None or _workspace_creds_identity != identity:
+                _workspace_creds_by_identity.clear()
+                _workspace_creds_dwd_sa = dwd_sa
+                _workspace_creds = _build_workspace_credentials(*identity)
+                _workspace_creds_identity = identity
+            creds = _workspace_creds
+            if not creds.valid:
+                from google.auth.transport.requests import Request as AuthRequest
+
+                try:
+                    creds.refresh(AuthRequest())
+                except google.auth.exceptions.RefreshError as exc:
+                    raise WorkspaceAuthError(_explain_refresh_error(exc, *identity)) from exc
+            return creds
+
+    identity = (custom_subject, dwd_sa)
     with _workspace_creds_lock:
-        if _workspace_creds is None or _workspace_creds_identity != identity:
-            _workspace_creds = _build_workspace_credentials(*identity)
-            _workspace_creds_identity = identity
-        creds = _workspace_creds
+        if _workspace_creds_dwd_sa != dwd_sa:
+            _workspace_creds_by_identity.clear()
+            _workspace_creds_dwd_sa = dwd_sa
+        creds = _workspace_creds_by_identity.get(identity)
+        if creds is None:
+            creds = _build_workspace_credentials(*identity)
+            _workspace_creds_by_identity[identity] = creds
         if not creds.valid:
             from google.auth.transport.requests import Request as AuthRequest
 
             try:
                 creds.refresh(AuthRequest())
             except google.auth.exceptions.RefreshError as exc:
+                _workspace_creds_by_identity.pop(identity, None)
                 raise WorkspaceAuthError(_explain_refresh_error(exc, *identity)) from exc
         return creds
+
+
+def workspace_credentials_with_fallback(impersonate_user: Optional[str] = None) -> Any:
+    """Obtains DWD credentials for `impersonate_user` when specified, falling back to the default
+    bot identity (`workspace_credentials()`) if per-supervisor DWD is not configured or rejected.
+    """
+    custom_subject = (impersonate_user or "").strip()
+    if not custom_subject:
+        return workspace_credentials()
+    default_subject, dwd_sa = workspace_identity()
+    if not dwd_sa or custom_subject.lower() == default_subject.lower():
+        return workspace_credentials()
+    try:
+        return workspace_credentials(custom_subject)
+    except Exception as exc:
+        logger.warning(
+            "DWD impersonation for supervisor %s unavailable (%s); falling back to default workspace identity %s",
+            custom_subject,
+            exc,
+            default_subject or dwd_sa,
+        )
+        return workspace_credentials()
 
 
 _chat_user_id_lock = threading.Lock()
@@ -435,15 +483,28 @@ from .video_ingestor import VideoMetadataItem
 class GoogleWorkspaceGateway:
     """All Drive / Sheets I/O. Credentials resolve lazily per call, never at import time."""
 
+    def __init__(self, impersonate_user: Optional[str] = None) -> None:
+        self._impersonate_user = (impersonate_user or "").strip() or None
+
     def _drive_service(self):
         from googleapiclient.discovery import build
 
-        return build("drive", "v3", credentials=workspace_credentials(), cache_discovery=False)
+        creds = (
+            workspace_credentials_with_fallback(self._impersonate_user)
+            if self._impersonate_user
+            else workspace_credentials()
+        )
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
 
     def _sheets_service(self):
         from googleapiclient.discovery import build
 
-        return build("sheets", "v4", credentials=workspace_credentials(), cache_discovery=False)
+        creds = (
+            workspace_credentials_with_fallback(self._impersonate_user)
+            if self._impersonate_user
+            else workspace_credentials()
+        )
+        return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
     @staticmethod
     def _check_folder_meta(drive: Any, folder_id: str) -> str:
@@ -919,8 +980,70 @@ class GoogleWorkspaceGateway:
                     spreadsheetId=sid, body={"requests": requests_body}
                 ).execute(num_retries=3)
 
+            audited_video_filenames = {
+                str(getattr(r, "video_filename", "")).strip()
+                for r in (*tab1_rows, *tab2_rows)
+                if str(getattr(r, "video_filename", "")).strip()
+            }
+            kept_tab1_rows: List[List[Any]] = []
+            kept_tab2_rows: List[List[Any]] = []
+            if not created_new_sheet and audited_video_filenames:
+                try:
+                    if tab1_title in existing_titles:
+                        res1 = (
+                            sheets.spreadsheets()
+                            .values()
+                            .get(spreadsheetId=sid, range=f"'{tab1_title}'!A2:K")
+                            .execute(num_retries=3)
+                        )
+                        for raw_row in res1.get("values", []) or []:
+                            if (
+                                len(raw_row) > 1
+                                and str(raw_row[1]).strip()
+                                and str(raw_row[1]).strip() not in audited_video_filenames
+                            ):
+                                padded = [str(c) for c in raw_row[:11]] + [""] * max(0, 11 - len(raw_row))
+                                try:
+                                    padded[6] = float(padded[6] or 0.0)
+                                except (TypeError, ValueError):
+                                    padded[6] = 0.0
+                                kept_tab1_rows.append(padded)
+                    if tab2_title in existing_titles:
+                        res2 = (
+                            sheets.spreadsheets()
+                            .values()
+                            .get(spreadsheetId=sid, range=f"'{tab2_title}'!A2:O")
+                            .execute(num_retries=3)
+                        )
+                        for raw_row in res2.get("values", []) or []:
+                            if (
+                                len(raw_row) > 2
+                                and str(raw_row[2]).strip()
+                                and str(raw_row[2]).strip() not in audited_video_filenames
+                            ):
+                                padded2: List[Any] = [str(c) for c in raw_row[:15]] + [""] * max(
+                                    0, 15 - len(raw_row)
+                                )
+                                for f_idx in (3, 11):
+                                    try:
+                                        padded2[f_idx] = float(padded2[f_idx] or 0.0)
+                                    except (TypeError, ValueError):
+                                        padded2[f_idx] = 0.0
+                                for i_idx in (7, 8, 9, 10, 12, 13):
+                                    try:
+                                        padded2[i_idx] = int(float(padded2[i_idx] or 0))
+                                    except (TypeError, ValueError):
+                                        padded2[i_idx] = 0
+                                kept_tab2_rows.append(padded2)
+                except Exception as exc:
+                    logger.warning(
+                        "Non-fatal warning reading existing report rows from %s for smart append: %s",
+                        sid,
+                        exc,
+                    )
+
             # A reused Sheet still holds the previous attempt's rows; wipe them so a shorter
-            # re-publish cannot leave stale rows underneath.
+            # re-publish cannot leave stale rows underneath, then write kept historical rows + new rows.
             if not created_new_sheet:
                 sheets.spreadsheets().values().batchClear(
                     spreadsheetId=sid,
@@ -928,7 +1051,7 @@ class GoogleWorkspaceGateway:
                 ).execute(num_retries=3)
 
             # 4. Clear & write Tab 1 (`违规事件 3 秒复核台`) and Tab 2 (`本次视频 Token 消耗与耗时账单`)
-            tab1_values = [
+            tab1_values: List[List[Any]] = [
                 [
                     "稽核单号 (Audit_ID)",
                     "监控原片 (Video_Filename)",
@@ -940,7 +1063,9 @@ class GoogleWorkspaceGateway:
                     "AI稽核证据描述 (Evidence_Description)",
                     "20秒证据视频链接 (Evidence_Drive_URL)",
                     "人工复核状态 (Human_Review_Status)",
-                ]
+                    "人工复核备注 (Human_Review_Note)",
+                ],
+                *kept_tab1_rows,
             ]
             for r in tab1_rows:
                 tab1_values.append(
@@ -955,10 +1080,11 @@ class GoogleWorkspaceGateway:
                         str(getattr(r, "evidence_description", "")),
                         str(getattr(r, "evidence_drive_url", "")),
                         str(getattr(r, "human_review_status", "")),
+                        str(getattr(r, "human_review_note", "") or ""),
                     ]
                 )
 
-            tab2_values = [
+            tab2_values: List[List[Any]] = [
                 [
                     "稽核单号 (Audit_ID)",
                     "文件夹ID (Folder_ID)",
@@ -975,7 +1101,8 @@ class GoogleWorkspaceGateway:
                     "端到端耗时ms (Latency_ms)",
                     "检出事件数 (Flagged_Events)",
                     "降级告警 (Fallback_Warning)",
-                ]
+                ],
+                *kept_tab2_rows,
             ]
             for r in tab2_rows:
                 tab2_values.append(
@@ -1011,4 +1138,122 @@ class GoogleWorkspaceGateway:
             return sid, surl
 
         return await loop.run_in_executor(None, _create_or_update)
+
+    def _resolve_report_sheet_id_sync(self, parent_folder_id: str, sheet_id_or_url: str) -> str:
+        from .config import extract_spreadsheet_id
+
+        raw = (sheet_id_or_url or "").strip()
+        if raw:
+            return extract_spreadsheet_id(raw)
+        if not parent_folder_id:
+            return ""
+        drive = self._drive_service()
+        res = (
+            drive.files()
+            .list(
+                q=(
+                    f"'{parent_folder_id}' in parents and "
+                    f"mimeType='{_SPREADSHEET_MIME}' and trashed=false"
+                ),
+                fields="files(id, name)",
+                pageSize=50,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute(num_retries=3)
+        )
+        for f in res.get("files", []) or []:
+            if "AI稽核报告与Token账单" in str(f.get("name") or ""):
+                return str(f.get("id") or "")
+        return ""
+
+    async def read_report_sheet_data(
+        self,
+        parent_folder_id: str,
+        sheet_id_or_url: str = "",
+    ) -> tuple[List[List[str]], List[List[str]]]:
+        """Reads `(tab1_rows_without_header, tab2_rows_without_header)` from the store's report Google Sheet."""
+        loop = asyncio.get_running_loop()
+
+        def _read() -> tuple[List[List[str]], List[List[str]]]:
+            sid = self._resolve_report_sheet_id_sync(parent_folder_id, sheet_id_or_url)
+            if not sid:
+                return [], []
+            tab1_title = "违规事件 3 秒复核台"
+            tab2_title = "本次视频 Token 消耗与耗时账单"
+            sheets = self._sheets_service()
+            res = (
+                sheets.spreadsheets()
+                .values()
+                .batchGet(
+                    spreadsheetId=sid,
+                    ranges=[f"'{tab1_title}'!A2:K", f"'{tab2_title}'!A2:O"],
+                )
+                .execute(num_retries=3)
+            )
+            val_ranges = res.get("valueRanges", []) or []
+            raw_t1 = (val_ranges[0].get("values", []) if len(val_ranges) > 0 else []) or []
+            raw_t2 = (val_ranges[1].get("values", []) if len(val_ranges) > 1 else []) or []
+            t1 = [
+                [str(c) for c in r[:11]] + [""] * max(0, 11 - len(r))
+                for r in raw_t1
+                if any(str(c).strip() for c in r)
+            ]
+            t2 = [
+                [str(c) for c in r[:15]] + [""] * max(0, 15 - len(r))
+                for r in raw_t2
+                if any(str(c).strip() for c in r)
+            ]
+            return t1, t2
+
+        return await loop.run_in_executor(None, _read)
+
+    async def update_report_human_reviews(
+        self,
+        parent_folder_id: str,
+        sheet_id_or_url: str,
+        updates: List[Dict[str, Any]],
+    ) -> int:
+        """Matches rows in `Tab 1` by composite key `(audit_id, video_filename, timestamp, rule_id, occ_idx)`
+        and writes human review status (`Col J`) and review note (`Col K`) in-place.
+        """
+        if not updates:
+            return 0
+        loop = asyncio.get_running_loop()
+
+        def _update() -> int:
+            from .gcs_gateway import match_and_apply_tab1_reviews
+
+            sid = self._resolve_report_sheet_id_sync(parent_folder_id, sheet_id_or_url)
+            if not sid:
+                raise WorkspaceAccessError("找不到该门店的稽核报告 Google Sheet，无法回写人工复核结果")
+            tab1_title = "违规事件 3 秒复核台"
+            sheets = self._sheets_service()
+            res1 = (
+                sheets.spreadsheets()
+                .values()
+                .get(spreadsheetId=sid, range=f"'{tab1_title}'!A2:K")
+                .execute(num_retries=3)
+            )
+            raw_rows = res1.get("values", []) or []
+            _, patches = match_and_apply_tab1_reviews(raw_rows, updates)
+            if not patches:
+                return 0
+            data_ranges = [
+                {
+                    "range": f"'{tab1_title}'!J{row_num}:K{row_num}",
+                    "values": [[status_val, note_val]],
+                }
+                for row_num, status_val, note_val in patches
+            ]
+            sheets.spreadsheets().values().batchUpdate(
+                spreadsheetId=sid,
+                body={
+                    "valueInputOption": "USER_ENTERED",
+                    "data": data_ranges,
+                },
+            ).execute(num_retries=3)
+            return len(patches)
+
+        return await loop.run_in_executor(None, _update)
 

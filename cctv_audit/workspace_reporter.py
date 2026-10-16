@@ -18,7 +18,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 import httpx
 from pydantic import BaseModel, Field
@@ -26,13 +26,21 @@ from pydantic import BaseModel, Field
 from .agentic_auditor import Finding, Status, TokenLedgerRow
 from .config import config
 from .gcp import resolve_chat_user_id
-from .gcs_gateway import build_source_video_url, is_gcs_target, safe_storage_id_slug
+from .gcs_gateway import (
+    build_gcs_console_folder_url,
+    build_source_video_url,
+    is_gcs_target,
+    safe_storage_id_slug,
+)
+from .portal import build_portal_url
 
 logger = logging.getLogger("cctv_audit.workspace_reporter")
 
 INITIAL_REVIEW_STATUS = "⏳ 待人工复核 (PENDING_HUMAN_REVIEW)"
 EVIDENCE_SUBFOLDER_NAME = "📁 违规证据切片_Evidence"
 REPORT_SHEET_TITLE = "📊 AI稽核报告与Token账单"
+_WEBHOOK_URI_CACHE: Dict[str, Tuple[float, str]] = {}
+_WEBHOOK_CACHE_TTL_SEC = 300.0
 
 
 class ViolationSheetRow(BaseModel):
@@ -48,6 +56,7 @@ class ViolationSheetRow(BaseModel):
     evidence_description: str
     evidence_drive_url: str
     human_review_status: str = Field(default=INITIAL_REVIEW_STATUS)
+    human_review_note: str = Field(default="")
 
 
 class AuditReportArtifact(BaseModel):
@@ -79,6 +88,15 @@ class WorkspaceDriveSheetsGatewayProtocol(Protocol):
         *,
         reuse_suffix: str = "",
     ) -> tuple[str, str]: ...
+    async def read_report_sheet_data(
+        self, folder_id: str, report_sheet_url: str = ""
+    ) -> Tuple[List[List[Any]], List[List[Any]]]: ...
+    async def update_report_human_reviews(
+        self,
+        folder_id: str,
+        report_sheet_url: str,
+        updates: List[Dict[str, str]],
+    ) -> int: ...
 
 
 class WorkspaceReporter:
@@ -136,6 +154,7 @@ class WorkspaceReporter:
         parent_folder_id: str,
         findings_by_video: List[tuple[str, List[Finding]]],
         ledger_rows: List[TokenLedgerRow],
+        suppress_notification: bool = False,
     ) -> AuditReportArtifact:
         """Creates `Evidence/` subfolder + Dual-Tab Google Sheet inside `parent_folder_id` and notifies user."""
         sheet_title = REPORT_SHEET_TITLE
@@ -194,13 +213,16 @@ class WorkspaceReporter:
             sheet_id = f"sheet_{audit_id}"
             sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
 
-        notified = await self.send_completion_notification(
-            user_email=user_email,
-            audit_id=audit_id,
-            sheet_url=sheet_url,
-            violations_count=len(all_tab1_rows),
-            total_tokens=sum(r.total_token_count for r in ledger_rows),
-        )
+        if suppress_notification:
+            notified = False
+        else:
+            notified = await self.send_completion_notification(
+                user_email=user_email,
+                audit_id=audit_id,
+                sheet_url=sheet_url,
+                violations_count=len(all_tab1_rows),
+                total_tokens=sum(r.total_token_count for r in ledger_rows),
+            )
 
         return AuditReportArtifact(
             audit_id=audit_id,
@@ -213,6 +235,144 @@ class WorkspaceReporter:
             notification_sent=notified,
         )
 
+    def _is_notification_enabled(self) -> bool:
+        return (
+            self._enable_notification
+            if self._enable_notification is not None
+            else (
+                config.enable_google_chat_notification
+                if "ENABLE_GOOGLE_CHAT_NOTIFICATION" in os.environ
+                else bool(self._webhook_url)
+            )
+        )
+
+    def _resolve_webhook_url_sync(self) -> str:
+        """Resolves `self._webhook_url` directly or from a `gs://<bucket>/<object>` URI (cached 300s)."""
+        raw = (self._webhook_url or "").strip()
+        if not raw:
+            return ""
+        if raw.startswith("https://chat.googleapis.com/"):
+            return raw
+        if raw.startswith("gs://"):
+            import time
+            from .gcs_gateway import GcsStorageGateway, parse_gcs_uri
+
+            now = time.monotonic()
+            cached = _WEBHOOK_URI_CACHE.get(raw)
+            if cached and (now - cached[0]) < _WEBHOOK_CACHE_TTL_SEC:
+                return cached[1]
+            try:
+                bucket, obj = parse_gcs_uri(raw)
+                gw = GcsStorageGateway()
+                status, body = gw._request("GET", gw._media_url(bucket, obj))
+                if status >= 400:
+                    logger.warning(
+                        "Failed to read Google Chat webhook secret from %s (HTTP %d)",
+                        raw,
+                        status,
+                    )
+                    return ""
+                resolved = body.decode("utf-8", errors="replace").strip()
+                if not resolved.startswith("https://chat.googleapis.com/"):
+                    logger.warning(
+                        "Invalid Google Chat webhook URL inside %s (must start with https://chat.googleapis.com/)",
+                        raw,
+                    )
+                    return ""
+                _WEBHOOK_URI_CACHE[raw] = (now, resolved)
+                return resolved
+            except Exception as exc:
+                logger.warning("Failed to resolve Google Chat webhook URI %s: %s", raw, exc)
+                return ""
+        return raw
+
+    async def send_job_start_notification(
+        self,
+        *,
+        user_email: str,
+        audit_id: str,
+        folder_id: str,
+        folder_name: str = "",
+        video_count: int = 0,
+        total_duration_sec: float = 0.0,
+        estimated_minutes: float = 0.0,
+        model_version: str = "",
+        prompt_version: str = "",
+    ) -> bool:
+        """Sends a Google Chat start notification when a single-store interactive job starts (`Job ID`)."""
+        enabled = self._is_notification_enabled()
+        webhook_url = (
+            await asyncio.to_thread(self._resolve_webhook_url_sync) if enabled else ""
+        )
+        if not enabled or not webhook_url:
+            logger.info(
+                "Google Chat start notification disabled or webhook unconfigured (enabled=%s); skipping push for job %s",
+                enabled,
+                audit_id,
+            )
+            return False
+
+        chat_user_id = await asyncio.to_thread(resolve_chat_user_id, user_email)
+        initiator_line = (
+            f"<users/{chat_user_id}> (<code>{user_email}</code>)"
+            if chat_user_id
+            else f"<code>{user_email}</code>"
+        )
+        folder_url = (
+            build_gcs_console_folder_url(folder_id)
+            if is_gcs_target(folder_id)
+            else f"https://drive.google.com/drive/folders/{folder_id}"
+        )
+        store_label = folder_name or folder_id[:16]
+        duration_min = round(max(0.0, float(total_duration_sec)) / 60.0, 1)
+
+        buttons: List[dict] = [
+            {
+                "text": "📁 打开门店视频目录",
+                "onClick": {"openLink": {"url": folder_url}},
+            }
+        ]
+
+        payload = {
+            "cardsV2": [
+                {
+                    "cardId": f"job-start-{audit_id}",
+                    "card": {
+                        "header": {
+                            "title": f"🚀 门店视频 AI 稽核已启动 (#{audit_id})",
+                            "subtitle": f"门店：{store_label} · 共 {video_count} 支视频（约 {duration_min} 分钟）· 预计耗时约 {estimated_minutes:.1f} 分钟",
+                        },
+                        "sections": [
+                            {
+                                "widgets": [
+                                    {
+                                        "decoratedText": {
+                                            "topLabel": "任务标识与生效配置",
+                                            "text": (
+                                                f"<b>发起督导</b>：{initiator_line}<br>"
+                                                f"<b>Job ID</b>：<code>{audit_id}</code><br>"
+                                                f"<b>模型</b>：<code>{model_version or 'gemini-3.8-flash'}</code> · "
+                                                f"<b>SOP</b>：<code>{prompt_version or 'APAC SOP'}</code>"
+                                            ),
+                                        }
+                                    },
+                                    {"buttonList": {"buttons": buttons}},
+                                ]
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(webhook_url, json=payload)
+                resp.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.warning("Failed to send Google Chat job start notification: %s", exc)
+            return False
+
     async def send_completion_notification(
         self,
         *,
@@ -222,17 +382,12 @@ class WorkspaceReporter:
         violations_count: int,
         total_tokens: int,
     ) -> bool:
-        """Sends Google Chat Webhook completion alert with direct link to the in-folder Google Sheet."""
-        enabled = (
-            self._enable_notification
-            if self._enable_notification is not None
-            else (
-                config.enable_google_chat_notification
-                if "ENABLE_GOOGLE_CHAT_NOTIFICATION" in os.environ
-                else bool(self._webhook_url)
-            )
+        """Sends Google Chat Webhook completion alert with both the HTML Supervisor Workbench and Google Sheet."""
+        enabled = self._is_notification_enabled()
+        webhook_url = (
+            await asyncio.to_thread(self._resolve_webhook_url_sync) if enabled else ""
         )
-        if not enabled or not self._webhook_url:
+        if not enabled or not webhook_url:
             logger.info(
                 "Google Chat notification disabled or webhook unconfigured (enabled=%s); skipping push for job %s (user=%s)",
                 enabled,
@@ -243,25 +398,320 @@ class WorkspaceReporter:
 
         chat_user_id = await asyncio.to_thread(resolve_chat_user_id, user_email)
         initiator_line = (
-            f"<users/{chat_user_id}> (`{user_email}`)"
+            f"<users/{chat_user_id}> (<code>{user_email}</code>)"
             if chat_user_id
-            else f"`{user_email}`"
+            else f"<code>{user_email}</code>"
         )
-        payload = {
-            "text": (
-                f"🔔 *【霸王茶姬门店 CCTV AI 稽核完成通知】*\n"
-                f"• **发起督导**：{initiator_line}\n"
-                f"• **稽核单号**：`{audit_id}`\n"
-                f"• **待人工 3 秒复核事件数**：`{violations_count}` 项（全部含 5~10s 永久视频切片）\n"
-                f"• **总计 Token 消耗**：`{total_tokens:,}` Tokens\n"
-                f"👉 **[点击打开您原文件夹内的《门店稽核报告与 Token 账单 Sheet》]({sheet_url})**"
+        portal_url = build_portal_url(job_id=audit_id, user_id=user_email)
+        buttons: List[dict] = []
+        if portal_url.startswith("http"):
+            buttons.append(
+                {
+                    "text": "🖥️ 打开 HTML 督导复核工作台",
+                    "onClick": {"openLink": {"url": portal_url}},
+                }
             )
+        if sheet_url:
+            buttons.append(
+                {
+                    "text": "📊 打开原 Google Sheet 账单",
+                    "onClick": {"openLink": {"url": sheet_url}},
+                }
+            )
+
+        payload = {
+            "cardsV2": [
+                {
+                    "cardId": f"job-done-{audit_id}",
+                    "card": {
+                        "header": {
+                            "title": f"✅ 门店视频 AI 稽核已完成 (#{audit_id})",
+                            "subtitle": f"共检出 {violations_count} 项待复核事件 · 消耗 {total_tokens:,} Tokens",
+                        },
+                        "sections": [
+                            {
+                                "header": "督导 3 秒复核入口（支持页内播放 20s 切片、一键生成 48h 整改单并实时回写 Sheet）",
+                                "widgets": [
+                                    {
+                                        "decoratedText": {
+                                            "topLabel": f"Job ID: {audit_id}",
+                                            "text": (
+                                                f"<b>发起督导</b>：{initiator_line}<br>"
+                                                f"<b>待复核违规事件</b>：{violations_count} 项 | "
+                                                f"<b>总 Token</b>：{total_tokens:,}"
+                                            ),
+                                        }
+                                    },
+                                    *(
+                                        [{"buttonList": {"buttons": buttons}}]
+                                        if buttons
+                                        else []
+                                    ),
+                                ],
+                            }
+                        ],
+                    },
+                }
+            ],
         }
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(self._webhook_url, json=payload)
+                resp = await client.post(webhook_url, json=payload)
                 resp.raise_for_status()
             return True
         except Exception as exc:
             logger.warning("Failed to send Google Chat webhook notification: %s", exc)
+            return False
+
+    async def send_batch_start_notification(
+        self,
+        *,
+        batch_id: str,
+        rule_id: str,
+        rule_name: str,
+        supervisor_email: str,
+        root_folder_url: str,
+        store_summaries: List[dict],
+    ) -> bool:
+        """Sends a Google Chat start notification when a scheduled multi-store batch starts (`Batch ID`)."""
+        enabled = self._is_notification_enabled()
+        webhook_url = (
+            await asyncio.to_thread(self._resolve_webhook_url_sync) if enabled else ""
+        )
+        if not enabled or not webhook_url:
+            logger.info(
+                "Google Chat batch start notification disabled or webhook unconfigured (enabled=%s); skipping push for batch %s",
+                enabled,
+                batch_id,
+            )
+            return False
+
+        chat_user_id = await asyncio.to_thread(resolve_chat_user_id, supervisor_email)
+        initiator_line = (
+            f"<users/{chat_user_id}> (<code>{supervisor_email}</code>)"
+            if chat_user_id
+            else f"<code>{supervisor_email}</code>"
+        )
+        total_stores = len(store_summaries)
+        running_stores = sum(
+            1 for s in store_summaries if str(s.get("state") or "").upper() == "RUNNING"
+        )
+        failed_stores = total_stores - running_stores
+        total_videos = sum(int(s.get("video_count") or 0) for s in store_summaries)
+
+        widgets: List[dict] = [
+            {
+                "decoratedText": {
+                    "topLabel": f"Batch ID: {batch_id}",
+                    "text": (
+                        f"<b>负责督导</b>：{initiator_line}<br>"
+                        f"<b>命中门店</b>：共 {total_stores} 家（已启动 {running_stores} 家 / 预检拦截 {failed_stores} 家）· 合计 {total_videos} 支新增视频"
+                    ),
+                }
+            }
+        ]
+        if root_folder_url and root_folder_url.startswith("http"):
+            widgets.append(
+                {
+                    "buttonList": {
+                        "buttons": [
+                            {
+                                "text": "📁 打开巡检根目录",
+                                "onClick": {"openLink": {"url": root_folder_url}},
+                            }
+                        ]
+                    }
+                }
+            )
+
+        for idx, st in enumerate(store_summaries, start=1):
+            fname = str(st.get("folder_name") or st.get("folder_id") or f"Store-{idx}")
+            st_state = str(st.get("state") or "RUNNING").upper()
+            v_cnt = int(st.get("video_count") or 0)
+            st_job_id = str(st.get("job_id") or "")
+            err_msg = str(st.get("error_message") or "")
+            detail_txt = (
+                f"<b>{fname}</b> — 新增视频 {v_cnt} 支（后台稽核中）"
+                if st_state == "RUNNING"
+                else f"<b>{fname}</b> — 预检拦截（{err_msg[:80] or '详见日志'}）"
+            )
+            widgets.append(
+                {
+                    "decoratedText": {
+                        "topLabel": f"门店 #{idx} · Job ID: {st_job_id} ({st_state})",
+                        "text": detail_txt,
+                    }
+                }
+            )
+
+        payload = {
+            "cardsV2": [
+                {
+                    "cardId": f"scheduled-batch-start-{batch_id}",
+                    "card": {
+                        "header": {
+                            "title": f"🚀 定时自动巡检已启动：{rule_name} ({rule_id})",
+                            "subtitle": f"Batch ID: {batch_id} · 共 {total_stores} 家门店 / {total_videos} 支新增视频",
+                        },
+                        "sections": [
+                            {
+                                "header": "本批次派发门店清单",
+                                "widgets": widgets[:30],
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(webhook_url, json=payload)
+                resp.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.warning("Failed to send Google Chat batch start notification: %s", exc)
+            return False
+
+    async def send_batch_summary_notification(
+        self,
+        *,
+        batch_id: str,
+        rule_id: str,
+        rule_name: str,
+        supervisor_email: str,
+        root_folder_url: str,
+        store_summaries: List[dict],
+    ) -> bool:
+        """Sends a single consolidated multi-store Google Chat card when a scheduled batch completes."""
+        enabled = self._is_notification_enabled()
+        webhook_url = (
+            await asyncio.to_thread(self._resolve_webhook_url_sync) if enabled else ""
+        )
+        if not enabled or not webhook_url:
+            logger.info(
+                "Google Chat batch notification disabled or webhook unconfigured (enabled=%s); skipping push for batch %s",
+                enabled,
+                batch_id,
+            )
+            return False
+
+        chat_user_id = await asyncio.to_thread(resolve_chat_user_id, supervisor_email)
+        initiator_line = (
+            f"<users/{chat_user_id}> (<code>{supervisor_email}</code>)"
+            if chat_user_id
+            else f"<code>{supervisor_email}</code>"
+        )
+        total_stores = len(store_summaries)
+        succeeded_stores = sum(1 for s in store_summaries if str(s.get("state") or "").upper() == "DONE")
+        failed_stores = total_stores - succeeded_stores
+        total_videos = sum(int(s.get("video_count") or 0) for s in store_summaries)
+        total_violations = sum(int(s.get("violations_found") or 0) for s in store_summaries)
+        total_tokens = sum(int(s.get("total_tokens") or 0) for s in store_summaries)
+        total_cost_usd = sum(float(s.get("cost_usd") or 0.0) for s in store_summaries)
+        batch_portal_url = build_portal_url(batch_id=batch_id)
+
+        widgets: List[dict] = [
+            {
+                "decoratedText": {
+                    "topLabel": f"Batch ID: {batch_id}",
+                    "text": (
+                        f"<b>负责督导</b>：{initiator_line}<br>"
+                        f"<b>覆盖门店</b>：共 {total_stores} 家（成功 {succeeded_stores} 家 / 失败 {failed_stores} 家）· {total_videos} 支视频<br>"
+                        f"<b>汇总检出</b>：{total_violations} 项待复核 | <b>总 Token</b>：{total_tokens:,}（约 ${total_cost_usd:.4f}）"
+                    ),
+                }
+            }
+        ]
+        top_buttons: List[dict] = []
+        if batch_portal_url.startswith("http"):
+            top_buttons.append(
+                {
+                    "text": "🌐 打开本批次多门店 HTML 复核工作台",
+                    "onClick": {"openLink": {"url": batch_portal_url}},
+                }
+            )
+        if root_folder_url and root_folder_url.startswith("http"):
+            top_buttons.append(
+                {
+                    "text": "📁 打开巡检根目录",
+                    "onClick": {"openLink": {"url": root_folder_url}},
+                }
+            )
+        if top_buttons:
+            widgets.append({"buttonList": {"buttons": top_buttons}})
+
+        for idx, st in enumerate(store_summaries, start=1):
+            fname = str(st.get("folder_name") or st.get("folder_id") or f"Store-{idx}")
+            st_state = str(st.get("state") or "DONE").upper()
+            st_job_id = str(st.get("job_id") or "")
+            v_cnt = int(st.get("video_count") or 0)
+            viol_cnt = int(st.get("violations_found") or 0)
+            tok_cnt = int(st.get("total_tokens") or 0)
+            s_url = str(st.get("report_sheet_url") or "")
+            err_msg = str(st.get("error_message") or "")
+            store_portal_url = (
+                build_portal_url(batch_id=batch_id, store_job_id=st_job_id)
+                if st_job_id
+                else ""
+            )
+            btn_target = (
+                store_portal_url
+                if store_portal_url.startswith("http")
+                else s_url
+            )
+            btn_label = (
+                "🖥️ HTML 复核台"
+                if store_portal_url.startswith("http")
+                else "📊 打开报告 Sheet"
+            )
+            row_text = (
+                f"<b>{fname}</b> — 视频 {v_cnt} 支 | 待复核 {viol_cnt} 项 | {tok_cnt:,} Tokens"
+                if st_state == "DONE"
+                else f"<b>{fname}</b> — 执行失败（{err_msg[:80] or '详见日志'}）"
+            )
+            widgets.append(
+                {
+                    "decoratedText": {
+                        "topLabel": f"门店 #{idx} · Job ID: {st_job_id} ({st_state})",
+                        "text": row_text,
+                        **(
+                            {
+                                "button": {
+                                    "text": btn_label,
+                                    "onClick": {"openLink": {"url": btn_target}},
+                                }
+                            }
+                            if btn_target and st_state == "DONE"
+                            else {}
+                        ),
+                    }
+                }
+            )
+
+        payload = {
+            "cardsV2": [
+                {
+                    "cardId": f"scheduled-batch-{batch_id}",
+                    "card": {
+                        "header": {
+                            "title": f"✅ 定时巡检已完成：{rule_name} ({rule_id})",
+                            "subtitle": f"Batch ID: {batch_id} · 覆盖 {total_stores} 家门店 / {total_videos} 支视频 · 待复核 {total_violations} 项",
+                        },
+                        "sections": [
+                            {
+                                "header": "门店巡检结果明细（支持顶部一键切换各门店 HTML 复核台）",
+                                "widgets": widgets[:30],
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(webhook_url, json=payload)
+                resp.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.warning("Failed to send Google Chat batch summary notification: %s", exc)
             return False

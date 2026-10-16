@@ -135,6 +135,9 @@ class AuditConfig(BaseModel):
     google_chat_webhook_url: str = Field(
         default_factory=lambda: os.environ.get("GOOGLE_CHAT_WEBHOOK_URL", "")
     )
+    cloud_run_job_name: str = Field(
+        default_factory=lambda: os.environ.get("CLOUD_RUN_JOB_NAME", "").strip()
+    )
     local_work_dir: Path = Field(
         default_factory=lambda: Path(os.environ.get("LOCAL_WORK_DIR", "/tmp/chagee_audit"))
     )
