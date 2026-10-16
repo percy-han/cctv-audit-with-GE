@@ -362,7 +362,7 @@ def list_folder_videos(drive: Any, folder_id: str) -> list[dict[str, Any]]:
     token = None
     while True:
         page = drive.files().list(
-            q=VIDEO_QUERY.format(folder=folder_id), fields="nextPageToken, files(id, name, videoMediaMetadata)",
+            q=VIDEO_QUERY.format(folder=folder_id), fields="nextPageToken, files(id, name, mimeType, videoMediaMetadata)",
             pageSize=1000, pageToken=token, supportsAllDrives=True, includeItemsFromAllDrives=True,
         ).execute(num_retries=3)
         files += page.get("files", [])
@@ -371,6 +371,8 @@ def list_folder_videos(drive: Any, folder_id: str) -> list[dict[str, Any]]:
             break
     out = []
     for f in files:
+        if f.get("mimeType") == "application/vnd.google-apps.folder":
+            continue
         meta = f.get("videoMediaMetadata") or {}
         v: dict[str, Any] = {"file_id": f["id"], "filename": f["name"]}
         dur = float(meta.get("durationMillis", 0) or 0) / 1000.0
@@ -392,8 +394,469 @@ def _http_hint(exc: BaseException, what: str) -> str:
     return f"{what} 读取失败：{type(exc).__name__}: {exc}"
 
 
-def load_golden_from_sheet(sheet_id: str, *, sheets: Any, drive: Any) -> GoldenSet:
-    """Reads the label tab + ``测评配置`` tab, lists the folders and returns the GoldenSet."""
+_FOOTAGE_PREFIX_RE = re.compile(r"(?i)^\s*footage\s*(\d+(?:\s*[&,]\s*\d+)*)\s*[:：]")
+_LEADING_NUM_PREFIX_RE = re.compile(r"^\s*\d+\s*[\.\-]\s*(.+?)\s*$")
+
+
+def _clean_hierarchy_segment(name: str) -> str:
+    """Strips leading numbering like ``1. Handwashing Monitoring`` -> ``Handwashing Monitoring`` or
+    ``1-Bau Cat`` -> ``Bau Cat``."""
+    m = _LEADING_NUM_PREFIX_RE.match((name or "").strip())
+    return m.group(1).strip() if m else (name or "").strip()
+
+
+def _infer_chagee_sop_category(clause: str, focus: str) -> str:
+    """Maps a human label row's Audit Clause + Focus to the canonical 3-bucket Chagee SOP category."""
+    cl = (clause or "").strip().lower()
+    fc = (focus or "").strip().lower()
+    if "tea maker" in cl or "personal belonging" in cl or "tea bar" in cl or "6.2" in cl or "1.4" in cl:
+        return "C_TeaBar_Hygiene"
+    if "ice maker" in cl or "equipment cleaning" in cl or "ice maker" in fc:
+        return "B_IceMaker"
+    if "handwashing" in cl or "cross contamination" in cl or "handwashing" in fc:
+        return "A_Handwashing"
+    return ""
+
+
+def _infer_single_ts_compound_parts(finding: str) -> list[str] | None:
+    """Splits a single-timestamp finding text containing two independent violation sentences (e.g. R18 in golden_v1)
+    into two scoring parts, while keeping multi-stage causal chains (e.g. Cross Contamination) as a single part."""
+    from eval.build_dataset import parse_osd_times
+
+    if "cross contamination" in (finding or "").lower():
+        return None
+    times = parse_osd_times(finding)
+    if len(times) != 1:
+        return None
+    body = re.sub(
+        r"(?i)^\s*footage\s*\d+(?:\s*[&,]\s*\d+)*\s*[:：]\s*\d{6}\s*",
+        "",
+        finding.strip(),
+    )
+    parts = [p.strip() for p in re.split(r"\.\s+(?=[A-Z])", body) if p.strip()]
+    neg_re = re.compile(r"(?i)\b(do\s+not|dot\s+not|not\s+|did\s+not|without\s+|fail|less\s+than)\b")
+    if len(parts) >= 2 and all(neg_re.search(p) for p in parts):
+        restored: list[str] = []
+        for idx, p in enumerate(parts):
+            if idx < len(parts) - 1 and not p.endswith("."):
+                restored.append(p + ".")
+            else:
+                restored.append(p)
+        return restored
+    return None
+
+
+def discover_golden_video_folders(
+    drive: Any,
+    root_folder_id: str,
+    *,
+    known_focuses: set[str] | None = None,
+    known_outlets: set[str] | None = None,
+) -> tuple[list[FolderConfig], dict[str, list[dict[str, Any]]]]:
+    """Recursively discovers all leaf video folders under ``root_folder_id`` (up to depth 4) and lists
+    their videos. Skips ``📁 违规证据切片`` evidence subfolders."""
+    focuses_norm = {f.lower(): f for f in (known_focuses or set()) if f}
+    outlets_norm = {o.lower(): o for o in (known_outlets or set()) if o}
+
+    def _list_subfolders(parent_id: str) -> list[dict[str, str]]:
+        subfolders: list[dict[str, str]] = []
+        token = None
+        q = (
+            f"'{parent_id}' in parents and trashed=false and "
+            "mimeType='application/vnd.google-apps.folder'"
+        )
+        while True:
+            page = (
+                drive.files()
+                .list(
+                    q=q,
+                    fields="nextPageToken, files(id, name, mimeType)",
+                    pageSize=200,
+                    pageToken=token,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                )
+                .execute(num_retries=3)
+            )
+            for item in page.get("files", []) or []:
+                mtype = str(item.get("mimeType") or "").strip()
+                if mtype and mtype != "application/vnd.google-apps.folder":
+                    continue
+                nm = str(item.get("name") or "").strip()
+                if nm.startswith("📁") or "违规证据切片" in nm:
+                    continue
+                subfolders.append({"id": str(item["id"]), "name": nm})
+            token = page.get("nextPageToken")
+            if not token:
+                break
+        subfolders.sort(key=lambda x: x["name"])
+        return subfolders
+
+    try:
+        root_meta = (
+            drive.files()
+            .get(fileId=root_folder_id, fields="id, name", supportsAllDrives=True)
+            .execute(num_retries=3)
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise GoldenSheetError(_http_hint(exc, f"黄金集视频目录 {root_folder_id}")) from exc
+
+    root_name = str(root_meta.get("name") or root_folder_id).strip()
+    queue: list[tuple[str, list[str]]] = [(root_folder_id, [root_name])]
+    discovered_folders: list[FolderConfig] = []
+    listings: dict[str, list[dict[str, Any]]] = {}
+
+    visited: set[str] = set()
+    while queue:
+        curr_id, path_names = queue.pop(0)
+        if curr_id in visited or len(path_names) > 5:
+            continue
+        visited.add(curr_id)
+
+        try:
+            vids = list_folder_videos(drive, curr_id)
+        except Exception as exc:  # noqa: BLE001
+            raise GoldenSheetError(_http_hint(exc, f"黄金集视频子目录 {curr_id}")) from exc
+
+        if vids:
+            cleaned_ancestors = [_clean_hierarchy_segment(seg) for seg in path_names]
+            matched_focus = ""
+            matched_outlet = ""
+            for seg in cleaned_ancestors:
+                seg_l = seg.lower()
+                if not matched_focus:
+                    for kf_l, kf_orig in focuses_norm.items():
+                        if kf_l == seg_l or kf_l in seg_l or seg_l in kf_l:
+                            matched_focus = kf_orig
+                            break
+                if not matched_outlet:
+                    for ko_l, ko_orig in outlets_norm.items():
+                        if ko_l == seg_l or ko_l in seg_l or seg_l in ko_l:
+                            matched_outlet = ko_orig
+                            break
+            if not matched_outlet and cleaned_ancestors:
+                matched_outlet = cleaned_ancestors[-1]
+            if not matched_focus and len(cleaned_ancestors) >= 2:
+                matched_focus = cleaned_ancestors[-2]
+            elif not matched_focus:
+                matched_focus = matched_outlet
+
+            gid = hashlib.sha1(f"{matched_outlet}|{matched_focus}|{curr_id}".encode("utf-8")).hexdigest()[:6]
+            discovered_folders.append(
+                FolderConfig(
+                    group_id=gid,
+                    outlet=matched_outlet,
+                    focus=matched_focus,
+                    folder_id=curr_id,
+                    cache_job_ids=[],
+                    row=len(discovered_folders) + 1,
+                )
+            )
+            listings[curr_id] = vids
+
+        try:
+            children = _list_subfolders(curr_id)
+        except Exception:
+            children = []
+        for child in children:
+            queue.append((child["id"], path_names + [child["name"]]))
+
+    discovered_folders.sort(key=lambda f: (f.outlet, f.focus, f.folder_id))
+    return discovered_folders, listings
+
+
+def _resolve_missing_filenames_in_rows(
+    values: list[list[str]],
+    folders: Sequence[FolderConfig],
+    listings: Mapping[str, list[dict[str, Any]]],
+) -> list[list[str]]:
+    """Fills in Column F (``对应的视频文件名称``) when a human label sheet (such as ``CHAGEE_GolderSet``)
+    has only 5 columns (`Focus`, `Outlet`, `Outlet Name`, `Audit Clause`, `Findings`) by matching
+    `(Focus, Outlet Name)` + `Footage N` prefix against the discovered folder listings."""
+    folder_by_pair: dict[tuple[str, str], str] = {
+        (f.focus.lower(), f.outlet.lower()): f.folder_id for f in folders
+    }
+    carry = ["", "", "", ""]
+    out_rows: list[list[str]] = []
+    for idx, row in enumerate(values):
+        padded = list(row) + [""] * max(0, 6 - len(row))
+        if idx == 0:
+            if not padded[5].strip():
+                padded[5] = "对应的视频文件名称"
+            out_rows.append(padded[:6])
+            continue
+        finding = padded[4].strip()
+        if not finding:
+            out_rows.append(padded[:6])
+            continue
+        for c_i in range(4):
+            if padded[c_i].strip():
+                carry[c_i] = padded[c_i].strip()
+        focus, _, outlet_name, _ = carry
+        if not padded[5].strip():
+            fid = folder_by_pair.get((focus.lower(), outlet_name.lower()), "")
+            vids = listings.get(fid, []) if fid else []
+            m = _FOOTAGE_PREFIX_RE.match(finding)
+            if m and vids:
+                nums = [int(n.strip()) for n in re.split(r"[&,]", m.group(1)) if n.strip().isdigit()]
+                matched_names: list[str] = []
+                for num in nums:
+                    pat = re.compile(rf"(?i)^footage\s*0*{num}(?!\d)")
+                    cand = next((v["filename"] for v in vids if pat.search(v["filename"])), "")
+                    if cand:
+                        matched_names.append(cand)
+                if matched_names and len(matched_names) == len(nums):
+                    padded[5] = ",".join(matched_names)
+        out_rows.append(padded[:6])
+    return out_rows
+
+
+def _load_golden_from_sheet_and_folder(
+    sheet_id: str,
+    golden_videos_folder_id: str,
+    *,
+    sheets: Any,
+    drive: Any,
+) -> GoldenSet:
+    """Builds a ``GoldenSet`` from a Human Labels Google Sheet (``sheet_id``, which does NOT need a
+    ``测评配置`` tab) and a dedicated ``golden_videos_folder_id`` in Google Drive."""
+    try:
+        meta = (
+            drive.files()
+            .get(fileId=sheet_id, fields="name, modifiedTime, version", supportsAllDrives=True)
+            .execute(num_retries=3)
+        )
+        ss_meta = (
+            sheets.spreadsheets()
+            .get(spreadsheetId=sheet_id, fields="sheets.properties.title")
+            .execute(num_retries=3)
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise GoldenSheetError(_http_hint(exc, f"人工标注表 {sheet_id}")) from exc
+
+    tab_titles = [
+        str((s.get("properties") or {}).get("title") or "")
+        for s in (ss_meta.get("sheets") or [])
+    ]
+    optional_cfg: GoldenSheetConfig | None = None
+    if CONFIG_TAB in tab_titles:
+        try:
+            config_rows = (
+                sheets.spreadsheets()
+                .values()
+                .get(spreadsheetId=sheet_id, range=f"'{CONFIG_TAB}'")
+                .execute(num_retries=3)
+                .get("values", [])
+            )
+            optional_cfg = parse_config(config_rows)
+        except Exception:
+            optional_cfg = None
+
+    label_range = optional_cfg.label_range if optional_cfg and optional_cfg.label_range else ""
+    label_values: list[list[Any]] = []
+    if label_range:
+        try:
+            label_values = (
+                sheets.spreadsheets()
+                .values()
+                .get(spreadsheetId=sheet_id, range=label_range)
+                .execute(num_retries=3)
+                .get("values", [])
+            )
+        except Exception:
+            label_values = []
+
+    if not label_values:
+        for t_title in tab_titles:
+            if t_title == CONFIG_TAB:
+                continue
+            try:
+                cand_vals = (
+                    sheets.spreadsheets()
+                    .values()
+                    .get(spreadsheetId=sheet_id, range=f"'{t_title}'!A1:F200")
+                    .execute(num_retries=3)
+                    .get("values", [])
+                )
+            except Exception:
+                continue
+            if cand_vals and len(cand_vals[0]) >= 5 and str(cand_vals[0][4]).strip() == "Findings":
+                label_range = f"{t_title}!A1:F200"
+                label_values = cand_vals
+                break
+
+    if not label_values:
+        raise GoldenSheetError(
+            f"人工标注表 {sheet_id} 中未找到包含 'Findings'（E列）的标注工作表，请检查表头格式"
+        )
+
+    raw_padded = pad_rows(label_values, 6)
+    # Remove any completely empty separator rows inside the label table so sheet_row numbers stay contiguous
+    cleaned_rows: list[list[str]] = [raw_padded[0]]
+    known_focuses: set[str] = set()
+    known_outlets: set[str] = set()
+    carry_fo = ["", ""]
+    for r in raw_padded[1:]:
+        if not any(c.strip() for c in r):
+            continue
+        if r[0].strip():
+            carry_fo[0] = r[0].strip()
+        if r[2].strip():
+            carry_fo[1] = r[2].strip()
+        if carry_fo[0]:
+            known_focuses.add(carry_fo[0])
+        if carry_fo[1]:
+            known_outlets.add(carry_fo[1])
+        cleaned_rows.append(r)
+
+    discovered_folders, listings = discover_golden_video_folders(
+        drive,
+        golden_videos_folder_id,
+        known_focuses=known_focuses,
+        known_outlets=known_outlets,
+    )
+    if not discovered_folders:
+        raise GoldenSheetError(
+            f"黄金集视频目录 {golden_videos_folder_id} 下未找到任何包含视频的子文件夹，请检查 Golden_Videos_Folder_URL"
+        )
+
+    # Preserve group_id and cache_job_ids from optional_cfg if matching (outlet, focus) exists
+    if optional_cfg and optional_cfg.folders:
+        cfg_by_pair = {(f.outlet.lower(), f.focus.lower()): f for f in optional_cfg.folders}
+        merged_folders: list[FolderConfig] = []
+        for df in discovered_folders:
+            prev_f = cfg_by_pair.get((df.outlet.lower(), df.focus.lower()))
+            if prev_f is not None:
+                merged_folders.append(
+                    FolderConfig(
+                        group_id=prev_f.group_id,
+                        outlet=prev_f.outlet,
+                        focus=prev_f.focus,
+                        folder_id=df.folder_id,
+                        cache_job_ids=list(prev_f.cache_job_ids),
+                        row=df.row,
+                    )
+                )
+            else:
+                merged_folders.append(df)
+        discovered_folders = merged_folders
+
+    resolved_values = _resolve_missing_filenames_in_rows(cleaned_rows, discovered_folders, listings)
+    filename_index: dict[str, str] = {}
+    problems: list[str] = []
+    for f in discovered_folders:
+        for v in listings.get(f.folder_id, []):
+            prev = filename_index.setdefault(v["filename"], v["file_id"])
+            if prev != v["file_id"]:
+                problems.append(
+                    f"视频文件名 {v['filename']!r} 在黄金集视频目录里出现了不止一次（{prev} / {v['file_id']}），标注无法唯一对应"
+                )
+    if problems:
+        raise GoldenSheetError("黄金集视频目录有问题：\n  - " + "\n  - ".join(problems))
+
+    dev_groups = (
+        list(optional_cfg.dev_groups)
+        if optional_cfg and optional_cfg.dev_groups
+        else [
+            ("Handwashing Monitoring", "Cantavil D2"),
+            ("Ice Maker Weekly Cleaning", "Bau Cat"),
+        ]
+    )
+    compound: dict[int, list[str]] = (
+        dict(optional_cfg.compound) if optional_cfg and optional_cfg.compound else {}
+    )
+    if not compound:
+        for offset, r in enumerate(resolved_values[1:]):
+            s_row = offset + 2
+            inferred_parts = _infer_single_ts_compound_parts(r[4])
+            if inferred_parts:
+                compound[s_row] = inferred_parts
+
+    try:
+        records = build_golden_records(
+            resolved_values,
+            filename_index,
+            source_sheet_id=(optional_cfg.source_sheet_id if optional_cfg else "") or sheet_id,
+            source_sha256=label_values_sha256(resolved_values),
+            dev_groups=set(dev_groups),
+            text_compound_parts=compound,
+            expected_rows=optional_cfg.expected_rows if optional_cfg else None,
+        )
+    except (GoldenBuildError, ValueError) as exc:
+        msg = str(exc)
+        if "not found in the Drive listing" in msg:
+            msg = (
+                "标注里的视频文件名在黄金集视频目录中找不到（必须完全一致，包括空格和括号）：\n  "
+                + msg.split(":", 1)[1].strip().replace("\n  ", "\n  ")
+            )
+        raise GoldenSheetError(f"人工标注页 {label_range} 无法转成黄金集：{msg}") from exc
+
+    if optional_cfg and optional_cfg.items:
+        item_settings = list(optional_cfg.items)
+    else:
+        default_stable = {"R08", "R09", "R12", "R13", "R14", "R19"}
+        item_settings = []
+        for idx_r, rec in enumerate(records, 1):
+            iid = str(rec["item_id"])
+            cat = _infer_chagee_sop_category(str(rec.get("audit_clause") or ""), str(rec.get("focus") or ""))
+            item_settings.append(
+                ItemSetting(
+                    item_id=iid,
+                    sop_category=cat,
+                    temporal_mode="",
+                    stable_baseline=iid in default_stable,
+                    row=idx_r,
+                )
+            )
+
+    synth_cfg = GoldenSheetConfig(
+        name=(optional_cfg.name if optional_cfg and optional_cfg.name else "golden_v1"),
+        label_range=label_range,
+        expected_rows=len(records),
+        note=(optional_cfg.note if optional_cfg else ""),
+        source_sheet_id=sheet_id,
+        folders=discovered_folders,
+        dev_groups=dev_groups,
+        compound=compound,
+        items=item_settings,
+    )
+    manifest = build_manifest(synth_cfg, listings)
+    origin = {
+        "type": "google_sheet",
+        "sheet_id": sheet_id,
+        "sheet_name": str(meta.get("name") or ""),
+        "sheet_modified_time": str(meta.get("modifiedTime") or ""),
+        "sheet_version": str(meta.get("version") or ""),
+        "label_range": label_range,
+        "golden_videos_folder_id": golden_videos_folder_id,
+        "sheet_url": f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit",
+    }
+    return build_golden(
+        records_to_jsonl(records).encode("utf-8"),
+        manifest,
+        stem=synth_cfg.name,
+        source=f"sheet:{sheet_id}",
+        manifest_source=f"drive_folder:{golden_videos_folder_id}",
+        origin=origin,
+    )
+
+
+def load_golden_from_sheet(
+    sheet_id: str,
+    *,
+    sheets: Any,
+    drive: Any,
+    golden_videos_folder_id: str = "",
+) -> GoldenSet:
+    """Reads the label tab (plus ``测评配置`` tab when ``golden_videos_folder_id`` is empty, or discovers
+    folders directly from ``golden_videos_folder_id`` when provided) and returns the GoldenSet."""
+    if str(golden_videos_folder_id or "").strip():
+        return _load_golden_from_sheet_and_folder(
+            sheet_id,
+            str(golden_videos_folder_id).strip(),
+            sheets=sheets,
+            drive=drive,
+        )
     try:
         meta = drive.files().get(fileId=sheet_id, fields="name, modifiedTime, version",
                                  supportsAllDrives=True).execute(num_retries=3)

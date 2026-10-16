@@ -163,6 +163,49 @@ class SheetToGoldenTest(unittest.TestCase):
             gsh.load_golden_from_sheet(SID, sheets=FakeSheets({}, fail_status=403), drive=FakeDrive(FOLDERS))
         self.assertIn("共享给评测使用的 Workspace 身份", str(ctx.exception))
 
+    def test_pure_human_labels_sheet_with_golden_videos_folder_id(self):
+        """Verifies 3-path mode (`golden_videos_folder_id`): works without `测评配置` tab and supports 5-col & 6-col sheets."""
+        root_id = "1RootGoldenVideos_0000"
+        cat1_id = "1CatHandwashing_0000"
+        cat2_id = "1CatIceMaker_0000"
+        leaf_a = "1LeafBauCat_aaaaaaaa"
+        leaf_b = "1LeafCantavil_bbbbbb"
+        nested_folders = {
+            root_id: [
+                {"id": cat1_id, "name": "1. Handwashing Monitoring", "mimeType": "application/vnd.google-apps.folder"},
+                {"id": cat2_id, "name": "2. Ice Maker Weekly Cleaning", "mimeType": "application/vnd.google-apps.folder"},
+            ],
+            cat1_id: [
+                {"id": leaf_a, "name": "1-Demo Store A", "mimeType": "application/vnd.google-apps.folder"},
+            ],
+            cat2_id: [
+                {"id": leaf_b, "name": "2-Demo Store B", "mimeType": "application/vnd.google-apps.folder"},
+            ],
+            leaf_a: [
+                {"id": "fA1", "name": "Footage1-A_clip1.mov", "mimeType": "video/quicktime",
+                 "videoMediaMetadata": {"durationMillis": "300000", "width": 1920, "height": 1080}},
+                {"id": "fA2", "name": "Footage2-A_clip2.mov", "mimeType": "video/quicktime", "videoMediaMetadata": {}},
+            ],
+            leaf_b: [
+                {"id": "fB1", "name": "Footage1-B_clip1.mov", "mimeType": "video/quicktime", "videoMediaMetadata": {}},
+            ],
+        }
+        # 5-column pure human labels sheet (like CHAGEE_GolderSet, on Sheet2, no 测评配置 tab, no filename column)
+        five_col_labels = [
+            ["Focus", "Outlet", "Outlet Name", "Audit Clause", "Findings"],
+            ["Handwashing Monitoring", "1", "Demo Store A", "1.5 Handwashing", "Footage 1: 080518 not dry hand"],
+            ["", "", "", "", "Footage 2: 080610 & 080640 soaping < 20s"],
+            ["Ice Maker Weekly Cleaning", "2", "Demo Store B", "5.8 Ice Maker", "Footage 1: 221647 dwell < 5 min"],
+        ]
+        sheets = FakeSheets({"Sheet1": [], "Sheet2": five_col_labels})
+        drive = FakeDrive(nested_folders)
+        g = gsh.load_golden_from_sheet(SID, sheets=sheets, drive=drive, golden_videos_folder_id=root_id)
+        self.assertEqual([it["item_id"] for it in g.items], ["R02", "R03", "R04"])
+        self.assertEqual(g.items[0]["video_filenames"], ["Footage1-A_clip1.mov"])
+        self.assertEqual(g.items[1]["video_filenames"], ["Footage2-A_clip2.mov"])
+        self.assertEqual(g.items[2]["video_filenames"], ["Footage1-B_clip1.mov"])
+        self.assertEqual(g.origin["golden_videos_folder_id"], root_id)
+
 
 @unittest.skipUnless((DATA / "manual_audit_result_raw.json").exists() and (DATA / "golden_v1.manifest.json").exists(),
                      "private golden_v1 data not present")

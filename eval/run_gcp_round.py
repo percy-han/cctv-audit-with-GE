@@ -125,12 +125,23 @@ def resolve_golden_source(golden_arg: str | Path | None, sheet_arg: str | None,
     return "file", uri or str(DEFAULT_GOLDEN_PATH)
 
 
-def load_golden_source(kind: str, ref: str, tmp_dir: Path) -> tuple[Path | None, GoldenSet]:
+def load_golden_source(
+    kind: str,
+    ref: str,
+    tmp_dir: Path,
+    *,
+    golden_videos_folder_id: str = "",
+) -> tuple[Path | None, GoldenSet]:
     if kind == "sheet":
         from eval.golden_sheet import default_services, load_golden_from_sheet
 
         sheets, drive = default_services()
-        return None, load_golden_from_sheet(ref, sheets=sheets, drive=drive)
+        return None, load_golden_from_sheet(
+            ref,
+            sheets=sheets,
+            drive=drive,
+            golden_videos_folder_id=golden_videos_folder_id,
+        )
     local = materialize_golden(ref, tmp_dir)
     return local, load_golden(local)
 
@@ -848,6 +859,7 @@ async def run_sheet_triggered_eval(
     prompt_tab_name: str,
     model_version: str,
     golden_source_id: str,
+    golden_videos_folder_id: str = "",
     results_folder_id: str = "",
     supervisor_email: str = "",
     eval_task_id: str = "",
@@ -897,6 +909,7 @@ async def run_sheet_triggered_eval(
         kind,
         str(golden_source_id).strip(),
         tmp_golden_dir,
+        golden_videos_folder_id=str(golden_videos_folder_id or "").strip(),
     )
     res_dir = results_dir / run_id
     res_dir.mkdir(parents=True, exist_ok=True)

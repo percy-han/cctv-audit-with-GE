@@ -121,7 +121,12 @@ def load_snapshot(path: Path) -> list[dict[str, Any]]:
         values = tab.get("values")
         if not isinstance(values, list) or not values or not all(isinstance(r, list) for r in values):
             raise ValueError(f"{path}: tab {tab.get('title')!r} has no row data")
-        if tab["title"] != TAB0_TITLE and len(values[0]) != 9:
+        if tab["title"] == "Tab3_黄金集评测工作台":
+            if len(values[0]) not in (9, 10):
+                raise ValueError(
+                    f"{path}: eval workbench tab {tab['title']!r} must have 9 or 10 columns, got {len(values[0])}"
+                )
+        elif tab["title"] != TAB0_TITLE and len(values[0]) != 9:
             raise ValueError(f"{path}: rules tab {tab['title']!r} must have 9 columns, got {len(values[0])}")
     return tabs
 

@@ -2052,13 +2052,15 @@ def test_preflight_rejected_store_preserves_error_message_in_batch_and_portal(
 
 
 def test_tab3_eval_workbench_parsing_and_dropdown_validations() -> None:
-    """Verifies Tab3_黄金集评测工作台 row parsing, error diagnostics, and native dropdown validations."""
+    """Verifies Tab3_黄金集评测工作台 10-col row parsing, legacy 9-col migration, error diagnostics, and native dropdown validations."""
     from cctv_audit.prompt_manager import (
         EVAL_WORKBENCH_HEADERS,
         build_master_sheet_validation_requests,
+        migrate_tab3_rows_to_3path_schema,
         parse_scheduled_eval_rules_with_diagnostics,
     )
 
+    assert len(EVAL_WORKBENCH_HEADERS) == 10
     rows = [
         list(EVAL_WORKBENCH_HEADERS),
         [
@@ -2066,9 +2068,10 @@ def test_tab3_eval_workbench_parsing_and_dropdown_validations() -> None:
             "V10 基线评测",
             "Prompt_v2.5_V10全量17条标准版",
             "gemini-3.1-flash-preview",
-            "https://docs.google.com/spreadsheets/d/1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w/edit",
+            "https://drive.google.com/drive/folders/1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY",
+            "https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit",
             "https://drive.google.com/drive/folders/1ky221gNbzgIT83981ghVpFc03and4s-g",
-            "supervisor@chagee.com",
+            "admin@percyhan.altostrat.com",
             "START_EVAL",
             "",
         ],
@@ -2077,9 +2080,10 @@ def test_tab3_eval_workbench_parsing_and_dropdown_validations() -> None:
             "无效 SOP 标签页",
             "Prompt_NonExistent",
             "gemini-3.1-flash-preview",
-            "https://docs.google.com/spreadsheets/d/1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w/edit",
+            "https://drive.google.com/drive/folders/1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY",
+            "https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit",
             "https://drive.google.com/drive/folders/1ky221gNbzgIT83981ghVpFc03and4s-g",
-            "supervisor@chagee.com",
+            "admin@percyhan.altostrat.com",
             "START_EVAL",
             "",
         ],
@@ -2091,11 +2095,46 @@ def test_tab3_eval_workbench_parsing_and_dropdown_validations() -> None:
     assert len(valid_rules) == 1
     assert valid_rules[0].eval_id == "EVAL-01"
     assert valid_rules[0].trigger_action == "START_EVAL"
-    assert valid_rules[0].golden_source_id == "1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w"
+    assert valid_rules[0].golden_videos_folder_id == "1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY"
+    assert valid_rules[0].golden_source_id == "1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0"
     assert valid_rules[0].results_folder_id == "1ky221gNbzgIT83981ghVpFc03and4s-g"
     assert len(row_errors) == 1
     assert row_errors[0].row_index == 3
     assert "Prompt_NonExistent" in row_errors[0].error_message
+
+    # Legacy 9-column migration check
+    legacy_rows = [
+        [
+            "Eval_ID",
+            "Eval_Name",
+            "Prompt_Tab_Name",
+            "Model_Version",
+            "Golden_Sheet_URL",
+            "Results_Folder_URL",
+            "Supervisor_Email",
+            "Trigger_Action",
+            "Last_Eval_Report",
+        ],
+        [
+            "EVAL-LEGACY",
+            "旧版9列评测",
+            "Prompt_v2.5_V10全量17条标准版",
+            "gemini-3.1-flash-preview",
+            "https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit",
+            "https://drive.google.com/drive/folders/1ky221gNbzgIT83981ghVpFc03and4s-g",
+            "admin@percyhan.altostrat.com",
+            "IDLE",
+            "",
+        ],
+    ]
+    changed, migrated = migrate_tab3_rows_to_3path_schema(legacy_rows)
+    assert changed is True
+    assert migrated[0] == list(EVAL_WORKBENCH_HEADERS)
+    assert len(migrated[1]) == 10
+    assert migrated[1][4] == ""
+    assert migrated[1][5] == "https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit"
+    assert migrated[1][7] == "admin@percyhan.altostrat.com"
+    assert migrated[1][8] == "IDLE"
 
     sheet_meta = {
         "sheets": [
@@ -2113,7 +2152,10 @@ def test_tab3_eval_workbench_parsing_and_dropdown_validations() -> None:
         if "setDataValidation" in r
         and r["setDataValidation"]["range"]["sheetId"] == 30
     ]
-    assert len(tab3_reqs) == 4
+    # 5 requests: Prompt_Tab_Name (Col C), Model_Version (Col D), Clear E:G, Supervisor_Email (Col H), Trigger_Action (Col I)
+    assert len(tab3_reqs) == 5
+    trigger_req = [r for r in tab3_reqs if r["range"]["startColumnIndex"] == 8][0]
+    assert trigger_req["range"]["endColumnIndex"] == 9
 
 
 def test_tab3_eval_workbench_tick_lifecycle_and_preflight(
@@ -2167,11 +2209,14 @@ def test_tab3_eval_workbench_tick_lifecycle_and_preflight(
             eval_name="缺少归档目录测试",
             prompt_tab_name="Prompt_v2.5_V10全量17条标准版",
             model_version="gemini-3.1-flash-preview",
-            golden_sheet_url="https://docs.google.com/spreadsheets/d/1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w/edit",
-            golden_source_id="1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w",
+            golden_videos_folder_url="https://drive.google.com/drive/folders/1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY",
+            golden_videos_folder_id="1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY",
+            human_labels_sheet_url="https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit",
+            golden_sheet_url="https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit",
+            golden_source_id="1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0",
             results_folder_url="",
             results_folder_id="",
-            supervisor_email="supervisor@chagee.com",
+            supervisor_email="admin@percyhan.altostrat.com",
             trigger_action="START_EVAL",
             last_eval_report="",
         )
@@ -2181,11 +2226,14 @@ def test_tab3_eval_workbench_tick_lifecycle_and_preflight(
             eval_name="V10.2 候选评测",
             prompt_tab_name="Prompt_v2.6_r02",
             model_version="gemini-3.1-flash-preview",
-            golden_sheet_url="https://docs.google.com/spreadsheets/d/1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w/edit",
-            golden_source_id="1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w",
+            golden_videos_folder_url="https://drive.google.com/drive/folders/1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY",
+            golden_videos_folder_id="1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY",
+            human_labels_sheet_url="https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit",
+            golden_sheet_url="https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit",
+            golden_source_id="1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0",
             results_folder_url="https://drive.google.com/drive/folders/1ky221gNbzgIT83981ghVpFc03and4s-g",
             results_folder_id="1ky221gNbzgIT83981ghVpFc03and4s-g",
-            supervisor_email="supervisor@chagee.com",
+            supervisor_email="admin@percyhan.altostrat.com",
             trigger_action="START_EVAL",
             last_eval_report="",
         )
@@ -2195,7 +2243,10 @@ def test_tab3_eval_workbench_tick_lifecycle_and_preflight(
 
         monkeypatch.setattr(svc.prompt_manager, "load_scheduled_eval_rules", _load_eval_rules)
 
+        seen_task_recs: List[Any] = []
+
         async def _fake_eval_runner(task_rec: Any) -> Dict[str, Any]:
+            seen_task_recs.append(task_rec)
             return {
                 "eval_id": task_rec.eval_id,
                 "eval_name": task_rec.eval_name,
@@ -2228,6 +2279,8 @@ def test_tab3_eval_workbench_tick_lifecycle_and_preflight(
         assert len(res["triggered_evals"]) == 2
         assert res["triggered_evals"][0]["status"] == "preflight_failed"
         assert res["triggered_evals"][1]["status"] == "dispatched"
+        assert len(seen_task_recs) == 1
+        assert seen_task_recs[0].golden_videos_folder_id == "1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY"
 
         # Row 2 was marked FAILED on preflight
         row2_updates = [u for u in tab3_updates if u[0] == 2]

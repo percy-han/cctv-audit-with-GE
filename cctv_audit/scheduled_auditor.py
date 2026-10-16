@@ -137,6 +137,8 @@ class ScheduledEvalTaskRecord(BaseModel):
     row_index: int
     prompt_tab_name: str
     model_version: str
+    golden_videos_folder_url: str = ""
+    golden_videos_folder_id: str = ""
     golden_sheet_url: str
     golden_source_id: str
     results_folder_url: str = ""
@@ -1264,12 +1266,36 @@ class ScheduledAuditEngine:
                     effective_results_folder_id,
                 )
 
-        # 2. If Drive service factory is configured or running in production, verify Results_Folder_URL write permission
+        # 2. If Drive service factory is configured or running in production, verify Golden_Videos_Folder_URL & Results_Folder_URL
         if self._drive_service_factory is not None:
             try:
                 drive_svc = await asyncio.to_thread(
                     self._get_drive_service, rule.supervisor_email
                 )
+            except Exception as exc:
+                return (
+                    False,
+                    f"❌ 评测预检未通过：无法初始化 Google Drive 访问客户端：{str(exc)[:160]}（0 Token 消耗）",
+                    effective_results_folder_id,
+                )
+            if rule.golden_videos_folder_id:
+                try:
+                    await asyncio.to_thread(
+                        lambda: drive_svc.files()
+                        .get(
+                            fileId=rule.golden_videos_folder_id,
+                            fields="id,name,mimeType",
+                            supportsAllDrives=True,
+                        )
+                        .execute()
+                    )
+                except Exception as exc:
+                    return (
+                        False,
+                        f"❌ 评测预检未通过：无法访问黄金集视频目录 ({rule.golden_videos_folder_id})：{str(exc)[:160]}（0 Token 消耗）",
+                        effective_results_folder_id,
+                    )
+            try:
                 folder_meta = await asyncio.to_thread(
                     lambda: drive_svc.files()
                     .get(
@@ -1409,6 +1435,7 @@ class ScheduledAuditEngine:
                     prompt_tab_name=task_rec.prompt_tab_name,
                     model_version=task_rec.model_version,
                     golden_source_id=task_rec.golden_source_id,
+                    golden_videos_folder_id=task_rec.golden_videos_folder_id,
                     results_folder_id=task_rec.results_folder_id,
                     supervisor_email=task_rec.supervisor_email,
                     eval_task_id=task_rec.eval_task_id,
@@ -1594,6 +1621,8 @@ class ScheduledAuditEngine:
                 row_index=rule.row_index,
                 prompt_tab_name=rule.prompt_tab_name,
                 model_version=rule.model_version,
+                golden_videos_folder_url=rule.golden_videos_folder_url,
+                golden_videos_folder_id=rule.golden_videos_folder_id,
                 golden_sheet_url=rule.golden_sheet_url,
                 golden_source_id=rule.golden_source_id,
                 results_folder_url=rule.results_folder_url,

@@ -145,6 +145,18 @@ EVAL_WORKBENCH_HEADERS: tuple[str, ...] = (
     "Eval_Name",
     "Prompt_Tab_Name",
     "Model_Version",
+    "Golden_Videos_Folder_URL",
+    "Human_Labels_Sheet_URL",
+    "Results_Folder_URL",
+    "Supervisor_Email",
+    "Trigger_Action",
+    "Last_Eval_Report",
+)
+LEGACY_EVAL_WORKBENCH_HEADERS: tuple[str, ...] = (
+    "Eval_ID",
+    "Eval_Name",
+    "Prompt_Tab_Name",
+    "Model_Version",
     "Golden_Sheet_URL",
     "Results_Folder_URL",
     "Supervisor_Email",
@@ -160,9 +172,10 @@ VALID_EVAL_TRIGGER_ACTIONS: tuple[str, ...] = (
 )
 DEFAULT_TAB3_SAMPLE_ROW: tuple[str, ...] = (
     "EVAL-EXAMPLE-01",
-    "【示例】黄金标准集基准评测（填入黄金集 Sheet 链接并将 Trigger_Action 改为 START_EVAL 后自动在后台运行）",
+    "【示例】黄金标准集基准评测（分别填写黄金视频目录、人工标注 Sheet 与结果存放目录，将 Trigger_Action 改为 START_EVAL 后自动在后台运行）",
     "Prompt_v2.5_V10全量17条标准版",
     "gemini-3.8-flash",
+    "https://drive.google.com/drive/folders/1ExampleGoldenVideosFolderIdReplaceMe",
     "https://docs.google.com/spreadsheets/d/1ExampleGoldenSheetIdReplaceMe0000/edit",
     "https://drive.google.com/drive/folders/1ExampleEvalResultsFolderIdReplaceMe",
     "auditor@example.com",
@@ -179,6 +192,15 @@ class ScheduledEvalRule(BaseModel):
     eval_name: str = Field(default="", description="Human-readable evaluation name")
     prompt_tab_name: str = Field(description="Target Prompt_* tab in Master Sheet to evaluate")
     model_version: str = Field(description="Target Gemini model version to evaluate")
+    golden_videos_folder_url: str = Field(
+        default="", description="Dedicated Google Drive folder URL/ID containing golden dataset videos"
+    )
+    golden_videos_folder_id: str = Field(
+        default="", description="Normalized Google Drive folder ID containing golden dataset videos"
+    )
+    human_labels_sheet_url: str = Field(
+        default="", description="Human annotation Google Sheet URL/ID or gs://.../*.jsonl"
+    )
     golden_sheet_url: str = Field(description="Golden Set Google Sheet URL/ID or gs://.../*.jsonl")
     golden_source_id: str = Field(description="Normalized Golden Sheet ID or gs://.../*.jsonl URI")
     results_folder_url: str = Field(default="", description="Optional Drive folder URL/ID for report Sheets")
@@ -1212,12 +1234,85 @@ def _extract_eval_golden_source_id(raw_url: str) -> str:
     return ""
 
 
+def _is_legacy_tab3_header(header_row: Sequence[str]) -> bool:
+    """Returns True if `Tab3_黄金集评测工作台` row 1 is the legacy 9-column header (`Golden_Sheet_URL` in E1)."""
+    if not header_row:
+        return False
+    col_e = str(header_row[4]).strip() if len(header_row) > 4 else ""
+    return col_e == "Golden_Sheet_URL"
+
+
+def migrate_tab3_rows_to_3path_schema(rows: List[List[str]]) -> tuple[bool, List[List[str]]]:
+    """Converts legacy 9-column `Tab3_黄金集评测工作台` rows (`Golden_Sheet_URL`, `Results_Folder_URL`, ...)
+    into the 10-column 3-path schema (`Golden_Videos_Folder_URL`, `Human_Labels_Sheet_URL`, `Results_Folder_URL`, ...).
+
+    Returns `(changed, migrated_rows)`.
+    """
+    if not rows:
+        return True, [list(EVAL_WORKBENCH_HEADERS)]
+
+    is_legacy = _is_legacy_tab3_header(rows[0])
+    current_hdr = [str(c).strip() for c in rows[0][:10]]
+    changed = current_hdr != list(EVAL_WORKBENCH_HEADERS)
+    out_rows: List[List[str]] = [list(EVAL_WORKBENCH_HEADERS)]
+
+    for raw_row in rows[1:]:
+        if is_legacy:
+            padded = [str(c).strip() for c in raw_row] + [""] * max(0, 9 - len(raw_row))
+            (
+                eval_id,
+                eval_name,
+                prompt_tab,
+                model_ver,
+                golden_url,
+                results_folder_url,
+                sup_email,
+                trigger_raw,
+                last_report,
+            ) = padded[:9]
+            if not any(padded[:8]):
+                continue
+            changed = True
+            videos_folder_url = (
+                "https://drive.google.com/drive/folders/1ExampleGoldenVideosFolderIdReplaceMe"
+                if eval_id == "EVAL-EXAMPLE-01"
+                else ""
+            )
+            if eval_id == "EVAL-EXAMPLE-01" and "填入黄金集 Sheet 链接" in eval_name:
+                eval_name = DEFAULT_TAB3_SAMPLE_ROW[1]
+            out_rows.append(
+                [
+                    eval_id,
+                    eval_name,
+                    prompt_tab,
+                    model_ver,
+                    videos_folder_url,
+                    golden_url,
+                    results_folder_url,
+                    sup_email,
+                    trigger_raw or "IDLE",
+                    last_report,
+                ]
+            )
+        else:
+            padded = [str(c).strip() for c in raw_row] + [""] * max(0, 10 - len(raw_row))
+            if not any(padded[:9]):
+                continue
+            out_rows.append(padded[:10])
+
+    return changed, out_rows
+
+
 def parse_scheduled_eval_rules_with_diagnostics(
     rows: List[List[str]],
     *,
     available_prompt_tabs: Optional[Sequence[str]] = None,
 ) -> tuple[List[ScheduledEvalRule], List[ScheduledEvalRowError]]:
-    """Parses `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) rows into `(valid_rules, row_errors)`."""
+    """Parses `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) rows into `(valid_rules, row_errors)`.
+
+    Supports both the canonical 10-column 3-path layout (`Golden_Videos_Folder_URL`, `Human_Labels_Sheet_URL`,
+    `Results_Folder_URL`) and the legacy 9-column layout (`Golden_Sheet_URL`, `Results_Folder_URL`).
+    """
     if not rows or len(rows) < 2:
         return [], []
     parsed: List[ScheduledEvalRule] = []
@@ -1228,23 +1323,41 @@ def parse_scheduled_eval_rules_with_diagnostics(
         if available_prompt_tabs
         else set()
     )
+    is_legacy = _is_legacy_tab3_header(rows[0])
 
     for idx, raw_row in enumerate(rows[1:], start=2):
-        padded = [str(c).strip() for c in raw_row] + [""] * max(0, 9 - len(raw_row))
-        (
-            eval_id,
-            eval_name,
-            prompt_tab,
-            model_ver,
-            golden_url,
-            results_folder_url,
-            sup_email,
-            trigger_raw,
-            last_report,
-        ) = padded[:9]
-
-        if not any(padded[:8]):
-            continue
+        if is_legacy:
+            padded = [str(c).strip() for c in raw_row] + [""] * max(0, 9 - len(raw_row))
+            (
+                eval_id,
+                eval_name,
+                prompt_tab,
+                model_ver,
+                human_labels_url,
+                results_folder_url,
+                sup_email,
+                trigger_raw,
+                last_report,
+            ) = padded[:9]
+            golden_videos_url = ""
+            if not any(padded[:8]):
+                continue
+        else:
+            padded = [str(c).strip() for c in raw_row] + [""] * max(0, 10 - len(raw_row))
+            (
+                eval_id,
+                eval_name,
+                prompt_tab,
+                model_ver,
+                golden_videos_url,
+                human_labels_url,
+                results_folder_url,
+                sup_email,
+                trigger_raw,
+                last_report,
+            ) = padded[:10]
+            if not any(padded[:9]):
+                continue
 
         norm_trigger = (trigger_raw or "IDLE").upper()
 
@@ -1271,9 +1384,10 @@ def parse_scheduled_eval_rules_with_diagnostics(
             continue
         seen_eval_ids[eval_id] = idx
 
+        trigger_col_label = "H列" if is_legacy else "I列"
         if norm_trigger not in VALID_EVAL_TRIGGER_ACTIONS:
             _fail(
-                f"❌ 评测配置错误：Trigger_Action（H列）'{trigger_raw}' 无效，请从下拉框选择 IDLE 或 START_EVAL"
+                f"❌ 评测配置错误：Trigger_Action（{trigger_col_label}）'{trigger_raw}' 无效，请从下拉框选择 IDLE 或 START_EVAL"
             )
             continue
 
@@ -1296,35 +1410,58 @@ def parse_scheduled_eval_rules_with_diagnostics(
             )
             continue
 
-        if "/folders/" in golden_url or "/file/d/" in golden_url:
+        labels_col_name = "Golden_Sheet_URL（E列）" if is_legacy else "Human_Labels_Sheet_URL（F列）"
+        if "/folders/" in human_labels_url or "/file/d/" in human_labels_url:
             _fail(
-                "❌ 评测配置错误：Golden_Sheet_URL（E列）请填写黄金集标注 Google Sheet 链接（/spreadsheets/d/...）或 gs://.../*.jsonl 路径，不能填写文件夹或单个视频链接"
+                f"❌ 评测配置错误：{labels_col_name}请填写人工标注 Google Sheet 链接（/spreadsheets/d/...）或 gs://.../*.jsonl 路径，不能填写文件夹或单个视频链接"
             )
             continue
 
-        golden_source_id = _extract_eval_golden_source_id(golden_url)
+        golden_source_id = _extract_eval_golden_source_id(human_labels_url)
         if not golden_source_id:
             _fail(
-                f"❌ 评测配置错误：Golden_Sheet_URL（E列）'{golden_url}' 不是合法的 Google Sheet 链接或 gs:// 路径"
+                f"❌ 评测配置错误：{labels_col_name}'{human_labels_url}' 不是合法的 Google Sheet 链接或 gs:// 路径"
             )
             continue
 
+        golden_videos_folder_id = ""
+        if not is_legacy:
+            if golden_videos_url:
+                if "/file/d/" in golden_videos_url or "/spreadsheets/d/" in golden_videos_url:
+                    _fail(
+                        "❌ 评测配置错误：Golden_Videos_Folder_URL（E列）请填写黄金集 CCTV 视频所在的 Google Drive 文件夹链接（/folders/...），不能填写表格或单个视频链接"
+                    )
+                    continue
+                golden_videos_folder_id = _extract_scheduled_folder_id(golden_videos_url)
+                if not golden_videos_folder_id or golden_videos_folder_id.startswith("gs://"):
+                    _fail(
+                        f"❌ 评测配置错误：Golden_Videos_Folder_URL（E列）'{golden_videos_url}' 不是合法的 Google Drive 文件夹链接"
+                    )
+                    continue
+            elif not golden_source_id.startswith("gs://"):
+                _fail(
+                    "❌ 评测配置错误：Golden_Videos_Folder_URL（E列）不能为空，请填写独立的黄金集 CCTV 视频 Google Drive 文件夹链接（/folders/...）"
+                )
+                continue
+
+        results_col_name = "Results_Folder_URL（F列）" if is_legacy else "Results_Folder_URL（G列）"
         results_folder_id = ""
         if results_folder_url:
             if "/file/d/" in results_folder_url or "/spreadsheets/d/" in results_folder_url:
                 _fail(
-                    "❌ 评测配置错误：Results_Folder_URL（F列）请填写用于存放测评报告的 Google Drive 文件夹链接（/folders/...），或留空使用默认评测目录"
+                    f"❌ 评测配置错误：{results_col_name}请填写用于存放测评报告的 Google Drive 文件夹链接（/folders/...），或留空使用默认评测目录"
                 )
                 continue
             results_folder_id = _extract_scheduled_folder_id(results_folder_url)
             if not results_folder_id or results_folder_id.startswith("gs://"):
                 _fail(
-                    f"❌ 评测配置错误：Results_Folder_URL（F列）'{results_folder_url}' 不是合法的 Google Drive 文件夹链接"
+                    f"❌ 评测配置错误：{results_col_name}'{results_folder_url}' 不是合法的 Google Drive 文件夹链接"
                 )
                 continue
 
+        sup_col_name = "Supervisor_Email（G列）" if is_legacy else "Supervisor_Email（H列）"
         if sup_email and not _EMAIL_RE.match(sup_email):
-            _fail(f"❌ 评测配置错误：Supervisor_Email（G列）'{sup_email}' 不是合法的邮箱地址")
+            _fail(f"❌ 评测配置错误：{sup_col_name}'{sup_email}' 不是合法的邮箱地址")
             continue
 
         parsed.append(
@@ -1334,7 +1471,10 @@ def parse_scheduled_eval_rules_with_diagnostics(
                 eval_name=eval_name or eval_id,
                 prompt_tab_name=prompt_tab,
                 model_version=model_ver,
-                golden_sheet_url=golden_url,
+                golden_videos_folder_url=golden_videos_url,
+                golden_videos_folder_id=golden_videos_folder_id,
+                human_labels_sheet_url=human_labels_url,
+                golden_sheet_url=human_labels_url,
                 golden_source_id=golden_source_id,
                 results_folder_url=results_folder_url,
                 results_folder_id=results_folder_id,
@@ -1732,13 +1872,27 @@ def build_master_sheet_validation_requests(
             ]
         )
 
-    # 4. Tab 3 (`Tab3_黄金集评测工作台`):
+    # 4. Tab 3 (`Tab3_黄金集评测工作台`, 10 columns A:J):
     #    - Col C (index 2): Prompt_Tab_Name dropdown (all Prompt_* tabs)
     #    - Col D (index 3): Model_Version dropdown
-    #    - Col G (index 6): Supervisor_Email TEXT_IS_EMAIL
-    #    - Col H (index 7): Trigger_Action dropdown (IDLE, START_EVAL, RUNNING, DONE, FAILED)
+    #    - Col E..G (index 4..7): Clear any stale validation on URL columns
+    #    - Col H (index 7): Supervisor_Email TEXT_IS_EMAIL
+    #    - Col I (index 8): Trigger_Action dropdown (IDLE, START_EVAL, RUNNING, DONE, FAILED)
     tab3_id = title_to_id.get(TAB3_EVAL_TITLE)
     if tab3_id is not None:
+        requests.append(
+            {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": tab3_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": 200,
+                        "startColumnIndex": 4,
+                        "endColumnIndex": 7,
+                    },
+                }
+            }
+        )
         if effective_prompt_versions:
             requests.append(
                 {
@@ -1783,8 +1937,8 @@ def build_master_sheet_validation_requests(
                             "sheetId": tab3_id,
                             "startRowIndex": 1,
                             "endRowIndex": 200,
-                            "startColumnIndex": 6,
-                            "endColumnIndex": 7,
+                            "startColumnIndex": 7,
+                            "endColumnIndex": 8,
                         },
                         "rule": {
                             "condition": {"type": "TEXT_IS_EMAIL"},
@@ -1800,8 +1954,8 @@ def build_master_sheet_validation_requests(
                             "sheetId": tab3_id,
                             "startRowIndex": 1,
                             "endRowIndex": 200,
-                            "startColumnIndex": 7,
-                            "endColumnIndex": 8,
+                            "startColumnIndex": 8,
+                            "endColumnIndex": 9,
                         },
                         "rule": _one_of_list_rule(
                             VALID_EVAL_TRIGGER_ACTIONS,
@@ -1987,7 +2141,7 @@ class GoogleSheetsConfigClient:
                 rows, available_prompt_tabs=prompt_tabs
             )
         try:
-            a1 = f"{self.TAB3_EVAL_TITLE}!A1:I200"
+            a1 = f"{self.TAB3_EVAL_TITLE}!A1:J200"
             _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{a1}", None)
             rows = await self._read_range(sheet_id, a1)
             return parse_scheduled_eval_rules_with_diagnostics(rows)
@@ -2013,7 +2167,7 @@ class GoogleSheetsConfigClient:
         trigger_action: Optional[str] = None,
         last_eval_report: Optional[str] = None,
     ) -> None:
-        """Writes `trigger_action` (Col H) and/or `last_eval_report` (Col I) back to `Tab3_黄金集评测工作台` at `row_index`."""
+        """Writes `trigger_action` (Col I) and/or `last_eval_report` (Col J) back to `Tab3_黄金集评测工作台` at `row_index`."""
         if not sheet_id or sheet_id.startswith("gs://") or row_index < 2:
             return
         if trigger_action is None and last_eval_report is None:
@@ -2024,28 +2178,28 @@ class GoogleSheetsConfigClient:
             if trigger_action is not None and last_eval_report is not None:
                 svc.update(
                     spreadsheetId=sheet_id,
-                    range=f"'{self.TAB3_EVAL_TITLE}'!H{row_index}:I{row_index}",
+                    range=f"'{self.TAB3_EVAL_TITLE}'!I{row_index}:J{row_index}",
                     valueInputOption="USER_ENTERED",
                     body={"values": [[trigger_action, last_eval_report]]},
                 ).execute(num_retries=3)
             elif trigger_action is not None:
                 svc.update(
                     spreadsheetId=sheet_id,
-                    range=f"'{self.TAB3_EVAL_TITLE}'!H{row_index}",
+                    range=f"'{self.TAB3_EVAL_TITLE}'!I{row_index}",
                     valueInputOption="USER_ENTERED",
                     body={"values": [[trigger_action]]},
                 ).execute(num_retries=3)
             else:
                 svc.update(
                     spreadsheetId=sheet_id,
-                    range=f"'{self.TAB3_EVAL_TITLE}'!I{row_index}",
+                    range=f"'{self.TAB3_EVAL_TITLE}'!J{row_index}",
                     valueInputOption="USER_ENTERED",
                     body={"values": [[last_eval_report]]},
                 ).execute(num_retries=3)
 
         try:
             await asyncio.to_thread(_update)
-            _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB3_EVAL_TITLE}!A1:I200", None)
+            _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB3_EVAL_TITLE}!A1:J200", None)
         except Exception as exc:
             logger.warning(
                 "Failed to update Tab3 row %d on %s: %s",
@@ -2058,8 +2212,8 @@ class GoogleSheetsConfigClient:
         self, sheet_id: str, *, force: bool = False
     ) -> bool:
         """Idempotently migrates legacy `Tab2_定时巡检配置表` rows to the UTC dropdown schema,
-        auto-creates `Tab3_黄金集评测工作台` if missing, and applies native Google Sheets
-        `setDataValidation` rules across Tab 0, Prompt_*, Tab 2, and Tab 3.
+        migrates or auto-creates `Tab3_黄金集评测工作台` (10-column 3-path schema), and applies native
+        Google Sheets `setDataValidation` rules across Tab 0, Prompt_*, Tab 2, and Tab 3.
         """
         if not sheet_id or sheet_id.startswith("gs://"):
             return False
@@ -2123,6 +2277,27 @@ class GoogleSheetsConfigClient:
                     },
                 ).execute(num_retries=3)
                 meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute(num_retries=3)
+            else:
+                resp_t3 = (
+                    svc.spreadsheets()
+                    .values()
+                    .get(spreadsheetId=sheet_id, range=f"'{self.TAB3_EVAL_TITLE}'!A1:J200")
+                    .execute(num_retries=3)
+                )
+                raw_t3 = [[str(c) for c in r] for r in resp_t3.get("values", [])]
+                changed_t3, migrated_t3 = migrate_tab3_rows_to_3path_schema(raw_t3)
+                if changed_t3 and migrated_t3:
+                    svc.spreadsheets().values().clear(
+                        spreadsheetId=sheet_id,
+                        range=f"'{self.TAB3_EVAL_TITLE}'!A1:J200",
+                        body={},
+                    ).execute(num_retries=3)
+                    svc.spreadsheets().values().update(
+                        spreadsheetId=sheet_id,
+                        range=f"'{self.TAB3_EVAL_TITLE}'!A1",
+                        valueInputOption="RAW",
+                        body={"values": migrated_t3},
+                    ).execute(num_retries=3)
 
             reqs = build_master_sheet_validation_requests(meta)
             if reqs:
@@ -2137,7 +2312,7 @@ class GoogleSheetsConfigClient:
             if ok:
                 _VALID_SHEET_CACHE.add(sheet_id)
                 _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB2_SCHEDULED_TITLE}!A1:I200", None)
-                _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB3_EVAL_TITLE}!A1:I200", None)
+                _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB3_EVAL_TITLE}!A1:J200", None)
             return ok
         except Exception as exc:
             logger.warning(
