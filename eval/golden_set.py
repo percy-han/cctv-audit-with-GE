@@ -254,12 +254,134 @@ def manifest_path_for(golden_path: str) -> str:
     return golden_path + MANIFEST_SUFFIX
 
 
-def _read_bytes(uri: str) -> bytes | None:
-    if uri.startswith("gs://"):
+class _RestGcsBlob:
+    """Lightweight GCS blob adapter using ``google.auth`` + ``urllib.request`` for slim containers."""
+
+    def __init__(self, bucket_name: str, blob_name: str, token_fn: Any) -> None:
+        self.bucket_name = bucket_name
+        self.name = blob_name
+        self._token_fn = token_fn
+
+    def _meta_url(self) -> str:
+        import urllib.parse
+
+        b = urllib.parse.quote(self.bucket_name, safe="")
+        o = urllib.parse.quote(self.name, safe="")
+        return f"https://storage.googleapis.com/storage/v1/b/{b}/o/{o}"
+
+    def _upload_url(self) -> str:
+        import urllib.parse
+
+        b = urllib.parse.quote(self.bucket_name, safe="")
+        o = urllib.parse.quote(self.name, safe="")
+        return f"https://storage.googleapis.com/upload/storage/v1/b/{b}/o?uploadType=media&name={o}"
+
+    def exists(self) -> bool:
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(
+            self._meta_url(),
+            method="GET",
+            headers={"Authorization": f"Bearer {self._token_fn()}"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30.0) as resp:
+                return 200 <= resp.status < 300
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return False
+            raise
+
+    def download_as_bytes(self) -> bytes:
+        import urllib.request
+
+        req = urllib.request.Request(
+            f"{self._meta_url()}?alt=media",
+            method="GET",
+            headers={"Authorization": f"Bearer {self._token_fn()}"},
+        )
+        with urllib.request.urlopen(req, timeout=120.0) as resp:
+            return resp.read()
+
+    def download_as_text(self, encoding: str = "utf-8") -> str:
+        return self.download_as_bytes().decode(encoding)
+
+    def download_to_filename(self, filename: str) -> None:
+        Path(filename).write_bytes(self.download_as_bytes())
+
+    def upload_from_string(
+        self,
+        data: str | bytes,
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        import urllib.request
+
+        raw = data.encode("utf-8") if isinstance(data, str) else data
+        req = urllib.request.Request(
+            self._upload_url(),
+            data=raw,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self._token_fn()}",
+                "Content-Type": content_type,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=180.0) as resp:
+            resp.read()
+
+    def upload_from_filename(
+        self,
+        filename: str,
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        self.upload_from_string(Path(filename).read_bytes(), content_type=content_type)
+
+
+class _RestGcsBucket:
+    def __init__(self, bucket_name: str, token_fn: Any) -> None:
+        self.name = bucket_name
+        self._token_fn = token_fn
+
+    def blob(self, blob_name: str) -> _RestGcsBlob:
+        return _RestGcsBlob(self.name, blob_name, self._token_fn)
+
+
+class _RestGcsClient:
+    def __init__(self, project: str | None = None) -> None:
+        self.project = project
+        self._creds: Any = None
+
+    def _get_token(self) -> str:
+        import google.auth
+        import google.auth.transport.requests
+
+        if self._creds is None:
+            self._creds, _ = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/devstorage.read_write"]
+            )
+        if not getattr(self._creds, "valid", False):
+            self._creds.refresh(google.auth.transport.requests.Request())
+        return str(self._creds.token)
+
+    def bucket(self, bucket_name: str) -> _RestGcsBucket:
+        return _RestGcsBucket(bucket_name.replace("gs://", "").strip("/"), self._get_token)
+
+
+def get_gcs_storage_client(project: str | None = None) -> Any:
+    """Returns ``google.cloud.storage.Client(project=project)`` when installed, else ``_RestGcsClient``."""
+    try:
         from google.cloud import storage
 
+        return storage.Client(project=project) if project else storage.Client()
+    except ImportError:
+        return _RestGcsClient(project=project)
+
+
+def _read_bytes(uri: str) -> bytes | None:
+    if uri.startswith("gs://"):
         bucket, _, name = uri[len("gs://"):].partition("/")
-        blob = storage.Client().bucket(bucket).blob(name)
+        blob = get_gcs_storage_client().bucket(bucket).blob(name)
         return blob.download_as_bytes() if blob.exists() else None
     p = Path(uri)
     return p.read_bytes() if p.exists() else None

@@ -742,6 +742,95 @@ class WorkspaceReporter:
             logger.warning("Failed to send Google Chat batch summary notification: %s", exc)
             return False
 
+    async def send_eval_start_notification(
+        self,
+        *,
+        eval_id: str,
+        eval_name: str,
+        run_id: str,
+        prompt_tab_name: str,
+        model_version: str,
+        supervisor_email: str,
+        golden_videos_folder_url: str = "",
+        human_labels_sheet_url: str = "",
+        results_folder_url: str = "",
+    ) -> bool:
+        """Sends a Google Chat start card when a `Tab3_黄金集评测工作台` row transitions `START_EVAL -> RUNNING`."""
+        webhook_url = config.google_chat_webhook_url
+        if not webhook_url:
+            logger.info(
+                "No GOOGLE_CHAT_WEBHOOK_URL configured; skipping eval start notification for %s.",
+                eval_id,
+            )
+            return False
+
+        widgets: list[dict[str, Any]] = [
+            {
+                "decoratedText": {
+                    "topLabel": "评测任务 / 负责人",
+                    "text": f"<b>{eval_name} ({eval_id})</b> · <b>{supervisor_email or '督导'}</b>",
+                }
+            },
+            {
+                "decoratedText": {
+                    "topLabel": "待测 SOP 分表 / 模型版本",
+                    "text": f"SOP: <code>{prompt_tab_name}</code> · 模型: <code>{model_version}</code>",
+                }
+            },
+        ]
+        buttons: list[dict[str, Any]] = []
+        if golden_videos_folder_url and golden_videos_folder_url.startswith("https://"):
+            buttons.append(
+                {
+                    "text": "🎬 打开黄金集视频目录",
+                    "onClick": {"openLink": {"url": golden_videos_folder_url}},
+                }
+            )
+        if human_labels_sheet_url and human_labels_sheet_url.startswith("https://"):
+            buttons.append(
+                {
+                    "text": "📋 打开人工标注表",
+                    "onClick": {"openLink": {"url": human_labels_sheet_url}},
+                }
+            )
+        if results_folder_url and results_folder_url.startswith("https://"):
+            buttons.append(
+                {
+                    "text": "📂 打开测评报告归档目录",
+                    "onClick": {"openLink": {"url": results_folder_url}},
+                }
+            )
+        if buttons:
+            widgets.append({"buttonList": {"buttons": buttons}})
+
+        payload = {
+            "cardsV2": [
+                {
+                    "cardId": f"scheduled-eval-start-{run_id or eval_id}",
+                    "card": {
+                        "header": {
+                            "title": f"🚀 黄金集评测已启动：{eval_name} ({eval_id})",
+                            "subtitle": f"Run ID: {run_id} · SOP: {prompt_tab_name} · 模型: {model_version}",
+                        },
+                        "sections": [
+                            {
+                                "header": "⏳ 正在后台 24h Cloud Run Job 执行黄金集评测（完成后将自动推送召回率与 5-Tab 报告链接）",
+                                "widgets": widgets,
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(webhook_url, json=payload)
+                resp.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.warning("Failed to send Google Chat eval start notification: %s", exc)
+            return False
+
     async def send_eval_completion_notification(
         self,
         *,

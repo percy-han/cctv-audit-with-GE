@@ -333,14 +333,59 @@ def near_misses(part: dict[str, Any], files: list[str], findings: list[Finding],
     return out
 
 
+def _genai_judge_fallback(
+    cases: list[dict[str, str]],
+    project: str,
+    judge_model: str,
+    credentials: Any = None,
+) -> tuple[list[tuple[float | None, str]], Any]:
+    """Direct ``google.genai`` judge fallback when ``agentplatform`` is not installed in the worker image."""
+    from google import genai
+    from google.genai import types as gt
+
+    client = genai.Client(
+        vertexai=True,
+        project=project,
+        location="global",
+        credentials=credentials,
+    )
+    out: list[tuple[float | None, str]] = []
+    for c in cases:
+        prompt_text = JUDGE_TEMPLATE.format(
+            reference=c["reference"],
+            response=c["response"],
+        )
+        try:
+            resp = client.models.generate_content(
+                model=judge_model,
+                contents=prompt_text,
+                config=gt.GenerateContentConfig(
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                ),
+            )
+            raw_text = (resp.text or "").strip()
+            parsed = json.loads(raw_text)
+            raw_score = parsed.get("score")
+            score_val = float(raw_score) if raw_score is not None else None
+            expl = str(parsed.get("explanation") or "")
+            out.append((score_val, expl))
+        except Exception as exc:  # noqa: BLE001
+            out.append((None, f"JUDGE_ERROR: {type(exc).__name__}: {exc}"))
+    return out, None
+
+
 def sdk_judge(cases: list[dict[str, str]], project: str, judge_model: str,
               credentials: Any = None) -> tuple[list[tuple[float | None, str]], Any]:
-    """Grade cases with the Vertex AI GenAI Eval SDK.
+    """Grade cases with the Vertex AI GenAI Eval SDK (or ``google.genai`` fallback in slim containers).
 
     Returns ([(score, explanation), ...], raw EvaluationResult)."""
-    import agentplatform
-    from agentplatform import types
-    from google.genai import types as gt
+    try:
+        import agentplatform
+        from agentplatform import types
+        from google.genai import types as gt
+    except ImportError:
+        return _genai_judge_fallback(cases, project, judge_model, credentials)
 
     client = agentplatform.Client(project=project, location="global", credentials=credentials)
     metric = types.LLMMetric(
@@ -626,7 +671,12 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
 
 def load_json(path: str) -> dict[str, Any]:
     if path.startswith("gs://"):
-        return json.loads(subprocess.check_output(["gcloud", "storage", "cat", path], text=True))
+        from eval.golden_set import _read_bytes
+
+        raw = _read_bytes(path)
+        if raw is None:
+            raise FileNotFoundError(f"GCS JSON not found: {path}")
+        return json.loads(raw.decode("utf-8"))
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
 

@@ -35,7 +35,20 @@ from pathlib import Path
 
 # Everything the Dockerfile COPYs. tests/test_ci_pipeline.py fails if the Dockerfile gains a COPY
 # that is not listed here (the hash would then miss real image changes).
-IMAGE_INPUTS = ("Dockerfile", "requirements.txt", "cctv_audit")
+IMAGE_INPUTS = (
+    "Dockerfile",
+    "requirements.txt",
+    "cctv_audit",
+    "eval/__init__.py",
+    "eval/build_dataset.py",
+    "eval/eval_records.py",
+    "eval/golden_set.py",
+    "eval/golden_sheet.py",
+    "eval/run_gcp_round.py",
+    "eval/score_run.py",
+    "eval/sheet_report.py",
+    "eval/tune_loop.py",
+)
 
 # Never present in the Cloud Build tree (.gcloudignore includes .gitignore); skipped locally so a
 # developer's stray caches do not change the tag.

@@ -22,6 +22,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 COPY cctv_audit/ ./cctv_audit/
+COPY eval/__init__.py eval/build_dataset.py eval/eval_records.py eval/golden_set.py eval/golden_sheet.py eval/run_gcp_round.py eval/score_run.py eval/sheet_report.py eval/tune_loop.py ./eval/
 
 EXPOSE 8080
 

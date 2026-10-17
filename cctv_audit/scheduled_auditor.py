@@ -1645,6 +1645,21 @@ class ScheduledAuditEngine:
                         f"SOP={rule.prompt_tab_name} | 模型={rule.model_version}"
                     ),
                 )
+            send_eval_start_fn = getattr(
+                self.service.reporter, "send_eval_start_notification", None
+            )
+            if callable(send_eval_start_fn):
+                await send_eval_start_fn(
+                    eval_id=rule.eval_id,
+                    eval_name=rule.eval_name,
+                    run_id=eval_task_id,
+                    prompt_tab_name=rule.prompt_tab_name,
+                    model_version=rule.model_version,
+                    supervisor_email=rule.supervisor_email,
+                    golden_videos_folder_url=rule.golden_videos_folder_url,
+                    human_labels_sheet_url=rule.human_labels_sheet_url or rule.golden_sheet_url,
+                    results_folder_url=rule.results_folder_url,
+                )
             await self.dispatch_eval_job(task_rec)
             triggered_evals.append(
                 {

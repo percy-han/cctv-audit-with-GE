@@ -2175,6 +2175,7 @@ def test_tab3_eval_workbench_tick_lifecycle_and_preflight(
         svc = AuditService(job_store=job_store)
 
         tab3_updates: List[Tuple[int, str, str]] = []
+        eval_start_notifications: List[Dict[str, Any]] = []
         eval_chat_notifications: List[Dict[str, Any]] = []
 
         async def _update_eval_row(
@@ -2194,12 +2195,17 @@ def test_tab3_eval_workbench_tick_lifecycle_and_preflight(
         ) -> Any:
             return await svc.prompt_manager.load_active_config()
 
+        async def _send_eval_start(**kwargs: Any) -> bool:
+            eval_start_notifications.append(kwargs)
+            return True
+
         async def _send_eval_chat(**kwargs: Any) -> bool:
             eval_chat_notifications.append(kwargs)
             return True
 
         monkeypatch.setattr(svc.prompt_manager, "update_scheduled_eval_row", _update_eval_row)
         monkeypatch.setattr(svc.prompt_manager, "load_config_for_tab", _load_config_for_tab)
+        monkeypatch.setattr(svc.reporter, "send_eval_start_notification", _send_eval_start)
         monkeypatch.setattr(svc.reporter, "send_eval_completion_notification", _send_eval_chat)
         monkeypatch.setattr(svc.prompt_manager, "load_scheduled_rules", lambda: asyncio.sleep(0, result=[]))
 
@@ -2293,6 +2299,8 @@ def test_tab3_eval_workbench_tick_lifecycle_and_preflight(
         assert [u[1] for u in row3_updates] == ["RUNNING", "DONE"]
         assert "https://docs.google.com/spreadsheets/d/eval_sheet_999/edit" in row3_updates[-1][2]
         assert "42.1%" in row3_updates[-1][2]
+        assert len(eval_start_notifications) == 1
+        assert eval_start_notifications[0]["eval_id"] == "EVAL-OK-01"
         assert len(eval_chat_notifications) == 1
         assert eval_chat_notifications[0]["status"] == "DONE"
 

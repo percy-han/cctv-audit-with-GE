@@ -81,6 +81,7 @@ from eval.golden_set import (  # noqa: E402
     GoldenSet,
     GoldenSetError,
     derive_folder_specs,
+    get_gcs_storage_client,
     load_golden,
     materialize_golden,
 )
@@ -186,9 +187,7 @@ def sync_eval_history_from_gcs(
     if not bucket_name and not fallback_bucket:
         return 0
     try:
-        from google.cloud import storage
-
-        st_client = storage.Client(project=project_id)
+        st_client = get_gcs_storage_client(project=project_id)
         remote_lines: list[str] = []
         for candidate_bkt in dict.fromkeys([b for b in (bucket_name, fallback_bucket) if b]):
             blob = st_client.bucket(candidate_bkt).blob("eval/rounds/eval_history.jsonl")
@@ -308,8 +307,6 @@ async def resolve_or_ingest_video_slice(
     ingestor: VideoIngestor | None,
 ) -> VideoSliceSegment:
     """Reuses existing audio-stripped MP4 slice in GCS if present, else ingests from Drive."""
-    from google.cloud import storage
-
     file_id = str(video_dict["file_id"])
     filename = str(video_dict["filename"])
     # Clip metadata comes from the golden manifest; clips derived from golden items have none until
@@ -317,7 +314,7 @@ async def resolve_or_ingest_video_slice(
     meta: dict[str, Any] = {k: video_dict[k] for k in ("duration_sec", "width", "height") if k in video_dict}
 
     def _check_gcs() -> tuple[str | None, dict[str, Any]]:
-        storage_client = storage.Client(project=cfg.gcp_project)
+        storage_client = get_gcs_storage_client(project=cfg.gcp_project)
         candidate_buckets = list(dict.fromkeys([b for b in (bucket_name, cfg.staging_bucket) if b]))
         candidate_blob_paths = [
             f"eval/media/{file_id}/seg_0.mp4",
@@ -390,7 +387,7 @@ async def resolve_or_ingest_video_slice(
         seg = segments[0]
 
         def _upload_slice() -> str:
-            storage_client = storage.Client(project=cfg.gcp_project)
+            storage_client = get_gcs_storage_client(project=cfg.gcp_project)
             bucket = storage_client.bucket(bucket_name)
             blob_path = f"eval/media/{file_id}/seg_0.mp4"
             bucket.blob(blob_path).upload_from_filename(str(seg.local_path), content_type="video/mp4")
@@ -438,8 +435,7 @@ class ClipCheckpointStore:
         if self.local_dir is not None:
             path = self.local_dir / name
             return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
-        from google.cloud import storage
-        blob = storage.Client(project=self.project).bucket(self.bucket_name).blob(name)
+        blob = get_gcs_storage_client(project=self.project).bucket(self.bucket_name).blob(name)
         return json.loads(blob.download_as_text()) if blob.exists() else None
 
     def put(self, baseline_jid: str, file_id: str, doc: dict[str, Any]) -> None:
@@ -450,8 +446,7 @@ class ClipCheckpointStore:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(data, encoding="utf-8")
             return
-        from google.cloud import storage
-        storage.Client(project=self.project).bucket(self.bucket_name).blob(name).upload_from_string(
+        get_gcs_storage_client(project=self.project).bucket(self.bucket_name).blob(name).upload_from_string(
             data, content_type="application/json")
 
 
@@ -582,9 +577,7 @@ async def evaluate_single_folder(
 
 
 def upload_directory_to_gcs(bucket_name: str, project_id: str, local_dir: Path, gcs_prefix: str) -> None:
-    from google.cloud import storage
-
-    client = storage.Client(project=project_id)
+    client = get_gcs_storage_client(project=project_id)
     bucket = client.bucket(bucket_name)
     for path in sorted(local_dir.rglob("*")):
         if path.is_file():
@@ -832,9 +825,7 @@ async def run_round_async(args: argparse.Namespace) -> int:
             res_dir,
             f"eval/results/{run_id}",
         )
-        from google.cloud import storage
-
-        st_client = storage.Client(project=cfg.gcp_project)
+        st_client = get_gcs_storage_client(project=cfg.gcp_project)
         for target_bkt in dict.fromkeys([b for b in (persistent_bucket, cfg.staging_bucket) if b]):
             bucket = st_client.bucket(target_bkt)
             for fname in ("ledger.json", "ledger.md", "eval_history.jsonl", "eval_round_averages.jsonl"):
@@ -1034,9 +1025,7 @@ async def run_sheet_triggered_eval(
             res_dir,
             f"eval/results/{run_id}",
         )
-        from google.cloud import storage
-
-        st_client = storage.Client(project=cfg.gcp_project)
+        st_client = get_gcs_storage_client(project=cfg.gcp_project)
         for target_bkt in dict.fromkeys([b for b in (persistent_bucket, cfg.staging_bucket) if b]):
             bucket = st_client.bucket(target_bkt)
             for fname in ("eval_history.jsonl", "eval_round_averages.jsonl"):
