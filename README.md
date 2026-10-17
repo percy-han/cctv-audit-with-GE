@@ -222,50 +222,93 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 - **方式 A（使用 Google Drive 文件夹）**：把要稽核的 Drive 文件夹共享给机器人账号，权限选**编辑者**（报告和证据片段要写回这个文件夹）。
 - **方式 B（使用 GCS 目录，无需 Google Workspace）**：直接把门店视频上传到 Terraform 自动创建的版本控制工作桶（例如 `gs://<项目ID>-<p>-workspace/stores/<门店名>/`），Worker 服务账号已自动拥有该桶读写权限，无需额外执行任何授权命令。
 
-### （可选）开启 Google Chat 完成通知（自动 `@发起人`）
+### （可选）开启 Google Chat 双阶段通知（启动通知 + 完成通知，自动 `@督导本人`）
 
-默认关闭（`enable_google_chat_notification = false`）。如果希望后台稽核完成后自动往指定的 Google Chat 聊天室发卡片并 `@` 发起任务的督导：
+默认关闭（`enable_google_chat_notification = false`）。开启后，无论是 **GE 对话发起的单店稽核**、**`Tab2` 每日定时巡检批次**，还是 **`Tab3` 黄金集评测任务**，系统都会在**任务启动瞬间（`🚀 已启动`）**和**任务完成瞬间（`✅ 已完成`）**自动向指定的 Google Chat 聊天室推送卡片通知，并精准 `@` 对应督导本人：
 
 1. 在目标 Google Chat 聊天室里创建一个 Incoming Webhook（聊天室名称旁下拉菜单 → 应用和集成 → Webhook）。
-2. 在 `<env>.tfvars`（或本地不提交 Git 的 `*.auto.tfvars`）中设置：
-   ```hcl
-   enable_google_chat_notification = true
-   google_chat_webhook_url         = "https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=..."
-   ```
+2. **推荐做法（仓库零密钥，通过 GCS 托管 Webhook 地址）**：
+   - 将 Webhook URL 写入受版本控制的专属工作区存储桶（该桶仅项目内服务账号可读，避免把含 `key` 和 `token` 的明文 URL 提交到 Git）：
+     ```bash
+     printf '%s' 'https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=...' \
+       | gcloud storage cp - gs://<项目ID>-<p>-workspace/config/google_chat_webhook.txt
+     ```
+   - 在 `<env>.tfvars` 中填入该 `gs://` 路径引用（系统发通知时会在内存中实时读取并解析为真实 HTTPS 地址）：
+     ```hcl
+     enable_google_chat_notification = true
+     google_chat_webhook_url         = "gs://<项目ID>-<p>-workspace/config/google_chat_webhook.txt"
+     ```
+   - *（备选）* 若无需脱敏，也可直接在 `google_chat_webhook_url` 中填写 `https://chat.googleapis.com/v1/spaces/...` 原始地址。
 3. 重新执行第 5 步部署命令即可生效；随时把 `enable_google_chat_notification` 改回 `false` 即可关闭通知。
 
 ### （可选）推送即部署
 
 在 Cloud Build 控制台把本 GitHub 仓库连接为第二代仓库，然后在 `bootstrap/<env>.tfvars` 设置 `trigger_repository = "projects/<项目ID>/locations/<region>/connections/<连接名>/repositories/<仓库名>"`，重新 apply bootstrap。之后推送到 `main` 分支会自动部署。如果代码不在仓库根目录，设置 `iac_dir`。
 
-## 6. 使用
+## 6. 日常使用与定时自动巡检操作手册
+
+### 6.1 方式一：在 Gemini Enterprise 对话框手动发起单店稽核
 
 1. 打开 GE 应用（控制台 → Gemini Enterprise → 应用 `<p>-ge`），给用户分配许可。
-2. 在 GE 里选择稽核 Agent，发送 **Google Drive 文件夹链接** 或 **GCS 目录地址（`gs://...` 或控制台链接）**。
-3. Agent 先做预检（返回专属**预检单号**、权限检查、视频数量/时长、切片计划、生效规则和模型版本），回复"确认开始"后任务在后台运行，可以关掉页面（支持同时开启多个会话窗口并发稽核不同目录，单号与进度按会话严格隔离）。
-4. 随时问"好了么"查进度；完成后回复报告链接（Drive 模式返回 Google Sheet 链接，GCS 模式返回 `📊 AI稽核报告与Token账单.xlsx` 链接及目录链接；若开启了 Google Chat 通知，也会在聊天室自动 `@` 发起人并附上报告链接）。
+2. 在 GE 里选择稽核 Agent，发送 **Google Drive 门店视频文件夹链接** 或 **GCS 目录地址（`gs://...` 或控制台链接）**。
+3. Agent 先做秒级预检（返回专属**预检单号**、权限检查、分辨率检查、视频数量/时长、切片计划、生效规则和模型版本），回复「确认开始」后任务在后台运行，可以随时关掉页面（支持同时开启多个会话窗口并发稽核不同目录，单号与进度按会话严格隔离）。
+4. 任务启动瞬间与完成瞬间均会在 Google Chat 群推送通知卡片（含 **`🖥️ 打开 HTML 督导复核工作台`** 与 **`📊 打开原 Google Sheet 账单`** 双按钮）；也可随时在 GE 对话框问「好了么」查进度。
 
-### 每日定时自动巡检（`Tab2_定时巡检配置表`）、HTML 督导复核工作台与同表智能追加
+---
 
-除了在 GE 聊天框手动发送链接外，系统还支持在 SOP 总控表（Google Sheet 或 GCS `master_sheet.xlsx`）的 **`Tab2_定时巡检配置表`** 页签中配置**每日定时自动巡检**，并在稽核完成后推送 **HTML 督导复核工作台**：
-1. **配置方式（全下拉框防呆校验，`strict: True`）**：打开 SOP 总控表的 `Tab2_定时巡检配置表` 页签（已预置两行默认 `PAUSED` 的示例配置），按需填写 9 列：
-   - `Rule_ID`（唯一规则编号，如 `SCHED-VN-01`）
-   - `Rule_Name`（任务名称）
-   - `Root_Folder_URL`（大区/总部根文件夹的 Google Drive 链接/ID 或 `gs://` 存储桶前缀，支持多层嵌套的 `大区/城市/门店/` 子目录，**无需每天手动新建或修改链接**；内置自定义公式拦截误填的 `/file/d/` 单视频链接）
-   - `Trigger_Hour_UTC`（每日触发小时，统一采用 **UTC 时区**，下拉框 `00`–`23`）与 `Trigger_Minute_UTC`（每日触发分钟，下拉框 `00`、`15`、`30`、`45` 四档，对齐 Cloud Scheduler 每 15 分钟轮询刻度；支持当天修改触发时间后自动重排当日计划）
-   - `Lookback_Days`（向前追溯扫描窗口天数，下拉框 `0.5`、`1`、`2`、`3`、`4`、`5`、`6`、`7` 天，最低 `0.5` 天即 12 小时，最长 `7` 天即 168 小时；仅拉取窗口内新上传且未稽核过的视频）
-   - `Supervisor_Email`（负责该区域的督导邮箱，原生邮箱格式校验，用于按督导身份隔离 DWD 权限及在 Google Chat 中精准 `@` 本人）
-   - `Enabled`：下拉框选择 `ENABLED` 即刻生效，选择 `PAUSED` 随时暂停。
-   - `Last_Run_Status`：系统每次巡检后自动回写最近一次执行时间与批次摘要；若某行通过复制粘贴绕过前端校验填入了非法值，后端巡检时会自动在该列回写具体报错原因（如 `❌ 配置错误：...`）。
-2. **智能防重与子目录越权豁免（Carve-Out）**：
-   - 系统通过 3 态文件级去重账本确保**同一视频文件绝不重复消耗 Token**（若某视频因瞬时故障失败，次日可自动重试）。
-   - 若某旗舰店子目录单独配置了一条不同时间的 `ENABLED` 规则，父级大区规则在扫描时会自动豁免该子目录（就近祖先归属），互不抢占。
-3. **24 小时超长任务支持与同表智能追加（方式一）**：
-   - 后台重度视频切片与推理通过 **`Cloud Run Jobs`（`<p>-worker-job`，最长 24 小时超时）** 按门店并发执行，门店内部视频严格串行以保持跨片段 5–10 分钟消毒浸泡计时接力。
-   - 同一门店多次运行（或次日增量上传新视频）时，系统自动识别该门店目录下已有的 `📊 AI稽核报告与Token账单`，将新视频的违规记录与 Token 账单**追加到同一张表末尾**并累加顶部总计，一个门店文件夹始终保持干净的 **1 张表**。
-4. **HTML 督导复核工作台（`/portal`，默认 30 天签名有效期）**：
-   - 任务或定时批次完成后，Google Chat 通知卡片会附带 **`🖥️ 打开 HTML 督导复核工作台`**（HMAC-SHA256 签名链接，默认有效期 **30 天**，可通过 `PORTAL_URL_TTL_SEC` 环境变量配置）与 **`📊 打开原 Google Sheet 账单`** 按钮。
-   - 督导在 HTML 工作台中可直接在线播放 20 秒违规证据切片、对照 SOP 原文、一键切换同批次多门店，并将人工复核结论（`✅ 确认违规` / `❌ 排除误报`）与复核备注实时写回原 Google Sheet 的第 J/K 列。
+### 6.2 方式二：每日定时自动巡检操作手册（总控表 `Tab2_定时巡检配置表`）
+
+除了在 GE 聊天框手动发链接外，客户可在 SOP 总控表（`CHAGEE_SOP_与模型版本总控台` Google Sheet 或 GCS `master_sheet.xlsx`）的 **`Tab2_定时巡检配置表`** 页签中配置**每日无人值守定时巡检**。门店或区域人员白天只需往 Google Drive 大目录（或其下的门店/日期子文件夹）上传监控视频，**无需每天手动修改表格里的文件夹链接**，系统每天到点自动扫描新增视频、按门店并发执行稽核，并推送汇总报告。
+
+#### 第一步：规划并授权监控视频根目录（`Root_Folder_URL`）
+1. 在 Google Drive（或 GCS 存储桶）建立大区/总部监控根目录，子目录可按多层嵌套自由组织，系统会自动以**最末级放视频的子文件夹（Leaf Folder）**为单位拆分为独立的门店稽核任务：
+   ```text
+   📁 越南大区每日监控根目录 (Root_Folder_URL，共享给机器人账号「编辑者」权限)
+   ├── 📁 1-Cantavil D2/
+   │   ├── 🎬 Footage1.mov
+   │   ├── 🎬 Footage2.mov
+   │   ├── 📊 AI稽核报告与Token账单          <-- 系统自动在该门店目录内生成/同表智能追加
+   │   └── 📁 违规证据切片_Evidence/         <-- 系统自动生成 20s 违规证据 MP4（巡检自动跳过此目录）
+   └── 📁 2-Bau Cat/
+       ├── 🎬 Footage1.mov
+       └── ...
+   ```
+2. **权限要求**：将顶层根目录共享给你的 **GWS 机器人账号（`workspace_impersonate_user`）**，权限设为 **「编辑者 (Editor)」**（子文件夹会自动继承该权限，无需逐个设置）。
+
+#### 第二步：在总控表 `Tab2_定时巡检配置表` 填写定时规则（`A–I 列` 逐列说明）
+
+打开总控表的 **`Tab2_定时巡检配置表`** 页签，从第 2 行起每行配置一条定时规则（系统已自动绑定原生下拉框与防呆校验 `strict: True`）：
+
+| 列号 | 列名 | 填写要求与校验规则 | 填写示例 |
+| :--- | :--- | :--- | :--- |
+| **A 列** | `Rule_ID` | **必填**，全局唯一的规则编号（不可与其他行重复） | `SCHED-VN-01` |
+| **B 列** | `Rule_Name` | 任务或区域名称（显示在 Google Chat 通知卡片上） | `越南大区门店每日晚间巡检` |
+| **C 列** | `Root_Folder_URL` | **必填**，第 1 步准备的 Google Drive 根文件夹链接/ID 或 `gs://桶/前缀`（内置公式自动拦截误填的 `/file/d/` 单视频链接） | `https://drive.google.com/drive/folders/1abc...` |
+| **D 列** | `Trigger_Hour_UTC` | **必填（下拉框）**，每日触发小时（**统一采用 UTC 时区**，`00`–`23` 共 24 档）：<br/>• 越南时间 (`UTC+7`) `22:00` ➔ 选 **`15`**<br/>• 新加坡/北京时间 (`UTC+8`) `22:00` ➔ 选 **`14`** | `15` |
+| **E 列** | `Trigger_Minute_UTC` | **必填（下拉框）**，每日触发分钟，仅 **`00`、`15`、`30`、`45`** 四档（对齐 Cloud Scheduler 每 15 分钟轮询刻度；支持当天修改时间后立即按新时间重排） | `00` |
+| **F 列** | `Lookback_Days` | **必填（下拉框）**，向前追溯扫描天数，可选 **`0.5`、`1`、`2`、`3`、`4`、`5`、`6`、`7`** 天（`0.5` 天 = 12 小时，`1` 天 = 24 小时）：仅稽核在该时间窗内新上传且尚未稽核过的视频 | `1` |
+| **G 列** | `Supervisor_Email` | **必填**，负责该区域的督导企业邮箱（系统在启动和完成通知中自动高亮 `@` 该邮箱） | `auditor@chagee.com` |
+| **H 列** | `Enabled` | **必填（下拉框）**：选 **`ENABLED`** 立即生效；选 **`PAUSED`** 暂停该规则 | `ENABLED` |
+| **I 列** | `Last_Run_Status` | **系统自动回写列（请勿手填）**：每次触发或完成后自动回写状态摘要；若某行通过复制粘贴填入了非法值，系统也会在此列自动回写 `❌ 配置错误：具体原因` | `✅ 批次 batch_... 已完成：共 2 家门店...` |
+
+#### 第三步：定时巡检的五大生产级自动化机制
+1. **双阶段 Google Chat 批次通知（绝不刷屏）**：
+   - 到点触发时：推送 **1 张 `⏰ 定时批量视频 AI 稽核已启动` 卡片**（列出本批次包含的所有门店子目录、视频数及预检状态）；
+   - 所有门店跑完后：由最后一个完成的门店容器通过 GCS 乐观锁触发推送 **唯一 1 张 `✅ 定时巡检批次已完成` 汇总卡片**（汇总各门店违规数与成本，顶部提供一键打开多门店联合复核工作台按钮）。
+2. **单视频级 `<720P` 低清自动过滤（`REJECTED_LOW_RES`，不阻断同目录高清视频）**：
+   - 若某个门店文件夹内混入了低于 `720P`（短边 `< 720` 像素）的低清视频，系统会将该低清视频单独标记为 `REJECTED_LOW_RES` 自动跳过（并在通知卡片与 `Last_Run_Status` 中明确提示跳过了哪几支低清视频及分辨率），同文件夹内其余 `>= 720P` 的高清视频照常完成稽核，且次日不会对已跳过的低清视频死循环重复报错。
+3. **文件级防重账本与母子目录就近归属（Carve-Out）**：
+   - 每支视频在 GCS 拥有独立三态原子账本（`DISPATCHED` / `COMPLETED` / `FAILED`），已成功稽核的视频绝不重复扣费；
+   - 若母目录设在 `21:00` 巡检，而其中某个重点门店子目录单独配了一行 `22:00` 的 `ENABLED` 规则，系统在 `21:00` 扫描时会自动将该子目录豁免保留给 `22:00` 的专属规则执行。
+4. **24 小时超长任务支持与同表智能追加（一个门店永远只有 1 张报告表）**：
+   - 后台采用 **`Cloud Run Jobs`（`<p>-worker-job`，单任务最长支持 24 小时）**，多门店之间 100% 并发执行，单门店内部视频按文件名自然顺序严格串行（确保跨视频的 5–10 分钟消毒浸泡计时接力不断裂）；
+   - 次日同一门店目录上传新视频后，系统自动将新视频的违规记录与 Token 账单智能追加到该门店原有的 `📊 AI稽核报告与Token账单` 末尾（若重跑同名视频则原地替换该视频旧行），不会每天碎片化生成新表。
+5. **督导 HTML 卡片式复核工作台（`/portal`）**：
+   - 点击 Google Chat 完成卡片上的 **`🌐 打开本批次多门店 HTML 复核工作台`**（或单店 **`🖥️ 打开 HTML 督导复核工作台`**，HMAC-SHA256 签名链接默认 **30 天**有效），即可在浏览器中：
+     - 顶部一键切换同批次不同门店；
+     - 边看 20 秒违规证据视频、边对照右侧违反的 SOP 原文；
+     - 点击 **`✅ 确认违规`** 或 **`❌ 排除误报`** 并填写整改备注，结果实时同步写回原 Google Sheet 的第 J、K 列；
+     - 一键切换到 **「📋 门店 48h 整改通知单」** 页签复制标准整改通知下发店长。
 
 ### Zero-GWS / GCS 兜底模式详解（没有 Google Workspace 时）
 
@@ -318,53 +361,92 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 
 `eval/tests` 中依赖私有评测数据的用例在没有数据时会自动跳过。
 
-## 8. 模型与 SOP 评测体系及 Google Sheet 测评报告（eval/）
+## 8. 黄金数据集准备与自助评测操作手册（总控表 `Tab3_黄金集评测工作台` & `eval/`）
 
-用人工稽核结果做"黄金基准集（Golden Dataset）"，评估不同模型版本（`model_version`）和不同 SOP 提示词版本（`sop_version`）的召回率、误报密度、定位误差与推理成本。**评分只做一次**（`eval/score_run.py`，本地），所有数字以该次的 `score.json` 和 `eval/rounds/eval_history.jsonl` 为唯一来源；每次评测在 Google Drive 里新建一份带时间戳的 Google Sheet 报告。评测指标**不再**推送到 Cloud Monitoring 或 Vertex AI Experiments（Round 67 起）。
+当需要**测试新发布的 Gemini 模型版本**，或者**业务团队修改了某份 SOP 提示词分表后验证召回率是否提升、有无误报劣化**时，可在总控表的 **`Tab3_黄金集评测工作台`** 页签中**零代码一键发起黄金集回归评测**。
 
-- **核心方式一（推荐，零代码自助工作台）：总控表 `Tab3_黄金集评测工作台`**：
-  - 在总控表 `CHAGEE_SOP_与模型版本总控台` 的 **`Tab3_黄金集评测工作台`** 中，只需配置一行即可零代码触发黄金集评测：
-    1. `Eval_ID` / `Eval_Name`：评测编号与名称；
-    2. `Prompt_Tab_Name`：下拉选择待评测的 SOP 分表（如 `Prompt_v2.5_V10全量17条标准版`）；
-    3. `Model_Version`：下拉选择待评测的模型版本（如 `gemini-3.8-flash`、`gemini-2.5-flash`、`gemini-2.5-pro`）；
-    4. `Golden_Videos_Folder_URL`：黄金集视频所在的独立 Google Drive 根目录（如 `evaluation/Golden_Videos`，与日常门店视频物理隔离防误删）；
-    5. `Human_Labels_Sheet_URL`：人工标注结果 Google Sheet 链接（含 `Manual Audit Result` 标注页，无需在表内维护额外配置页，系统自动与 `Golden_Videos_Folder_URL` 下的子目录及视频匹配）；
-    6. `Results_Folder_URL`：评测报告 Google Sheet 的归档文件夹链接；
-    7. `Supervisor_Email`：负责督导邮箱；
-    8. `Trigger_Action`：下拉选择 `START_EVAL` 即可在下一个 15 分钟调度刻度（`POST /internal/jobs/scheduled-tick`）自动触发 24h `Cloud Run Job` 执行。
-  - **状态流转与双阶段 Google Chat 通知**：
-    - 触发瞬间：`Trigger_Action` 自动变为 `RUNNING`，并通过 Google Chat Webhook（支持直连 URL 或 `gs://<桶>/config/google_chat_webhook.txt` 密钥文件引用）推送 **`🚀 黄金集评测已启动`** 卡片；
-    - 评测完成：`Trigger_Action` 自动变为 `DONE`（异常则为 `FAILED`），`Last_Eval_Report` 自动回写召回率摘要与新生成的 5-Tab 测评报告 Sheet 链接，并推送 **`✅ 黄金集评测已完成`** Google Chat 卡片。
-  - **日常定时自动巡检（`Tab2_定时巡检配置表`）**：
-    - 在总控表 `Tab2_定时巡检配置表` 配置 `Root_Folder_URL`、`Trigger_Hour_UTC`（`00`–`23`）、`Trigger_Minute_UTC`（`00`/`15`/`30`/`45`）、`Lookback_Days`（`0.5` 或 `1`–`7` 天）及 `Enabled = ENABLED`，系统每天按 UTC 设定时间自动扫描回溯窗口内的新增门店视频、按门店拆分为 24h `Cloud Run Job` 并发执行（对 `<720P` 低清视频按单视频粒度标记 `REJECTED_LOW_RES` 自动跳过，不阻断同目录高清视频），并在批次启动与完成时推送汇总 Google Chat 卡片（含 30 天有效期的多门店 HTML 督导复核工作台链接）。
+### 8.1 零代码自助评测操作手册（推荐：总控表 `Tab3_黄金集评测工作台`）
 
-- **核心方式二：CLI 与 Cloud Build 脚本（`eval/`）**：
-  - **黄金集不写死在代码里**：题目、题数、SOP 大类、门店、视频、文件夹、稳定基线题全部来自黄金集文件 `<name>.jsonl` 及可选的 `<name>.manifest.json`（格式与字段说明见 `eval/data/README.md`）。换黄金集只改配置：Terraform 变量 **`eval_golden_uri`**（`<env>.tfvars`，gs:// 或源码内路径；为空则用 `eval/data/golden_v1.jsonl`）→ Cloud Build `_GOLDEN_URI=$(terraform output -raw eval_golden_uri)`。黄金集是客户私有数据，不要放进公开仓库，也不要放进 staging bucket（30 天自动删除）。
-  - **推荐：直接读客户自己的标注表**。客户继续维护他们的「Manual Audit Result」标注页（程序不改动它），表格放在测评结果文件夹里，并加一页「测评配置」（黄金集名称、标注页范围、视频文件夹、开发集分组、复合题、逐题设置；格式见 `eval/data/README.md`）。每次评测实时读取这两页，并列出配置的 Drive 文件夹里的全部视频（包括没有标注的）。Terraform 变量 **`eval_golden_sheet_id`** → Cloud Build `_GOLDEN_SHEET_ID`；它和 `eval_golden_uri` 只能设一个。Workspace 身份需要对表格和视频文件夹至少有查看权限。自检：`python -m eval.golden_sheet check --sheet-id <ID>`；生成配置页：`python -m eval.golden_sheet init-config ...`。每次评测把实际使用的黄金集快照写到结果目录的 `golden_snapshot/`，Sheet 报告多一页「本次黄金集快照」。
-  - 每次评测都记录 **`golden_version`**（文件名@评分标尺哈希，方案 `ruler-v2`：只在题目、标注文本/时间、划分、视频清单、逐题设置、稳定基线题变化时改变；备注、视频时长/分辨率、缓存任务、来源时间戳不影响）和题数；不同版本黄金集的召回率不可比，按轮次取均值和 Sheet 历史对比都只在同一版本内进行。
-  - `eval/build_dataset.py`：把客户人工稽核表冻结成黄金集 JSONL；数据集划分、复合题、来源表 ID、期望行数等都放在 `--config <name>.build.json`（`eval/data/golden_v1.build.json` 可原样重建 golden_v1）。
-  - `eval/run_gcp_round.py`：用一个调优轮次（`eval/rounds/rNN/`）的规则跑全部验证视频、自动打分、追加写入 `eval/rounds/eval_history.jsonl` / `eval_round_averages.jsonl`，生成本次的 Google Sheet 报告（`--skip-sheet-report` 可跳过），并把结果同步到 GCS；支持通过 `eval/cloudbuild_round.yaml` 在 Cloud Build 上运行。
+整个评测准备与触发只需 4 步，**无需修改任何代码，也无需在人工标注表内部添加任何隐藏配置页**：
 
-  - `eval/score_run.py`：确定性时间预筛 + Gemini Pro 3 次投票取中位数裁判打分。针对不同 SOP 性质采用**分化的时间容差与定位误差策略**：
-    - **瞬时定点动作（`POINT` 模式：`1.5 Handwashing and Sanitation Standard` 洗手台瞬时动作）**：采用 **`±20 秒`（前后共 40 秒跨度）** 严格时间窗口，并计算 AI 报出时刻与人工标注时刻的 **时间戳定位误差（`timestamp_drift_sec`）**。
-    - **持续过程 / 静置计时 / 跨阶段因果链（`WINDOW` 模式：制冰机 5–10 分钟静置、泡茶 30 秒内搅拌、摸头发后未洗手复工等）**：保留 **`±60 秒` 窗口（及起止时间段包含匹配）**，且**豁免单点时间戳误差统计**。
-  - `eval/eval_records.py`：每次运行的结构化记录（召回率、命中率、告警密度、时间漂移、翻转率、成本、耗时、Token）、历史台账与按轮次（同 round + 模型 + SOP + 视频模式）取均值；以及 Agent Platform Evaluation 逐题明细发布。
-  - `eval/sheet_report.py`：每次评测新建一份 Google Sheet 报告；也可为已有的运行补生成：`python -m eval.sheet_report --history eval/rounds/eval_history.jsonl --score eval/results/<run_id>/score.json --folder-id <文件夹ID>`（加 `--dry-run` 只打印内容、不调用 API）。
-  - `eval/tune_loop.py`：自动调优循环的控制器和守则（单层修改、防过拟合词表、早停守卫：`findings_per_clip <= 8.0` 且 `regressed_stable_items == 0`）。
-  - `eval/run_visibility_probe.py`：针对单条漏检，裁出前后 60–75 秒的短片，检查模型能否"看见"该动作。
+#### 第一步：准备物理隔离的黄金集视频目录（`Golden_Videos_Folder_URL`）
+1. **为什么要物理隔离**：黄金集视频是长期对比的基准标尺，**必须单独存放在专属的 Google Drive 文件夹中**（例如 `evaluation/Golden_Videos`），与日常门店上传/清理的监控文件夹彻底分开，防止日常清理误删基准视频。
+2. **目录结构要求**：在 `Golden_Videos` 根目录下，支持按 `稽核重点 / 门店名`（两层）或直接按 `门店名`（一层）组织子文件夹，将对应的基准视频（`.mov` / `.mp4`）放入门店子文件夹中：
+   ```text
+   📁 Golden_Videos (Golden_Videos_Folder_URL，共享给机器人账号「查看者」或「编辑者」)
+   ├── 📁 1. Handwashing Monitoring/
+   │   ├── 📁 1-Cantavil D2/
+   │   │   ├── 🎬 Footage2-...mov
+   │   │   ├── 🎬 Footage3-...mov
+   │   │   └── 🎬 Footage4-...mov
+   │   └── 📁 2-Bau Cat/
+   │       ├── 🎬 Footage1-...mov
+   │       └── ...
+   └── 📁 2. Ice Maker Weekly Cleaning/
+       ├── 📁 1-Cantavil D2/
+       └── 📁 2-Bau Cat/
+   ```
+   > **注**：评测过程只读拉取这些视频（首次运行后会将去音轨切片缓存在持久化桶 `gs://<项目ID>-<p>-workspace/eval/media/` 中加速后续评测），**绝不会**往黄金集视频目录里写入日常稽核报告或证据切片，保持基准目录 100% 纯净。
 
-- **Google Sheet 测评报告（每次评测一份新表）**：
-  - 存放位置由 Terraform 变量 **`eval_results_folder_id`**（`<env>.tfvars`）指定，每个环境各填各的 Drive 文件夹；Workspace 身份（`terraform output -raw workspace_identity`）需要对该文件夹有「编辑者」权限。变量为空时评测照常完成，只打印「Sheet report: SKIPPED」。
-  - Cloud Build 运行时传入：`--substitutions=...,_EVAL_RESULTS_FOLDER_ID=$(terraform output -raw eval_results_folder_id),_EVAL_REPORT_TIME_ZONE=$(terraform output -raw eval_report_time_zone)`（时区沿用 `scheduler_time_zone`）。
-  - 表名 `CHAGEE AI稽核测评_<round_id>_<run_id>_<YYYYMMDD-HHMMSS>`；链接打印在 `LOOP STATUS` 下一行，并写入 `eval/results/<run_id>/sheet_report.json`（随结果上传 GCS）。生成失败不会让评测失败，但会以 ERROR 记录并打印「Sheet report: FAILED — 原因」。
-  - 5 个页签（面向客户生产环境统一采用全量黄金集指标，不展示内部算法调优用的留出集/开发集切分）：
-    1. `本次测评概览`：核心召回率（`总体召回率`、`仅 CONFIRMED 召回率`）、告警密度与护栏、瞬时动作时间漂移、成本/耗时与 Token 拆分；
-    2. `本次逐题结果`：每个标注点的得分（1 / 0.5 / 0）、匹配告警与裁判理由；
-    3. `历史轮次对比`：自动从 GCS 同步历史台账（`gs://<staging_bucket>/eval/rounds/eval_history.jsonl`），展示同一套黄金集（相同 `golden_version`）下各历史轮次均值 + 3 张原生图表（核心召回率与命中率、按 SOP 大类、按门店 × 稽核重点）；
-    4. `历史单跑明细`：每次历史运行明细 + 告警密度 / 时间漂移 / 成本图；
-    5. `本次黄金集快照`：本次评测使用的黄金集标注题目快照。所有图表的横轴都是轮次或运行标签，不是时间。
+#### 第二步：准备人工标注结果表（`Human_Labels_Sheet_URL`）
+1. 准备一张原生 Google Sheet（左上角无 `.XLSX` 标记），共享给 **GWS 机器人账号（`查看者` 权限即可）**。
+2. 表格的第一个页签（或名为 `Manual Audit Result` / `Sheet1` 的页签）直接存放人工稽核标注行，系统原生兼容以下 **5 列格式** 或 **6 列格式**（第 1 行为表头，从第 2 行起每行一条人工发现的违规）：
 
-每个脚本都支持 `--help`。
+   | 列 | 字段名 | 填写说明 | 示例 |
+   | :--- | :--- | :--- | :--- |
+   | **A 列** | `Audit Focus` | 稽核重点 / 场景名称（与视频子目录对应，同列下行留空会自动向上继承） | `Handwashing Monitoring` |
+   | **B 列** | `Outlet` | 门店编号（可选，留空自动继承上一行） | `1` |
+   | **C 列** | `Outlet Name` | **必填**，门店名称（需与第一步的子文件夹门店名匹配，如 `Cantavil D2` 匹配 `1-Cantavil D2`；同门店下行留空会自动继承） | `Cantavil D2` |
+   | **D 列** | `Audit Clause` | 违反的 SOP 条款大类名称 | `1.5 Handwashing and Sanitation Standard` |
+   | **E 列** | `Audit Result` / `Findings` | **必填**，人工标注原文，格式为 `Footage <序号>: <画面OSD时间 HHMMSS> <违规描述>`（若同一视频内有多个时间点，会自动拆分为多个得分点） | `Footage 2: 080518 Partner not dry hand with hand towel after handwashing` |
+   | **F 列** | `对应的视频文件名称` *(可选第 6 列)* | 可显式填写视频完整文件名；**若采用 5 列格式不填此列**，系统会自动根据 C 列门店名 + E 列开头的 `Footage <序号>` 在第一步的文件夹中精准匹配唯一视频文件 | *(可不填，自动按 `Footage 2` 匹配)* |
+
+#### 第三步：准备测评报告归档目录（`Results_Folder_URL`）
+1. 在 Google Drive 中新建一个用于存放历次测评报告的文件夹（如 `evaluation`），将其共享给 **GWS 机器人账号**，权限必须设为 **「编辑者 (Editor)」**（因为每次评测都会在该文件夹下新建一份带时间戳的 5-Tab Google Sheet 测评报告）。
+
+#### 第四步：在总控表 `Tab3_黄金集评测工作台` 配置并一键触发（`A–J 列` 逐列说明）
+
+打开总控表 `CHAGEE_SOP_与模型版本总控台` 的 **`Tab3_黄金集评测工作台`** 页签，按列填写并触发：
+
+| 列号 | 列名 | 填写要求与作用 | 填写示例 |
+| :--- | :--- | :--- | :--- |
+| **A 列** | `Eval_ID` | **必填**，唯一的评测任务编号 | `EVAL-01` |
+| **B 列** | `Eval_Name` | 评测说明名称（显示在 Google Chat 卡片与报告中） | `V2.5标准版提示词回归评测` |
+| **C 列** | `Prompt_Tab_Name` | **必填（下拉框）**，选择本次要评测的 SOP 规则页签（直接读取该页签规则评测，**无需改动 `Tab0` 线上生产开关，零生产影响**） | `Prompt_v2.5_V10全量17条标准版` |
+| **D 列** | `Model_Version` | **必填（下拉框）**，选择本次要评测的模型版本 | `gemini-3.8-flash` |
+| **E 列** | `Golden_Videos_Folder_URL` | **必填**，第一步准备的黄金集视频根目录 Google Drive 链接 | `https://drive.google.com/drive/folders/1tAX...` |
+| **F 列** | `Human_Labels_Sheet_URL` | **必填**，第二步准备的人工标注结果 Google Sheet 链接 | `https://docs.google.com/spreadsheets/d/1VBu...` |
+| **G 列** | `Results_Folder_URL` | **必填**，第三步准备的测评报告归档文件夹 Google Drive 链接 | `https://drive.google.com/drive/folders/1ky2...` |
+| **H 列** | `Supervisor_Email` | **必填**，接收评测启动/完成 Google Chat `@` 通知的邮箱 | `admin@chagee.com` |
+| **I 列** | `Trigger_Action` | **必填（触发控制下拉框）**：<br/>• 平时保持 `IDLE` 或 `DONE`；<br/>• **需要跑评测时，下拉切换为 `START_EVAL`**；<br/>• 系统在下一个 15 分钟调度刻度检测到 `START_EVAL` 后，自动将其改为 `RUNNING`，跑完自动改为 `DONE`（异常则为 `FAILED`） | `START_EVAL` |
+| **J 列** | `Last_Eval_Report` | **系统自动回写列（请勿手填）**：自动回写启动状态、预检报错原因，或评测完成后的召回率摘要与 **5-Tab 测评报告 Sheet 直链** | `✅ 评测完成 (...)：总体召回率 52.6% (仅 CONFIRMED 52.6%) \| 成本 $4.60 \| 报告: https://...` |
+
+#### 第五步：解读生成的 5-Tab 测评报告 Sheet 与跨轮次历史对比
+
+每次评测完成后，系统会在 `Results_Folder_URL` 文件夹中生成一份全新的 Google Sheet（文件名形如 `CHAGEE AI稽核测评_<round_id>_<run_id>_<YYYYMMDD-HHMMSS>`），并在 Google Chat 推送 **`✅ 黄金集评测已完成`** 卡片。报告包含 **5 个页签**（面向生产环境统一采用全量黄金集指标，无内部开发集/留出集切分）：
+1. **`Tab 1: 本次测评概览`**：汇总本次评测的 **`总体召回率`**、**`仅 CONFIRMED 召回率`**、平均每视频告警数（护栏 `≤ 8.0`）、告警命中率、瞬时动作时间定位误差（秒）、单视频平均成本与总成本（USD），以及 Input / Thinking / Output Token 拆分。
+2. **`Tab 2: 本次逐题结果`**：逐题列出每道人工标注题目的得分（`1.0` 命中 / `0.5` 半对 / `0.0` 漏检）、匹配的 AI 告警详情及 Gemini Pro 裁判模型的给分理由，方便业务人员针对 `0` 分漏检题精准优化 SOP 描述。
+3. **`Tab 3: 历史轮次对比`（含 3 张原生对比图表）**：
+   - **为什么每次新建一张 Sheet，里面却有完整的历史对比？** 系统会将每次评测的汇总指标持久化追加到 GCS 账本 `gs://<项目ID>-<p>-workspace/eval/rounds/eval_history.jsonl`。每次生成新 Sheet 时，容器会自动拉取该账本，把**同一套黄金集（相同 `golden_version`）**下的所有历史轮次与当前轮次汇总在同一张表内，并自动绘制 3 张原生柱状/折线图：
+     - **图 1**：各轮次核心召回率（`总体召回率`、`仅 CONFIRMED 召回率`）与 `告警命中率` 演进趋势；
+     - **图 2**：各轮次按 **SOP 大类**（洗手规范 / 制冰机清洁 / 吧台卫生等）召回率对比；
+     - **图 3**：各轮次按 **门店 × 稽核重点** 召回率对比。
+4. **`Tab 4: 历史单跑明细`（含原生图表）**：列出历次单跑记录（当前运行以 **`★`** 标记）及 **图 4：每次运行的告警密度 / 时间漂移 / 单视频成本对比图**（带 `8.0 条/视频` 防误报爆炸守卫线）。
+5. **`Tab 5: 本次黄金集快照`**：完整备份本次评测读取的人工标注题目、时间判定模式（`POINT ±20s` vs `WINDOW ±60s`）与对应视频文件名，确保每次评测 100% 可审计、可追溯。
+
+---
+
+### 8.2 进阶方式二：开发者 CLI 与 Cloud Build 脚本（`eval/`）
+
+除总控表 `Tab3` 零代码触发外，工程团队也可通过命令行或 Cloud Build 直接调用 `eval/` 工具链：
+- **评分标尺与双时间窗机制（`eval/score_run.py`）**：确定性时间预筛 + Gemini Pro 3 次投票取中位数裁判打分：
+  - **瞬时定点动作（`POINT` 模式：`1.5 Handwashing and Sanitation Standard` 洗手台瞬时动作）**：采用 **`±20 秒`（前后共 40 秒跨度）** 严格时间窗口，并计算 AI 报出时刻与人工标注时刻的 **时间戳定位误差（`timestamp_drift_sec`）**。
+  - **持续过程 / 静置计时 / 跨阶段因果链（`WINDOW` 模式：制冰机 5–10 分钟静置、泡茶 30 秒内搅拌、摸头发后未洗手复工等）**：保留 **`±60 秒` 窗口（及起止时间段包含匹配）**，且**豁免单点时间戳误差统计**。
+- **黄金集版本防串台（`golden_version`，`ruler-v2`）**：每次评测自动计算 `golden_version` 哈希；当且仅当两轮评测使用完全相同的黄金集题目与视频集合时，`Tab 3: 历史轮次对比` 才会将它们纳入同一张图表对比。
+- **常用模块 CLI（均支持 `--help`）**：
+  - `eval/run_gcp_round.py`：在本地或通过 `eval/cloudbuild_round.yaml` 运行评测轮次；
+  - `eval/sheet_report.py`：为已有运行补生成或原地刷新 5-Tab Google Sheet 报告（`python -m eval.sheet_report --history eval/rounds/eval_history.jsonl --score eval/results/<run_id>/score.json --folder-id <文件夹ID>`）；
+  - `eval/run_visibility_probe.py`：针对单条漏检裁出前后 60–75 秒短片，快速诊断模型视觉可见性。
 
 ## 9. 删除环境
 
