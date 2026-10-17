@@ -889,8 +889,7 @@ class WorkspaceReporter:
         summary = summary or {}
         sheet_url = str(summary.get("spreadsheet_url") or "")
         overall_recall = float(summary.get("overall_recall", 0.0)) * 100.0
-        holdout_recall = float(summary.get("holdout_recall", 0.0)) * 100.0
-        dev_recall = float(summary.get("dev_recall", 0.0)) * 100.0
+        confirmed_only_recall = float(summary.get("confirmed_only_recall", summary.get("overall_recall", 0.0))) * 100.0
         findings_per_clip = float(summary.get("findings_per_clip", 0.0))
         hit_rate = float(summary.get("hit_rate", 0.0)) * 100.0
         total_cost_usd = float(summary.get("total_cost_usd", 0.0))
@@ -912,8 +911,7 @@ class WorkspaceReporter:
                         "topLabel": "核心召回率指标 (Recall)",
                         "text": (
                             f"总体召回率: <b>{overall_recall:.1f}%</b> | "
-                            f"留出集 (Holdout): <b>{holdout_recall:.1f}%</b> | "
-                            f"开发集 (Dev): <b>{dev_recall:.1f}%</b>"
+                            f"仅 CONFIRMED 召回率: <b>{confirmed_only_recall:.1f}%</b>"
                         ),
                     }
                 }

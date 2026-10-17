@@ -207,16 +207,14 @@ def build_overview_table(
         "文件名@评分标尺哈希（ruler-v2）；不同版本的召回率不可比")
     origin = golden.get("golden_origin") or {}
     add("黄金集来源", origin.get("sheet_url") or golden.get("golden_source") or "",
-        (f"{origin.get('sheet_name', '')}（{origin.get('label_range', '')} + 「{origin.get('config_tab', '')}」页，"
-         f"读取时表格修改时间 {origin.get('sheet_modified_time', '')}）") if origin else "黄金集文件")
+        (f"{origin.get('sheet_name', '')}（{origin.get('label_range', '')}"
+         + (f" + 「{origin.get('config_tab', '')}」页" if origin.get("config_tab") else "")
+         + f"，读取时表格修改时间 {origin.get('sheet_modified_time', '')}）") if origin else "黄金集文件")
     add("黄金集题数 / 标注点数", f"{n_items} 题 / {run_record.get('golden_part_count') or golden.get('part_count') or ''} 个标注点",
-        "；".join(f"{k} {v} 题" for k, v in splits.items()))
+        "")
     add("裁判模型 (judge_model)", run_record.get("judge_model") or score_doc.get("judge_model"),
         f"每题裁判 {score_doc.get('judge_passes', '')} 次取中位" if score_doc.get("judge_passes") else "")
-    rec = score_doc.get("recall") or {}
     add(f"总体召回率 ({n_items} 题)", m.get("overall_recall"), "权威数字：eval/score_run.py 本地评分", PERCENT)
-    add(f"留出集召回率 (holdout, {(rec.get('holdout') or {}).get('rows', 0)} 题)", m.get("holdout_recall"), "", PERCENT)
-    add(f"开发集召回率 (dev, {(rec.get('dev') or {}).get('rows', 0)} 题)", m.get("dev_recall"), "", PERCENT)
     add("仅 CONFIRMED 召回率", m.get("confirmed_only_recall"), "只算 CONFIRMED 处置的告警", PERCENT)
     add("平均告警数 / 视频 (findings_per_clip)", m.get("findings_per_clip"),
         f"守卫线 ≤ {MAX_MEAN_ALERT_DENSITY:.1f}", DECIMAL_2)
@@ -270,7 +268,7 @@ def build_items_table(
 
     header = [
         "part_id", "题号 (item_id)", "门店", "稽核重点", "SOP 大类", "时间判定模式", "时间窗 (±秒)",
-        "数据集划分", "人工标注原文", "标注时间点 (OSD)", "本题得分", "整题得分", "判定",
+        "人工标注原文", "标注时间点 (OSD)", "本题得分", "整题得分", "判定",
         "时间模式来源", "SOP 大类来源",
         "匹配的 AI 告警", "时间漂移 (秒)", "裁判理由",
     ]
@@ -295,7 +293,6 @@ def build_items_table(
                 item.get("sop_category", ""),
                 part.get("temporal_mode", ""),
                 _blank(part.get("window_sec")),
-                item.get("split", ""),
                 gpart.get("description") or item.get("finding_verbatim", ""),
                 ", ".join(gpart.get("osd_times") or []),
                 score,
@@ -318,7 +315,7 @@ def build_golden_snapshot_table(golden_items: Sequence[Mapping[str, Any]], stabl
     """One row per golden part exactly as this run used it (category / time mode with their source)."""
     from eval.score_run import sop_category_and_source, temporal_mode_and_source
 
-    header = ["题号", "part_id", "门店", "稽核重点", "数据集划分", "稽核条款", "人工标注原文", "标注时间点 (OSD)",
+    header = ["题号", "part_id", "门店", "稽核重点", "稽核条款", "人工标注原文", "标注时间点 (OSD)",
               "视频文件名", "SOP 大类", "SOP 大类来源", "时间判定模式", "时间模式来源", "稳定基线题"]
     rows: list[list[Any]] = [header]
     for it in golden_items:
@@ -327,7 +324,7 @@ def build_golden_snapshot_table(golden_items: Sequence[Mapping[str, Any]], stabl
             mode, mode_src = temporal_mode_and_source(dict(it), dict(p))
             rows.append([
                 it.get("item_id", ""), p.get("part_id", ""), it.get("outlet_name", ""), it.get("focus", ""),
-                it.get("split", ""), it.get("audit_clause", ""), p.get("description") or it.get("finding_verbatim", ""),
+                it.get("audit_clause", ""), p.get("description") or it.get("finding_verbatim", ""),
                 ", ".join(p.get("osd_times") or []), "\n".join(it.get("video_filenames") or []),
                 cat, cat_src, mode, mode_src, "是" if it.get("stable_baseline") or it.get("item_id") in stable_ids else "",
             ])
@@ -344,7 +341,7 @@ def build_rounds_table(history: Sequence[dict[str, Any]]) -> tuple[Table, list[s
     ofs = sorted({k for r in rounds for k in (r.get("outlet_focus_recall") or {})})
     header = [
         "轮次", "round_id", "SOP 版本", "模型版本", "视频模式", "运行次数", "run_ids",
-        "总体召回率", "留出集召回率", "开发集召回率", "仅 CONFIRMED 召回率", "告警命中率",
+        "总体召回率", "仅 CONFIRMED 召回率", "告警命中率",
         *cats, *ofs,
         "平均告警数 / 视频", "时间漂移均值 (秒)", "单视频平均成本 (USD)",
     ]
@@ -354,7 +351,7 @@ def build_rounds_table(history: Sequence[dict[str, Any]]) -> tuple[Table, list[s
         rows.append([
             lbl, r.get("round_id", ""), r.get("sop_version", ""), r.get("model_version", ""),
             r.get("media_mode", ""), r.get("runs_count", 0), ", ".join(r.get("run_ids") or []),
-            _blank(m.get("overall_recall")), _blank(m.get("holdout_recall")), _blank(m.get("dev_recall")),
+            _blank(m.get("overall_recall")),
             _blank(m.get("confirmed_only_recall")), _blank(m.get("hit_rate")),
             *[_blank(((r.get("sop_category_recall") or {}).get(c) or {}).get("recall")) for c in cats],
             *[_blank(((r.get("outlet_focus_recall") or {}).get(o) or {}).get("recall")) for o in ofs],
@@ -362,7 +359,7 @@ def build_rounds_table(history: Sequence[dict[str, Any]]) -> tuple[Table, list[s
             _blank(m.get("cost_per_clip_usd")),
         ])
     t = Table(TAB_ROUNDS, rows)
-    pct = ["总体召回率", "留出集召回率", "开发集召回率", "仅 CONFIRMED 召回率", "告警命中率", *cats, *ofs]
+    pct = ["总体召回率", "仅 CONFIRMED 召回率", "告警命中率", *cats, *ofs]
     t.col_formats = {t.col(h): PERCENT for h in pct}
     t.col_formats[t.col("平均告警数 / 视频")] = DECIMAL_2
     t.col_formats[t.col("时间漂移均值 (秒)")] = DECIMAL_2
@@ -376,7 +373,7 @@ GUARDRAIL_HEADER = f"告警密度守卫线 ({MAX_MEAN_ALERT_DENSITY:.1f})"
 def build_runs_table(history: Sequence[dict[str, Any]], current_run_id: str) -> Table:
     header = [
         "运行", "本次", "round_id", "run_id", "SOP 版本", "模型版本", "视频模式",
-        "总体召回率", "留出集召回率", "开发集召回率", "平均告警数 / 视频", GUARDRAIL_HEADER,
+        "总体召回率", "仅 CONFIRMED 召回率", "平均告警数 / 视频", GUARDRAIL_HEADER,
         "时间漂移均值 (秒)", "单视频平均成本 (USD)", "总成本 (USD)",
         "Input Token 数", "Thinking Token 数", "Output Token 数", "总 Token 数",
         "单视频平均耗时 (秒)", "护栏通过",
@@ -388,7 +385,7 @@ def build_runs_table(history: Sequence[dict[str, Any]], current_run_id: str) -> 
             run_label(rec), "★" if rec.get("run_id") == current_run_id else "",
             rec.get("round_id", ""), rec.get("run_id", ""), rec.get("sop_version", ""),
             rec.get("model_version", ""), rec.get("media_mode", ""),
-            _blank(m.get("overall_recall")), _blank(m.get("holdout_recall")), _blank(m.get("dev_recall")),
+            _blank(m.get("overall_recall")), _blank(m.get("confirmed_only_recall")),
             _blank(m.get("findings_per_clip")), MAX_MEAN_ALERT_DENSITY,
             _blank(m.get("mean_point_timestamp_drift_sec")), _blank(m.get("cost_per_clip_usd")),
             _blank(m.get("total_cost_usd")),
@@ -398,7 +395,7 @@ def build_runs_table(history: Sequence[dict[str, Any]], current_run_id: str) -> 
             "是" if m.get("guardrails_passed") else "否",
         ])
     t = Table(TAB_RUNS, rows)
-    t.col_formats = {t.col(h): PERCENT for h in ("总体召回率", "留出集召回率", "开发集召回率")}
+    t.col_formats = {t.col(h): PERCENT for h in ("总体召回率", "仅 CONFIRMED 召回率")}
     for h in ("平均告警数 / 视频", GUARDRAIL_HEADER, "时间漂移均值 (秒)", "单视频平均耗时 (秒)"):
         t.col_formats[t.col(h)] = DECIMAL_2
     for h in ("单视频平均成本 (USD)", "总成本 (USD)"):
@@ -493,8 +490,8 @@ def build_chart_requests(rounds: Table, cats: Sequence[str], ofs: Sequence[str],
     reqs = [
         build_chart_request(
             rounds, title="图1 各轮次核心召回率与告警命中率", domain_header="轮次",
-            series=[("总体召回率", "COLUMN", "LEFT_AXIS"), ("留出集召回率", "COLUMN", "LEFT_AXIS"),
-                    ("开发集召回率", "COLUMN", "LEFT_AXIS"), ("告警命中率", "LINE", "LEFT_AXIS")],
+            series=[("总体召回率", "COLUMN", "LEFT_AXIS"), ("仅 CONFIRMED 召回率", "COLUMN", "LEFT_AXIS"),
+                    ("告警命中率", "LINE", "LEFT_AXIS")],
             bottom_title="轮次 · SOP 版本", left_title="比例", anchor_row=base,
             max_data_rows=MAX_CHART_ROUNDS),
     ]

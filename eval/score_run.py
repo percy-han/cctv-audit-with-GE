@@ -698,8 +698,6 @@ def render_markdown(run_label: str, rep: dict[str, Any]) -> str:
         "",
         f"- 黄金集：{(rep.get('golden') or {}).get('golden_version', '未记录')}（{r['all']['rows']} 题）",
         f"- 加权召回（全部 {r['all']['rows']} 行）：**{r['all']['points']:.1f} / {r['all']['rows']} = {r['all']['recall']:.1%}**",
-        f"- 开卷 dev：{r['dev']['points']:.1f} / {r['dev']['rows']} = {r['dev']['recall']:.1%}",
-        f"- 检查 holdout：{r['holdout']['points']:.1f} / {r['holdout']['rows']} = {r['holdout']['recall']:.1%}",
         f"- 仅 CONFIRMED 召回率：{qm.get('confirmed_only_points', 0.0):.1f} / {r['all']['rows']} = {qm.get('confirmed_only_recall', 0.0):.1%}",
         f"- 告警密度：{ad['findings']} 条 / {ad['clips']} 段 = 平均 {ad['mean_per_clip']:.1f} 条/段，最多 {ad['max_per_clip']} 条/段（有效命中率 Hit Rate = {qm.get('hit_rate', 0.0):.1%}）",
         f"- 瞬时动作时间戳定位误差（POINT ±{qm.get('point_window_sec', POINT_WINDOW_SEC)}s）：{drift_str}",
@@ -709,7 +707,7 @@ def render_markdown(run_label: str, rep: dict[str, Any]) -> str:
         "|---|---|---|---|---|---|---|---|",
     ]
     for it in rep["items"]:
-        grp = f"{it['split']} · {it['focus'].split()[0]} · {it['outlet_name']}"
+        grp = f"{it['focus'].split()[0]} · {it['outlet_name']}"
         modes = "/".join(
             f"{p.get('temporal_mode', 'WINDOW')}(±{p.get('window_sec', WINDOW_SEC)}s"
             + (f",偏移{p['timestamp_drift_sec']}s)" if p.get("timestamp_drift_sec") is not None else ")")

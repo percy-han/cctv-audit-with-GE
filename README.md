@@ -339,10 +339,10 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
     - 在总控表 `Tab2_定时巡检配置表` 配置 `Root_Folder_URL`、`Trigger_Hour_UTC`（`00`–`23`）、`Trigger_Minute_UTC`（`00`/`15`/`30`/`45`）、`Lookback_Days`（`0.5` 或 `1`–`7` 天）及 `Enabled = ENABLED`，系统每天按 UTC 设定时间自动扫描回溯窗口内的新增门店视频、按门店拆分为 24h `Cloud Run Job` 并发执行（对 `<720P` 低清视频按单视频粒度标记 `REJECTED_LOW_RES` 自动跳过，不阻断同目录高清视频），并在批次启动与完成时推送汇总 Google Chat 卡片（含 30 天有效期的多门店 HTML 督导复核工作台链接）。
 
 - **核心方式二：CLI 与 Cloud Build 脚本（`eval/`）**：
-  - **黄金集不写死在代码里**：题目、题数、SOP 大类、门店、视频、文件夹、稳定基线题全部来自黄金集文件 `<name>.jsonl` 及可选的 `<name>.manifest.json`（格式与字段说明见 `eval/data/README.md`）。换黄金集只改配置：Terraform 变量 **`eval_golden_uri`**（`<env>.tfvars`，gs:// 或源码内路径）。**本仓库不附带黄金集**：变量为空时会去找 `eval/data/golden_v1.jsonl`，不存在就在调用任何模型之前报错退出并提示如何设置→ Cloud Build `_GOLDEN_URI=$(terraform output -raw eval_golden_uri)`。黄金集是客户私有数据，不要放进公开仓库，也不要放进 staging bucket（30 天自动删除）。
+  - **黄金集不写死在代码里**：题目、题数、SOP 大类、门店、视频、文件夹、稳定基线题全部来自黄金集文件 `<name>.jsonl` 及可选的 `<name>.manifest.json`（格式与字段说明见 `eval/data/README.md`）。换黄金集只改配置：Terraform 变量 **`eval_golden_uri`**（`<env>.tfvars`，gs:// 或源码内路径；为空则用 `eval/data/golden_v1.jsonl`）→ Cloud Build `_GOLDEN_URI=$(terraform output -raw eval_golden_uri)`。黄金集是客户私有数据，不要放进公开仓库，也不要放进 staging bucket（30 天自动删除）。
   - **推荐：直接读客户自己的标注表**。客户继续维护他们的「Manual Audit Result」标注页（程序不改动它），表格放在测评结果文件夹里，并加一页「测评配置」（黄金集名称、标注页范围、视频文件夹、开发集分组、复合题、逐题设置；格式见 `eval/data/README.md`）。每次评测实时读取这两页，并列出配置的 Drive 文件夹里的全部视频（包括没有标注的）。Terraform 变量 **`eval_golden_sheet_id`** → Cloud Build `_GOLDEN_SHEET_ID`；它和 `eval_golden_uri` 只能设一个。Workspace 身份需要对表格和视频文件夹至少有查看权限。自检：`python -m eval.golden_sheet check --sheet-id <ID>`；生成配置页：`python -m eval.golden_sheet init-config ...`。每次评测把实际使用的黄金集快照写到结果目录的 `golden_snapshot/`，Sheet 报告多一页「本次黄金集快照」。
   - 每次评测都记录 **`golden_version`**（文件名@评分标尺哈希，方案 `ruler-v2`：只在题目、标注文本/时间、划分、视频清单、逐题设置、稳定基线题变化时改变；备注、视频时长/分辨率、缓存任务、来源时间戳不影响）和题数；不同版本黄金集的召回率不可比，按轮次取均值和 Sheet 历史对比都只在同一版本内进行。
-  - `eval/build_dataset.py`：把客户人工稽核表冻结成黄金集 JSONL；数据集划分、复合题、来源表 ID、期望行数等都放在 `--config <name>.build.json`（配置格式与虚构示例见 `eval/data/README.md`）。
+  - `eval/build_dataset.py`：把客户人工稽核表冻结成黄金集 JSONL；数据集划分、复合题、来源表 ID、期望行数等都放在 `--config <name>.build.json`（`eval/data/golden_v1.build.json` 可原样重建 golden_v1）。
   - `eval/run_gcp_round.py`：用一个调优轮次（`eval/rounds/rNN/`）的规则跑全部验证视频、自动打分、追加写入 `eval/rounds/eval_history.jsonl` / `eval_round_averages.jsonl`，生成本次的 Google Sheet 报告（`--skip-sheet-report` 可跳过），并把结果同步到 GCS；支持通过 `eval/cloudbuild_round.yaml` 在 Cloud Build 上运行。
 
   - `eval/score_run.py`：确定性时间预筛 + Gemini Pro 3 次投票取中位数裁判打分。针对不同 SOP 性质采用**分化的时间容差与定位误差策略**：
@@ -351,13 +351,18 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
   - `eval/eval_records.py`：每次运行的结构化记录（召回率、命中率、告警密度、时间漂移、翻转率、成本、耗时、Token）、历史台账与按轮次（同 round + 模型 + SOP + 视频模式）取均值；以及 Agent Platform Evaluation 逐题明细发布。
   - `eval/sheet_report.py`：每次评测新建一份 Google Sheet 报告；也可为已有的运行补生成：`python -m eval.sheet_report --history eval/rounds/eval_history.jsonl --score eval/results/<run_id>/score.json --folder-id <文件夹ID>`（加 `--dry-run` 只打印内容、不调用 API）。
   - `eval/tune_loop.py`：自动调优循环的控制器和守则（单层修改、防过拟合词表、早停守卫：`findings_per_clip <= 8.0` 且 `regressed_stable_items == 0`）。
-  - 可见性探针（针对单条漏检裁出前后 60–75 秒短片、检查模型能否"看见"该动作）是项目内部针对第一批黄金集的诊断工具，含客户视频 ID，不随本仓库分发。
+  - `eval/run_visibility_probe.py`：针对单条漏检，裁出前后 60–75 秒的短片，检查模型能否"看见"该动作。
 
 - **Google Sheet 测评报告（每次评测一份新表）**：
   - 存放位置由 Terraform 变量 **`eval_results_folder_id`**（`<env>.tfvars`）指定，每个环境各填各的 Drive 文件夹；Workspace 身份（`terraform output -raw workspace_identity`）需要对该文件夹有「编辑者」权限。变量为空时评测照常完成，只打印「Sheet report: SKIPPED」。
   - Cloud Build 运行时传入：`--substitutions=...,_EVAL_RESULTS_FOLDER_ID=$(terraform output -raw eval_results_folder_id),_EVAL_REPORT_TIME_ZONE=$(terraform output -raw eval_report_time_zone)`（时区沿用 `scheduler_time_zone`）。
   - 表名 `CHAGEE AI稽核测评_<round_id>_<run_id>_<YYYYMMDD-HHMMSS>`；链接打印在 `LOOP STATUS` 下一行，并写入 `eval/results/<run_id>/sheet_report.json`（随结果上传 GCS）。生成失败不会让评测失败，但会以 ERROR 记录并打印「Sheet report: FAILED — 原因」。
-  - 4 个页签：`本次测评概览`、`本次逐题结果`（每个标注点的得分、匹配告警与裁判理由）、`历史轮次对比`（每轮均值 + 3 张原生图表：核心召回率、按 SOP 大类、按门店 × 稽核重点）、`历史单跑明细`（每次运行 + 告警密度 / 时间漂移 / 成本图）。所有图表的横轴都是轮次或运行标签，不是时间。
+  - 5 个页签（面向客户生产环境统一采用全量黄金集指标，不展示内部算法调优用的留出集/开发集切分）：
+    1. `本次测评概览`：核心召回率（`总体召回率`、`仅 CONFIRMED 召回率`）、告警密度与护栏、瞬时动作时间漂移、成本/耗时与 Token 拆分；
+    2. `本次逐题结果`：每个标注点的得分（1 / 0.5 / 0）、匹配告警与裁判理由；
+    3. `历史轮次对比`：自动从 GCS 同步历史台账（`gs://<staging_bucket>/eval/rounds/eval_history.jsonl`），展示同一套黄金集（相同 `golden_version`）下各历史轮次均值 + 3 张原生图表（核心召回率与命中率、按 SOP 大类、按门店 × 稽核重点）；
+    4. `历史单跑明细`：每次历史运行明细 + 告警密度 / 时间漂移 / 成本图；
+    5. `本次黄金集快照`：本次评测使用的黄金集标注题目快照。所有图表的横轴都是轮次或运行标签，不是时间。
 
 每个脚本都支持 `--help`。
 

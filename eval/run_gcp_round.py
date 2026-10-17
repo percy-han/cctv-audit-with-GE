@@ -1042,6 +1042,7 @@ async def run_sheet_triggered_eval(
         "prompt_tab_name": str(prompt_cfg.active_prompt_version),
         "model_version": str(prompt_cfg.active_model_version),
         "overall_recall": float(m.get("overall_recall", 0.0)),
+        "confirmed_only_recall": float(m.get("confirmed_only_recall", m.get("overall_recall", 0.0))),
         "holdout_recall": float(m.get("holdout_recall", 0.0)),
         "dev_recall": float(m.get("dev_recall", 0.0)),
         "findings_per_clip": float(m.get("findings_per_clip", 0.0)),

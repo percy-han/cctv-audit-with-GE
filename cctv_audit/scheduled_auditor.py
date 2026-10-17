@@ -1443,15 +1443,16 @@ class ScheduledAuditEngine:
 
             sheet_url = str(summary.get("spreadsheet_url") or "")
             overall_pct = float(summary.get("overall_recall", 0.0)) * 100.0
-            holdout_pct = float(summary.get("holdout_recall", 0.0)) * 100.0
-            dev_pct = float(summary.get("dev_recall", 0.0)) * 100.0
+            confirmed_pct = float(
+                summary.get("confirmed_only_recall", summary.get("overall_recall", 0.0))
+            ) * 100.0
             fpc = float(summary.get("findings_per_clip", 0.0))
             cost_usd = float(summary.get("total_cost_usd", 0.0))
             guardrails_ok = bool(summary.get("guardrails_passed", False))
             guard_tag = "护栏通过" if guardrails_ok else "触发护栏"
             report_msg = (
                 f"✅ 评测完成 ({task_rec.eval_task_id})：总体召回率 {overall_pct:.1f}% "
-                f"(留出集 {holdout_pct:.1f}% / 开发集 {dev_pct:.1f}%) | "
+                f"(仅 CONFIRMED {confirmed_pct:.1f}%) | "
                 f"密度 {fpc:.2f} 条/段 ({guard_tag}) | 成本 ${cost_usd:.2f}"
             )
             if sheet_url:

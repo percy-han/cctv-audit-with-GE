@@ -131,12 +131,17 @@ class SpecTest(unittest.TestCase):
     def test_percent_values_are_numbers_with_percent_format(self):
         spec = _spec()
         rounds = spec.tables[2]
-        for h in ("总体召回率", "留出集召回率", "开发集召回率", "告警命中率", "A_Handwashing",
+        for h in ("总体召回率", "仅 CONFIRMED 召回率", "告警命中率", "A_Handwashing",
                   "Bau Cat | Handwashing Monitoring"):
             c = rounds.col(h)
             self.assertEqual(rounds.col_formats[c], srp.PERCENT)
             for row in rounds.rows[1:]:
                 self.assertIsInstance(row[c], float)
+        for table in spec.tables:
+            flat_text = "\n".join(str(cell) for row in table.rows for cell in row)
+            self.assertNotIn("留出集", flat_text)
+            self.assertNotIn("开发集", flat_text)
+            self.assertNotIn("数据集划分", flat_text)
         overview = spec.tables[0]
         recall_row = next(i for i, r in enumerate(overview.rows) if r[0] == "总体召回率 (19 题)")
         self.assertIn((recall_row, 1, srp.PERCENT), overview.cell_formats)
