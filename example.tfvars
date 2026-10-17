@@ -26,9 +26,9 @@ workspace_impersonate_user = "<bot-user@customer-domain>" # "" = the worker SA i
 # workspace_bucket_name = ""                    # "" = <project-id>-<prefix>-workspace (versioned GCS-mode bucket)
 # vertex_model_location = "global"
 # scheduler_time_zone   = "Etc/UTC"            # also the timestamp zone of eval report Sheet names
-# eval_results_folder_id = "<drive-folder-id>"  # eval runs create one timestamped Sheet report here;
+# eval_results_folder_id = "<drive-folder-id>"  # fallback folder for CLI eval runs (Tab3_黄金集评测工作台 specifies its own Results_Folder_URL per row);
 #                                               # share it (Editor) with workspace_impersonate_user. "" = no report
-# eval_golden_uri       = "gs://<private-bucket>/golden/<name>.jsonl" # golden set for eval scoring (+ <name>.manifest.json); "" = repo default
+# eval_golden_uri       = "gs://<private-bucket>/golden/<name>.jsonl" # golden set for CLI eval scoring (+ <name>.manifest.json); "" = repo default
 # eval_golden_sheet_id  = "<label-sheet-id>"   # OR: the customer's label Sheet with a 测评配置 tab (set only one of the two)
 # ge_company_name       = "<Company>"          # shown by the new Gemini Enterprise app
 # ge_tenant_label       = "<brand>"            # used in agent descriptions / default display names
@@ -36,4 +36,4 @@ workspace_impersonate_user = "<bot-user@customer-domain>" # "" = the worker SA i
 # ge_example_folder_url = "https://drive.google.com/drive/folders/<id>"
 # extra_ge_engine_ids      = []                   # only Gemini Enterprise apps this stack owns
 # enable_google_chat_notification = false
-# google_chat_webhook_url         = "https://chat.googleapis.com/v1/spaces/<space>/messages?key=...&token=..."
+# google_chat_webhook_url         = "gs://<project-id>-<prefix>-staging/config/google_chat_webhook.txt" # or direct https://chat.googleapis.com/v1/spaces/... URL

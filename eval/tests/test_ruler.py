@@ -413,12 +413,12 @@ class EvalRecordsTest(unittest.TestCase):
             score_doc=score_with_parts,
             golden_items=sample_golden,
             job_docs=job_docs,
-            agent_engine_id="9876543210987654321",
+            agent_engine_id="9999999999999999999",
         )
         self.assertEqual(len(items_spec), 1)
         self.assertEqual(items_spec[0]["part_id"], "R02_p0")
         self.assertIn("✓ 命中 (1.0)", items_spec[0]["formatted_response"])
-        self.assertEqual(items_spec[0]["agent_engine_id"], "9876543210987654321")
+        self.assertEqual(items_spec[0]["agent_engine_id"], "9999999999999999999")
 
         from types import SimpleNamespace
 
@@ -450,7 +450,7 @@ class EvalRecordsTest(unittest.TestCase):
                 score_doc=score_with_parts,
                 golden_items=sample_golden,
                 job_docs=job_docs,
-                agent_engine_id="9876543210987654321",
+                agent_engine_id="9999999999999999999",
             )
         self.assertEqual(
             pub_res,
@@ -464,12 +464,178 @@ class EvalRecordsTest(unittest.TestCase):
         self.assertIn("Recall 79.0%", exp_call_kwargs["display_name"])
         self.assertEqual(
             exp_call_kwargs["labels"]["vertex-ai-evaluation-agent-engine-id"],
-            "9876543210987654321",
+            "9999999999999999999",
         )
         self.assertEqual(
             exp_call_kwargs["labels"]["vertex-ai-evaluation-set-name"],
             "projects/123456789012/locations/us-central1/evaluationSets/222",
         )
+
+    def test_run_sheet_triggered_eval_extracts_nested_metrics_from_mon_record(self):
+        """Regression test: `run_sheet_triggered_eval` must extract `overall_recall`, `holdout_recall`,
+        `dev_recall`, `findings_per_clip`, `hit_rate`, `guardrails_passed`, `total_cost_usd`, and
+        `total_token_count` from `mon_record['metrics']` instead of returning 0.0 from top-level."""
+        import asyncio
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import eval.run_gcp_round as rgr
+
+        sample_golden = [
+            {
+                "item_id": "R02",
+                "sheet_row": 2,
+                "split": "holdout",
+                "outlet_name": "1-Bau Cat",
+                "focus": "Handwashing",
+                "audit_clause": "4.2.1 Hand Washing Procedure",
+                "video_filenames": ["1-1.mp4"],
+                "parts": [
+                    {
+                        "part_id": "R02_p0",
+                        "osd_times": ["12:17:45"],
+                        "description": "Not wash hand for at least 20 seconds",
+                    }
+                ],
+            }
+        ]
+        score_with_parts = {
+            "recall": {
+                "all": {"points": 10.0, "rows": 19, "recall": 0.5263},
+                "holdout": {"points": 10.0, "rows": 13, "recall": 0.7692},
+                "dev": {"points": 0.0, "rows": 6, "recall": 0.0},
+            },
+            "alert_density": {
+                "mean_per_clip": 6.625,
+                "findings": 106,
+                "clips": 16,
+            },
+            "guardrails": {
+                "passed": True,
+                "regressed_stable_items": [],
+            },
+            "quality_metrics": {
+                "confirmed_only_points": 9.0,
+                "confirmed_only_recall": 0.4737,
+                "matched_findings_count": 12,
+                "total_findings_count": 106,
+                "hit_rate": 0.1132,
+                "point_window_sec": 20,
+                "window_sec": 60,
+                "point_parts_total": 8,
+                "point_parts_matched": 6,
+                "window_parts_total": 13,
+                "mean_point_timestamp_drift_sec": 7.6,
+                "max_point_timestamp_drift_sec": 19.0,
+            },
+            "sop_category_recall": {
+                "A_Handwashing": {"points": 7.0, "rows": 11, "recall": 0.6364},
+            },
+            "outlet_focus_recall": {
+                "Cantavil D2 | Handwashing Monitoring": {"points": 5.0, "rows": 5, "recall": 1.0},
+            },
+            "video_breakdown": {
+                "1-1.mp4": {"points": 1.0, "rows": 1, "recall": 1.0, "findings_count": 6},
+            },
+            "items": [
+                {
+                    "item_id": "R02",
+                    "score": 1.0,
+                    "parts": [{"part_id": "R02_p0", "score": 1.0, "explanation": "MATCH=0; 命中"}],
+                }
+            ],
+        }
+        job_docs = [
+            {
+                "baseline_job_id": "job_01",
+                "folder_name": "1-Cantavil D2 (1.5 Handwashing)",
+                "completed_segments": {"1-1.mp4:0": {}},
+                "findings": [
+                    {
+                        "video_filename": "1-1.mp4",
+                        "timestamp_start": "00:25",
+                        "timestamp_end": "00:35",
+                        "violation_type": "SKIPPED_SOAP",
+                        "confidence": "CONFIRMED",
+                        "evidence_description_zh": "跳过洗手液",
+                    }
+                ],
+                "token_ledger": [
+                    {
+                        "video_filename": "1-1.mp4",
+                        "slice_index": 0,
+                        "prompt_token_count": 400_000,
+                        "candidates_token_count": 10_000,
+                        "thoughts_token_count": 10_000,
+                        "total_token_count": 420_000,
+                        "estimated_cost_usd": 0.375,
+                        "processing_latency_sec": 38.0,
+                    }
+                ],
+            }
+        ]
+
+        async def _fake_load_cfg(self, prompt_tab_name, model_version, sheet_id=None):
+            return SimpleNamespace(
+                active_prompt_version=prompt_tab_name,
+                active_model_version=model_version,
+            )
+
+        async def _fake_eval_single_folder(**kwargs):
+            return job_docs[0]
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            fake_golden_file = td_path / "golden.jsonl"
+            fake_golden_file.write_text("{}", encoding="utf-8")
+            fake_golden_bundle = SimpleNamespace(
+                source="sheet:fake_label_sheet",
+                origin={"sheet_id": "fake_label_sheet"},
+                items=sample_golden,
+                manifest={"folders": [{"job_id": "job_01", "folder_name": "1-Cantavil D2"}]},
+                write_snapshot=lambda dest_stem: fake_golden_file,
+            )
+            fake_sheet_outcome = SimpleNamespace(
+                spreadsheet_url="https://docs.google.com/spreadsheets/d/report_123/edit",
+                spreadsheet_id="report_123",
+                error=None,
+                status_line="ok",
+            )
+            with (
+                patch.dict("os.environ", {"GCP_PROJECT": "example-project", "STAGING_BUCKET": "bkt"}),
+                patch.object(rgr.PromptManager, "load_config_for_tab", _fake_load_cfg),
+                patch.object(rgr, "load_golden_source", return_value=("sheet", fake_golden_bundle)),
+                patch.object(rgr, "folder_specs_from_golden", return_value=[{"job_id": "job_01"}]),
+                patch.object(rgr, "evaluate_single_folder", _fake_eval_single_folder),
+                patch.object(rgr, "score_run", return_value=dict(score_with_parts)),
+                patch.object(rgr, "render_markdown", return_value="# Mock Report"),
+                patch.object(rgr, "publish_run_sheet_report_safely", return_value=fake_sheet_outcome),
+            ):
+                res = asyncio.run(
+                    rgr.run_sheet_triggered_eval(
+                        eval_id="EVAL-01",
+                        eval_name="基线回归测试",
+                        prompt_tab_name="Tab1_V27_20261015",
+                        model_version="gemini-3-flash-preview",
+                        golden_videos_folder_id="folder_vids",
+                        golden_source_id="sheet_labels",
+                        results_folder_id="folder_results",
+                        eval_task_id="eval_EVAL-01_test",
+                        rounds_dir=td_path / "rounds",
+                        results_dir=td_path / "results",
+                        skip_gcs_sync=True,
+                    )
+                )
+
+        self.assertAlmostEqual(res["overall_recall"], 0.5263, places=4)
+        self.assertAlmostEqual(res["holdout_recall"], 0.7692, places=4)
+        self.assertAlmostEqual(res["findings_per_clip"], 6.625, places=3)
+        self.assertTrue(res["guardrails_passed"])
+        self.assertAlmostEqual(res["total_cost_usd"], 0.375, places=4)
+        self.assertEqual(res["total_tokens"], 420_000)
+        self.assertEqual(res["spreadsheet_url"], "https://docs.google.com/spreadsheets/d/report_123/edit")
 
 
 if __name__ == "__main__":

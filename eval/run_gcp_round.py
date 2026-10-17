@@ -1033,6 +1033,7 @@ async def run_sheet_triggered_eval(
                 if fpath.exists():
                     bucket.blob(f"eval/rounds/{fname}").upload_from_filename(str(fpath))
 
+    m = mon_record.get("metrics") or mon_record
     return {
         "eval_id": eval_id,
         "eval_name": eval_name,
@@ -1040,14 +1041,14 @@ async def run_sheet_triggered_eval(
         "run_id": run_id,
         "prompt_tab_name": str(prompt_cfg.active_prompt_version),
         "model_version": str(prompt_cfg.active_model_version),
-        "overall_recall": float(mon_record.get("overall_recall", 0.0)),
-        "holdout_recall": float(mon_record.get("holdout_recall", 0.0)),
-        "dev_recall": float(mon_record.get("dev_recall", 0.0)),
-        "findings_per_clip": float(mon_record.get("findings_per_clip", 0.0)),
-        "hit_rate": float(mon_record.get("hit_rate", 0.0)),
-        "guardrails_passed": bool(mon_record.get("guardrails_passed", False)),
-        "total_cost_usd": float(mon_record.get("total_cost_usd", 0.0)),
-        "total_tokens": int(mon_record.get("total_tokens", 0)),
+        "overall_recall": float(m.get("overall_recall", 0.0)),
+        "holdout_recall": float(m.get("holdout_recall", 0.0)),
+        "dev_recall": float(m.get("dev_recall", 0.0)),
+        "findings_per_clip": float(m.get("findings_per_clip", 0.0)),
+        "hit_rate": float(m.get("hit_rate", 0.0)),
+        "guardrails_passed": bool(m.get("guardrails_passed", False)),
+        "total_cost_usd": float(m.get("total_cost_usd", 0.0)),
+        "total_tokens": int(m.get("total_token_count", m.get("total_tokens", 0))),
         "spreadsheet_url": sheet_outcome.spreadsheet_url,
         "spreadsheet_id": sheet_outcome.spreadsheet_id,
         "sheet_error": sheet_outcome.error,
