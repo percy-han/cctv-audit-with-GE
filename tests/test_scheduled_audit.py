@@ -1557,6 +1557,62 @@ def test_unified_start_and_completion_chat_notifications_and_dedup_guard(
         assert resumed.resume_count == 1
         assert len(webhook_posts) == 1
 
+        # 4. Verify send_eval_start_notification and send_eval_completion_notification
+        # resolve gs:// webhook secret URIs via _resolve_webhook_url_sync instead of passing gs:// to httpx
+        posted_urls: List[str] = []
+
+        class _UrlCheckingClient(_FakeAsyncClient):
+            async def post(self, url: str, json: Dict[str, Any], **kwargs: Any) -> _FakeHttpResp:
+                assert url.startswith("https://chat.googleapis.com/"), f"Unexpected webhook URL: {url}"
+                posted_urls.append(url)
+                webhook_posts.append(json)
+                return _FakeHttpResp()
+
+        monkeypatch.setattr(httpx, "AsyncClient", _UrlCheckingClient)
+        eval_reporter = WorkspaceReporter(webhook_url="gs://test-bucket/config/google_chat_webhook.txt")
+        monkeypatch.setattr(
+            eval_reporter,
+            "_resolve_webhook_url_sync",
+            lambda: "https://chat.googleapis.com/v1/spaces/EVAL/messages?key=k&token=t",
+        )
+        ok_eval_start = await eval_reporter.send_eval_start_notification(
+            eval_id="EVAL-01",
+            eval_name="V10 基线评测",
+            run_id="eval_EVAL-01_run1",
+            prompt_tab_name="Prompt_v2.5_V10全量17条标准版",
+            model_version="gemini-3.8-flash",
+            supervisor_email="sup@chagee.com",
+            golden_videos_folder_url="https://drive.google.com/drive/folders/vid1",
+            human_labels_sheet_url="https://docs.google.com/spreadsheets/d/lbl1/edit",
+            results_folder_url="https://drive.google.com/drive/folders/res1",
+        )
+        assert ok_eval_start is True
+        ok_eval_done = await eval_reporter.send_eval_completion_notification(
+            eval_id="EVAL-01",
+            eval_name="V10 基线评测",
+            run_id="eval_EVAL-01_run1",
+            prompt_tab_name="Prompt_v2.5_V10全量17条标准版",
+            model_version="gemini-3.8-flash",
+            supervisor_email="sup@chagee.com",
+            status="DONE",
+            summary={
+                "spreadsheet_url": "https://docs.google.com/spreadsheets/d/rep1/edit",
+                "overall_recall": 0.421,
+                "holdout_recall": 0.444,
+                "dev_recall": 0.400,
+                "findings_per_clip": 5.2,
+                "hit_rate": 0.5625,
+                "total_cost_usd": 3.21,
+                "total_tokens": 120000,
+                "guardrails_passed": True,
+            },
+        )
+        assert ok_eval_done is True
+        assert posted_urls == [
+            "https://chat.googleapis.com/v1/spaces/EVAL/messages?key=k&token=t",
+            "https://chat.googleapis.com/v1/spaces/EVAL/messages?key=k&token=t",
+        ]
+
     asyncio.run(_run())
 
 

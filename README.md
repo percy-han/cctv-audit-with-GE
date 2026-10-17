@@ -322,7 +322,23 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 
 用人工稽核结果做"黄金基准集（Golden Dataset）"，评估不同模型版本（`model_version`）和不同 SOP 提示词版本（`sop_version`）的召回率、误报密度、定位误差与推理成本。**评分只做一次**（`eval/score_run.py`，本地），所有数字以该次的 `score.json` 和 `eval/rounds/eval_history.jsonl` 为唯一来源；每次评测在 Google Drive 里新建一份带时间戳的 Google Sheet 报告。评测指标**不再**推送到 Cloud Monitoring 或 Vertex AI Experiments（Round 67 起）。
 
-- **核心脚本**：
+- **核心方式一（推荐，零代码自助工作台）：总控表 `Tab3_黄金集评测工作台`**：
+  - 在总控表 `CHAGEE_SOP_与模型版本总控台` 的 **`Tab3_黄金集评测工作台`** 中，只需配置一行即可零代码触发黄金集评测：
+    1. `Eval_ID` / `Eval_Name`：评测编号与名称；
+    2. `Prompt_Tab_Name`：下拉选择待评测的 SOP 分表（如 `Prompt_v2.5_V10全量17条标准版`）；
+    3. `Model_Version`：下拉选择待评测的模型版本（如 `gemini-3.8-flash`、`gemini-2.5-flash`、`gemini-2.5-pro`）；
+    4. `Golden_Videos_Folder_URL`：黄金集视频所在的独立 Google Drive 根目录（如 `evaluation/Golden_Videos`，与日常门店视频物理隔离防误删）；
+    5. `Human_Labels_Sheet_URL`：人工标注结果 Google Sheet 链接（含 `Manual Audit Result` 标注页，无需在表内维护额外配置页，系统自动与 `Golden_Videos_Folder_URL` 下的子目录及视频匹配）；
+    6. `Results_Folder_URL`：评测报告 Google Sheet 的归档文件夹链接；
+    7. `Supervisor_Email`：负责督导邮箱；
+    8. `Trigger_Action`：下拉选择 `START_EVAL` 即可在下一个 15 分钟调度刻度（`POST /internal/jobs/scheduled-tick`）自动触发 24h `Cloud Run Job` 执行。
+  - **状态流转与双阶段 Google Chat 通知**：
+    - 触发瞬间：`Trigger_Action` 自动变为 `RUNNING`，并通过 Google Chat Webhook（支持直连 URL 或 `gs://<桶>/config/google_chat_webhook.txt` 密钥文件引用）推送 **`🚀 黄金集评测已启动`** 卡片；
+    - 评测完成：`Trigger_Action` 自动变为 `DONE`（异常则为 `FAILED`），`Last_Eval_Report` 自动回写召回率摘要与新生成的 5-Tab 测评报告 Sheet 链接，并推送 **`✅ 黄金集评测已完成`** Google Chat 卡片。
+  - **日常定时自动巡检（`Tab2_定时巡检配置表`）**：
+    - 在总控表 `Tab2_定时巡检配置表` 配置 `Root_Folder_URL`、`Trigger_Hour_UTC`（`00`–`23`）、`Trigger_Minute_UTC`（`00`/`15`/`30`/`45`）、`Lookback_Days`（`0.5` 或 `1`–`7` 天）及 `Enabled = ENABLED`，系统每天按 UTC 设定时间自动扫描回溯窗口内的新增门店视频、按门店拆分为 24h `Cloud Run Job` 并发执行（对 `<720P` 低清视频按单视频粒度标记 `REJECTED_LOW_RES` 自动跳过，不阻断同目录高清视频），并在批次启动与完成时推送汇总 Google Chat 卡片（含 30 天有效期的多门店 HTML 督导复核工作台链接）。
+
+- **核心方式二：CLI 与 Cloud Build 脚本（`eval/`）**：
   - **黄金集不写死在代码里**：题目、题数、SOP 大类、门店、视频、文件夹、稳定基线题全部来自黄金集文件 `<name>.jsonl` 及可选的 `<name>.manifest.json`（格式与字段说明见 `eval/data/README.md`）。换黄金集只改配置：Terraform 变量 **`eval_golden_uri`**（`<env>.tfvars`，gs:// 或源码内路径）。**本仓库不附带黄金集**：变量为空时会去找 `eval/data/golden_v1.jsonl`，不存在就在调用任何模型之前报错退出并提示如何设置→ Cloud Build `_GOLDEN_URI=$(terraform output -raw eval_golden_uri)`。黄金集是客户私有数据，不要放进公开仓库，也不要放进 staging bucket（30 天自动删除）。
   - **推荐：直接读客户自己的标注表**。客户继续维护他们的「Manual Audit Result」标注页（程序不改动它），表格放在测评结果文件夹里，并加一页「测评配置」（黄金集名称、标注页范围、视频文件夹、开发集分组、复合题、逐题设置；格式见 `eval/data/README.md`）。每次评测实时读取这两页，并列出配置的 Drive 文件夹里的全部视频（包括没有标注的）。Terraform 变量 **`eval_golden_sheet_id`** → Cloud Build `_GOLDEN_SHEET_ID`；它和 `eval_golden_uri` 只能设一个。Workspace 身份需要对表格和视频文件夹至少有查看权限。自检：`python -m eval.golden_sheet check --sheet-id <ID>`；生成配置页：`python -m eval.golden_sheet init-config ...`。每次评测把实际使用的黄金集快照写到结果目录的 `golden_snapshot/`，Sheet 报告多一页「本次黄金集快照」。
   - 每次评测都记录 **`golden_version`**（文件名@评分标尺哈希，方案 `ruler-v2`：只在题目、标注文本/时间、划分、视频清单、逐题设置、稳定基线题变化时改变；备注、视频时长/分辨率、缓存任务、来源时间戳不影响）和题数；不同版本黄金集的召回率不可比，按轮次取均值和 Sheet 历史对比都只在同一版本内进行。

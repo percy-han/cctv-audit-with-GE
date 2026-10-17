@@ -109,10 +109,20 @@ class WorkspaceReporter:
         enable_notification: Optional[bool] = None,
     ) -> None:
         self._gateway = gateway
-        self._webhook_url = (
-            webhook_url if webhook_url is not None else config.google_chat_webhook_url
-        )
+        self._explicit_webhook_url = webhook_url
         self._enable_notification = enable_notification
+
+    @property
+    def _webhook_url(self) -> str:
+        return (
+            self._explicit_webhook_url
+            if self._explicit_webhook_url is not None
+            else config.google_chat_webhook_url
+        )
+
+    @_webhook_url.setter
+    def _webhook_url(self, value: Optional[str]) -> None:
+        self._explicit_webhook_url = value
 
     def build_tab1_rows(
         self,
@@ -756,19 +766,30 @@ class WorkspaceReporter:
         results_folder_url: str = "",
     ) -> bool:
         """Sends a Google Chat start card when a `Tab3_黄金集评测工作台` row transitions `START_EVAL -> RUNNING`."""
-        webhook_url = config.google_chat_webhook_url
-        if not webhook_url:
+        enabled = self._is_notification_enabled()
+        webhook_url = (
+            await asyncio.to_thread(self._resolve_webhook_url_sync) if enabled else ""
+        )
+        if not enabled or not webhook_url:
             logger.info(
-                "No GOOGLE_CHAT_WEBHOOK_URL configured; skipping eval start notification for %s.",
+                "Google Chat eval start notification disabled or webhook unconfigured (enabled=%s); skipping push for %s.",
+                enabled,
                 eval_id,
             )
             return False
+
+        chat_user_id = await asyncio.to_thread(resolve_chat_user_id, supervisor_email)
+        initiator_line = (
+            f"<users/{chat_user_id}> (<code>{supervisor_email}</code>)"
+            if chat_user_id
+            else f"<code>{supervisor_email or '督导'}</code>"
+        )
 
         widgets: list[dict[str, Any]] = [
             {
                 "decoratedText": {
                     "topLabel": "评测任务 / 负责人",
-                    "text": f"<b>{eval_name} ({eval_id})</b> · <b>{supervisor_email or '督导'}</b>",
+                    "text": f"<b>{eval_name} ({eval_id})</b> · <b>负责督导</b>：{initiator_line}",
                 }
             },
             {
@@ -845,10 +866,24 @@ class WorkspaceReporter:
         error_message: str = "",
     ) -> bool:
         """Sends a Google Chat card notification for a Sheet-triggered golden-set evaluation (`Tab3_黄金集评测工作台`)."""
-        webhook_url = config.google_chat_webhook_url
-        if not webhook_url:
-            logger.info("No GOOGLE_CHAT_WEBHOOK_URL configured; skipping eval notification for %s.", eval_id)
+        enabled = self._is_notification_enabled()
+        webhook_url = (
+            await asyncio.to_thread(self._resolve_webhook_url_sync) if enabled else ""
+        )
+        if not enabled or not webhook_url:
+            logger.info(
+                "Google Chat eval notification disabled or webhook unconfigured (enabled=%s); skipping push for %s.",
+                enabled,
+                eval_id,
+            )
             return False
+
+        chat_user_id = await asyncio.to_thread(resolve_chat_user_id, supervisor_email)
+        initiator_line = (
+            f"<users/{chat_user_id}> (<code>{supervisor_email}</code>)"
+            if chat_user_id
+            else f"<code>{supervisor_email or '督导'}</code>"
+        )
 
         is_done = str(status).upper() == "DONE"
         summary = summary or {}
@@ -866,7 +901,7 @@ class WorkspaceReporter:
             {
                 "decoratedText": {
                     "topLabel": "评测负责人 / 配方版本",
-                    "text": f"<b>{supervisor_email or '督导'}</b> · SOP: <code>{prompt_tab_name}</code> · 模型: <code>{model_version}</code>",
+                    "text": f"<b>负责督导</b>：{initiator_line} · SOP: <code>{prompt_tab_name}</code> · 模型: <code>{model_version}</code>",
                 }
             },
         ]
