@@ -604,3 +604,82 @@ def test_portal_renders_custom_new_sop_rule_from_tab4(tmp_path: Path, monkeypatc
         assert f0["sop_fail_criteria"] == "取果糖后超过 15 秒未擦拭果糖机喷嘴"
 
     asyncio.run(_run())
+
+
+def test_engine_prompt_chips_canned_queries_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+    from deploy import deploy_reasoning_engine as dre
+
+    agent_name = "霸王茶姬 (CHAGEE) 门店监控 AI 稽核专家"
+    folder_url = "https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
+    chips = dre.build_engine_prompt_chips(agent_name, folder_url)
+    chip_ids = [cid for cid, _ in chips]
+    assert chip_ids == ["cctv-full-audit", "cctv-tab4-spot-check", "cctv-confirm-and-status"]
+    for _, body in chips:
+        assert body["enabled"] is True
+        assert f"「{agent_name}」" in body["defaultTexts"]["prefix"]
+        assert len(body["defaultTexts"]["suggestedPrompts"]) >= 1
+        for sp in body["defaultTexts"]["suggestedPrompts"]:
+            assert sp["promptText"].startswith(f"@{agent_name} ")
+
+    calls: list[tuple[str, str, dict | None]] = []
+
+    def _fake_call(
+        method: str,
+        url: str,
+        body: dict | None = None,
+        project_id: str = "",
+        ignore_errors: bool = False,
+    ) -> dict:
+        calls.append((method, url, body))
+        if method == "GET" and url.endswith("/cannedQueries?pageSize=100"):
+            return {
+                "cannedQueries": [
+                    {
+                        "name": "projects/p/locations/global/collections/default_collection/engines/eng1/assistants/default_assistant/cannedQueries/goog_start_my_day",
+                        "displayName": "Start my day",
+                        "googleDefined": True,
+                        "enabled": True,
+                    },
+                    {
+                        "name": "projects/p/locations/global/collections/default_collection/engines/eng1/assistants/default_assistant/cannedQueries/videocheck",
+                        "displayName": "视频稽核SOP",
+                        "enabled": True,
+                    },
+                    {
+                        "name": "projects/p/locations/global/collections/default_collection/engines/eng1/assistants/default_assistant/cannedQueries/cctv-full-audit",
+                        "displayName": "门店视频日常全量稽核",
+                        "enabled": True,
+                    },
+                ]
+            }
+        return {"name": url, "displayName": (body or {}).get("displayName", "")}
+
+    monkeypatch.setattr(dre, "_call", _fake_call)
+    de_base = "https://discoveryengine.googleapis.com/v1alpha/projects/p/locations/global/collections/default_collection"
+    synced = dre.ensure_engine_prompt_chips(
+        "p",
+        de_base,
+        "eng1",
+        agent_display_name=agent_name,
+        example_folder_url=folder_url,
+    )
+    assert len(synced) == 3
+
+    # Google-defined default chip and legacy `videocheck` chip must be disabled
+    disabled_urls = [
+        url for m, url, b in calls if m == "PATCH" and b and b.get("enabled") is False
+    ]
+    assert any("goog_start_my_day?updateMask=enabled" in u for u in disabled_urls)
+    assert any("videocheck?updateMask=enabled" in u for u in disabled_urls)
+
+    # Existing `cctv-full-audit` is PATCHed, while `cctv-tab4-spot-check` and `cctv-confirm-and-status` are POSTed
+    patched_custom = [
+        url for m, url, b in calls if m == "PATCH" and b and b.get("enabled") is True
+    ]
+    posted_custom = [url for m, url, _ in calls if m == "POST"]
+    assert len(patched_custom) == 1
+    assert "cctv-full-audit?updateMask=displayName,defaultTexts,enabled" in patched_custom[0]
+    assert len(posted_custom) == 2
+    assert any("cannedQueryId=cctv-tab4-spot-check" in u for u in posted_custom)
+    assert any("cannedQueryId=cctv-confirm-and-status" in u for u in posted_custom)
+

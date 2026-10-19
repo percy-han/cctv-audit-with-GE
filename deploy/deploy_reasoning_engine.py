@@ -357,6 +357,168 @@ def _report(action: str, eng: str, result: dict[str, Any], reasoning_engine_name
 GE_DATASTORE_FALLBACK_SUFFIX = "-store-v2"
 
 
+def build_engine_prompt_chips(
+    agent_display_name: str,
+    example_folder_url: str = "",
+) -> list[tuple[str, dict[str, Any]]]:
+    """Builds the Discovery Engine `cannedQueries` (Console `Prompt chips` / GE new-session homepage pills).
+
+    In Gemini Enterprise (`ucs-search-bar.ts` & `ucs-prompt-card.ts`):
+    - Before an Agent is selected or `@`-mentioned, the search bar's default placeholder is hardcoded in
+      the GE web bundle; `Agent.starterPrompts` and `Agent.customPlaceholderText` only appear *after*
+      selecting/`@`-mentioning the Agent.
+    - However, `assistants/default_assistant/cannedQueries` (`Prompt chips` in Cloud Console) are rendered
+      directly on the GE new-session homepage right below the input box. Clicking a chip sets the input
+      box placeholder to `defaultTexts.prefix` and opens a dropdown of `defaultTexts.suggestedPrompts`.
+    """
+    folder_example = example_folder_url or "<粘贴门店监控 Google Drive 文件夹链接>"
+    return [
+        (
+            "cctv-full-audit",
+            {
+                "displayName": "门店视频日常全量稽核",
+                "defaultTexts": {
+                    "title": "📹 门店视频全量稽核（请先 @稽核专家）",
+                    "prefix": (
+                        f"请先输入 @ 选中「{agent_display_name}」，"
+                        "再输入：请帮忙稽核视频，<视频文件夹链接>"
+                    ),
+                    "suggestedPrompts": [
+                        {"promptText": f"@{agent_display_name} 请帮忙稽核视频：{folder_example}"},
+                        {
+                            "promptText": (
+                                f"@{agent_display_name} 请帮忙稽核视频："
+                                "<粘贴门店监控 Google Drive 文件夹链接或 gs:// 目录>"
+                            )
+                        },
+                    ],
+                },
+                "enabled": True,
+            },
+        ),
+        (
+            "cctv-tab4-spot-check",
+            {
+                "displayName": "Tab4 专项抽检与新SOP测试",
+                "defaultTexts": {
+                    "title": "🧪 专项抽检与新规测试（仅测4号专项测试表，请先 @稽核专家）",
+                    "prefix": (
+                        f"请先输入 @ 选中「{agent_display_name}」，"
+                        "再输入：【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频，<视频文件夹链接>"
+                    ),
+                    "suggestedPrompts": [
+                        {
+                            "promptText": (
+                                f"@{agent_display_name} 【仅测 Tab4_专项测试表（非全量）】"
+                                f"请帮忙稽核视频：{folder_example}"
+                            )
+                        },
+                        {
+                            "promptText": (
+                                f"@{agent_display_name} 【仅测 Tab4_专项测试表（非全量）】"
+                                "请帮忙稽核视频：<粘贴门店监控 Google Drive 文件夹链接>"
+                            )
+                        },
+                    ],
+                },
+                "enabled": True,
+            },
+        ),
+        (
+            "cctv-confirm-and-status",
+            {
+                "displayName": "确认开始稽核与进度查询",
+                "defaultTexts": {
+                    "title": "✅ 确认开始稽核 / 查询任务进度（请先 @稽核专家）",
+                    "prefix": f"请先确保已 @ 选中「{agent_display_name}」，再点击下方指令或输入：确认开始稽核",
+                    "suggestedPrompts": [
+                        {"promptText": f"@{agent_display_name} 确认开始稽核"},
+                        {"promptText": f"@{agent_display_name} 查询我刚才提交的稽核任务进度"},
+                    ],
+                },
+                "enabled": True,
+            },
+        ),
+    ]
+
+
+def ensure_engine_prompt_chips(
+    project_id: str,
+    de_base: str,
+    eng: str,
+    *,
+    agent_display_name: str,
+    example_folder_url: str = "",
+) -> list[dict[str, Any]]:
+    """Syncs the GE new-session homepage Prompt Chips (`cannedQueries`) on `eng` and disables built-in noise."""
+    cq_base = f"{de_base}/engines/{eng}/assistants/default_assistant/cannedQueries"
+    listed = _call("GET", f"{cq_base}?pageSize=100", project_id=project_id, ignore_errors=True)
+    if listed.get("_http_error"):
+        print(
+            f"⚠️ Listing Prompt Chips (`cannedQueries`) in GE Engine `{eng}` FAILED: "
+            f"HTTP {listed['_http_error']} {listed.get('_error_body', '')}",
+            file=sys.stderr,
+        )
+        return []
+
+    existing_by_id: dict[str, dict[str, Any]] = {}
+    for cq in listed.get("cannedQueries", []):
+        name = cq.get("name", "")
+        cq_id = name.rsplit("/", 1)[-1] if "/" in name else ""
+        if cq_id:
+            existing_by_id[cq_id] = cq
+        # Disable Google-defined default office chips (and legacy manual `videocheck` chip) so only
+        # the CCTV Audit prompt chips appear on the GE new-session homepage.
+        if (cq.get("googleDefined") or cq_id == "videocheck") and cq.get("enabled"):
+            patch_url = f"https://discoveryengine.googleapis.com/v1alpha/{name}?updateMask=enabled"
+            _call(
+                "PATCH",
+                patch_url,
+                body={"name": name, "enabled": False},
+                project_id=project_id,
+                ignore_errors=True,
+            )
+
+    synced: list[dict[str, Any]] = []
+    for chip_id, chip_body in build_engine_prompt_chips(agent_display_name, example_folder_url):
+        existing = existing_by_id.get(chip_id)
+        if existing and existing.get("name"):
+            name = existing["name"]
+            patch_url = (
+                f"https://discoveryengine.googleapis.com/v1alpha/{name}"
+                "?updateMask=displayName,defaultTexts,enabled"
+            )
+            res = _call(
+                "PATCH",
+                patch_url,
+                body={"name": name, **chip_body},
+                project_id=project_id,
+                ignore_errors=True,
+            )
+            action = "Updated"
+        else:
+            post_url = f"{cq_base}?cannedQueryId={chip_id}"
+            res = _call(
+                "POST",
+                post_url,
+                body=chip_body,
+                project_id=project_id,
+                ignore_errors=True,
+            )
+            action = "Created"
+        if res.get("_http_error"):
+            print(
+                f"⚠️ {action} Prompt Chip `{chip_id}` in GE Engine `{eng}` FAILED: "
+                f"HTTP {res['_http_error']} {res.get('_error_body', '')}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"✅ {action} Prompt Chip `{chip_id}` in GE Engine `{eng}` -> {res.get('displayName')}")
+        synced.append(res)
+    return synced
+
+
+
 def ensure_gemini_enterprise_and_bind_agent(
     project_id: str,
     reasoning_engine_name: str,
@@ -529,6 +691,7 @@ def ensure_gemini_enterprise_and_bind_agent(
             )
 
         if stack_agents:
+            effective_agent_name = agent_display_name
             for ag in stack_agents:
                 existing_agent_name = ag["name"]
                 patch_body = dict(agent_payload)
@@ -538,6 +701,7 @@ def ensure_gemini_enterprise_and_bind_agent(
                 # Preserve existing custom displayName if already set on a legacy engine
                 if ag.get("displayName"):
                     patch_body["displayName"] = ag["displayName"]
+                    effective_agent_name = ag["displayName"]
                 patch_url = (
                     f"https://discoveryengine.googleapis.com/v1alpha/{existing_agent_name}"
                     "?updateMask=displayName,description,adkAgentDefinition,starterPrompts,customPlaceholderText"
@@ -551,6 +715,13 @@ def ensure_gemini_enterprise_and_bind_agent(
                 )
                 _report("Updated", eng, {"name": existing_agent_name, **updated}, reasoning_engine_name)
                 bound_agents[f"{eng}:{existing_agent_name}"] = updated
+            ensure_engine_prompt_chips(
+                project_id,
+                de_base,
+                eng,
+                agent_display_name=effective_agent_name,
+                example_folder_url=example_folder_url,
+            )
         elif foreign_agents:
             blocked_engines.append(eng)
         else:
@@ -563,6 +734,13 @@ def ensure_gemini_enterprise_and_bind_agent(
             )
             _report("Registered new", eng, created, reasoning_engine_name)
             bound_agents[eng] = created
+            ensure_engine_prompt_chips(
+                project_id,
+                de_base,
+                eng,
+                agent_display_name=agent_display_name,
+                example_folder_url=example_folder_url,
+            )
 
     if blocked_engines:
         raise SystemExit(
