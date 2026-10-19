@@ -695,3 +695,21 @@ def test_engine_prompt_chips_canned_queries_sync(monkeypatch: pytest.MonkeyPatch
     assert len(posted_custom) == 1
     assert any("cannedQueryId=cctv-tab4-spot-check" in u for u in posted_custom)
 
+
+def test_extract_drive_id_handles_ge_smart_chip_syntax() -> None:
+    from cctv_audit.video_ingestor import extract_drive_id
+
+    assert (
+        extract_drive_id(
+            "https://drive.google.com/drive/folders/1TfNVXCpc2clCzCCTX47CNviN-9J42fp1?usp=drive_link:1-Bau Cat"
+        )
+        == "1TfNVXCpc2clCzCCTX47CNviN-9J42fp1"
+    )
+    assert (
+        extract_drive_id(
+            "https://drive.google.com/drive/folders/1TfNVXCpc2clCzCCTX47CNviN-9J42fp1:1-Bau Cat]"
+        )
+        == "1TfNVXCpc2clCzCCTX47CNviN-9J42fp1"
+    )
+
+

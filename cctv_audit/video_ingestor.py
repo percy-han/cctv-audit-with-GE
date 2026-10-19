@@ -112,11 +112,13 @@ def extract_drive_id(url_or_id: str) -> str:
     path_parts = [p for p in parsed.path.split("/") if p]
     for idx, part in enumerate(path_parts):
         if part in ("folders", "d") and idx + 1 < len(path_parts):
-            return path_parts[idx + 1]
+            candidate = re.split(r"[:\]\s]", path_parts[idx + 1], maxsplit=1)[0]
+            if candidate:
+                return candidate
 
     qs = parse_qs(parsed.query)
     if "id" in qs and qs["id"]:
-        return qs["id"][0]
+        return re.split(r"[:\]\s]", qs["id"][0], maxsplit=1)[0]
 
     raise ValueError(f"无法从链接中解析出有效的 Google Drive ID: {raw}")
 

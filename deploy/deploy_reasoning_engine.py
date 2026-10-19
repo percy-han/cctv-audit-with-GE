@@ -1273,6 +1273,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"🧹 Removing duplicate ReasoningEngine {stale_re}...")
                 _call("DELETE", f"https://{host}/v1/{stale_re}", project_id=args.project_id, ignore_errors=True)
     elif args.cmd == "bind-ge":
+        _call("GET", reasoning_engine_url(args.reasoning_engine), project_id=args.project_id)
         _bind_from_args(args, args.reasoning_engine)
     elif args.cmd == "list":
         res = _call("GET", base, project_id=args.project_id)
