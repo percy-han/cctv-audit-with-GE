@@ -165,6 +165,7 @@ def build_reasoning_engine_body(
     company_name: str = "",
     tenant_label: str = "",
     gcs_sop_uri: str = "",
+    agent_display_name: str = "",
 ) -> dict[str, Any]:
     if not display_name:
         raise ValueError("display_name is required: it is how this stack's ReasoningEngine is found again")
@@ -178,6 +179,8 @@ def build_reasoning_engine_body(
         {"name": "KEEPALIVE_HOLD_SECONDS", "value": "25"},
         {"name": "ENABLE_BACKGROUND_WATCHDOG", "value": "false"},
     ]
+    if agent_display_name:
+        env_list.append({"name": "AGENT_DISPLAY_NAME", "value": agent_display_name})
     if staging_bucket:
         env_list.append({"name": "STAGING_BUCKET", "value": staging_bucket})
     # Terraform-seeded gs://<workspace_bucket>/sop/master_sheet.xlsx (Zero-GWS / GCS-mode SOP source).
@@ -475,9 +478,9 @@ def ensure_gemini_enterprise_and_bind_agent(
     agent_payload = {
         "displayName": agent_display_name,
         "description": (
-            f"负责{tenant_label}门店 CCTV 监控视频 SOP 合规稽核。当督导发送 Google Drive 监控视频文件夹链接时，"
-            "先执行零 Token 分辨率(>=720P)与时长预检；督导回复「确认开始」后，调度 Cloud Run 弹性算力池与 "
-            "gemini-3.8-flash (global agentic) 分析视频，自动在原 Drive 文件夹生成 20 秒违规证据切片与双页签复核 Sheet。"
+            f"负责{tenant_label}门店 CCTV 监控视频 SOP 合规稽核。使用时请在 GE 对话框 @{agent_display_name}（或在左侧选中本 Agent）："
+            "日常完整稽核请输入「请帮忙稽核视频，<视频文件夹链接>」；特定 SOP 专项抽检或新 SOP 测试请先在总控表 Tab4_专项测试表 更新规则，"
+            "再点击【仅测 Tab4_专项测试表】气泡并粘贴链接。"
         ),
         "adkAgentDefinition": {
             "provisionedReasoningEngine": {
@@ -494,8 +497,8 @@ def ensure_gemini_enterprise_and_bind_agent(
             {"text": "查询我刚才提交的稽核任务进度"},
         ],
         "customPlaceholderText": (
-            "如果想完整稽核整个视频，请在提示词中输入「请帮忙稽核视频，<视频链接>」；"
-            "专项抽检或测试新SOP请点击【仅测 Tab4_专项测试表】气泡"
+            f"请确认已选中或 @{agent_display_name}：完整稽核整个视频请输入「@{agent_display_name} 请帮忙稽核视频，<视频链接>」；"
+            "专项抽检或测新SOP请点【仅测 Tab4_专项测试表】气泡"
         ),
     }
 
@@ -1088,6 +1091,7 @@ def main(argv: list[str] | None = None) -> int:
             company_name=args.ge_company_name,
             tenant_label=args.ge_tenant_label,
             gcs_sop_uri=args.gcs_sop_uri,
+            agent_display_name=args.ge_agent_display_name,
         )
         # This stack's engine (by display name, owned by its service account) is PATCHed in place.
         existing_list = _call("GET", base, project_id=args.project_id).get("reasoningEngines", [])

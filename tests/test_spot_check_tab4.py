@@ -48,7 +48,19 @@ def test_detect_spot_check_tab_strictly_inspects_latest_user_utterance() -> None
     )
     assert (
         detect_spot_check_tab(
+            "@CHAGEE 门店视频 AI 稽核专家 请帮忙稽核视频：https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
+        )
+        == ""
+    )
+    assert (
+        detect_spot_check_tab(
             "【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频：https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
+        )
+        == TAB4_SPOT_CHECK_TITLE
+    )
+    assert (
+        detect_spot_check_tab(
+            "@CHAGEE 门店视频 AI 稽核专家 【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频：https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
         )
         == TAB4_SPOT_CHECK_TITLE
     )
@@ -61,7 +73,7 @@ def test_detect_spot_check_tab_strictly_inspects_latest_user_utterance() -> None
     multi_turn = (
         "[user] 【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频：<历史链接>\n"
         "[assistant] ⚠️ 【当前为专项抽检 / 新 SOP 测试模式（非全量稽核）】\n"
-        "[user] 请帮忙稽核视频，https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
+        "[user] @CHAGEE 门店视频 AI 稽核专家 请帮忙稽核视频，https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
     )
     assert detect_spot_check_tab(multi_turn) == ""
 
@@ -88,6 +100,7 @@ def test_classify_turn_populates_target_prompt_tab_and_anti_confusion_fallback()
 
         d_unclear = await classify_turn_with_llm("")
         assert d_unclear.action == TurnAction.UNCLEAR
+        assert "@CHAGEE 门店视频 AI 稽核专家" in d_unclear.reply_summary
         assert "请帮忙稽核视频" in d_unclear.reply_summary
         assert "Tab4_专项测试表" in d_unclear.reply_summary
 
@@ -96,6 +109,7 @@ def test_classify_turn_populates_target_prompt_tab_and_anti_confusion_fallback()
             "我忘了贴链接",
         )
         assert d_missing_url.action == TurnAction.UNCLEAR
+        assert "@CHAGEE 门店视频 AI 稽核专家" in d_missing_url.reply_summary
         assert "请帮忙稽核视频" in d_missing_url.reply_summary
         assert "Tab4_专项测试表" in d_missing_url.reply_summary
 
@@ -300,7 +314,15 @@ def test_two_step_spot_check_preflight_confirm_and_worker_execute(tmp_path: Path
         assert job_spot.active_prompt_version == "Tab4_专项测试表[B4]"
         assert job_spot.preflight_report is not None
         assert "【当前为专项抽检 / 新 SOP 测试模式（非全量稽核）】" in job_spot.preflight_report.message_to_user
-        assert "请帮忙稽核视频" in job_spot.preflight_report.message_to_user
+        assert f"@{config.agent_display_name} 请帮忙稽核视频" in job_spot.preflight_report.message_to_user
+
+        monkeypatch.setattr(config, "agent_display_name", "Custom Tenant 稽核专家")
+        custom_unclear = verify_url_verbatim(
+            TurnDecision(action=TurnAction.INSPECT, drive_url="https://not-present.example/folder"),
+            "请帮我稽核视频",
+        )
+        assert "@Custom Tenant 稽核专家" in custom_unclear.reply_summary
+        monkeypatch.setattr(config, "agent_display_name", "CHAGEE 门店视频 AI 稽核专家")
 
         job_full = await svc.preflight(
             user_id="sup@chagee.com",

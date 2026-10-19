@@ -56,7 +56,7 @@ variable "vertex_model_location" {
 }
 
 # ---- Name overrides. Empty = derived from name_prefix. Only for adopting names that existed before
-# ---- name_prefix did (see the first environment's <env>.tfvars); new stacks leave them empty.
+# ---- name_prefix did (see study-project-496907.tfvars); new stacks leave them empty.
 
 variable "artifact_repository_id" {
   description = "Image repository ID (created by bootstrap/; must equal its artifact_repository_id). Empty = <name_prefix>-images."
@@ -571,6 +571,10 @@ resource "google_cloud_run_v2_service" "cctv_audit_worker" {
         value = local.worker_job_name
       }
       env {
+        name  = "AGENT_DISPLAY_NAME"
+        value = local.ge_agent_display_name
+      }
+      env {
         name  = "ENABLE_BACKGROUND_WATCHDOG"
         value = "false"
       }
@@ -694,6 +698,10 @@ resource "google_cloud_run_v2_job" "cctv_audit_job_worker" {
         env {
           name  = "CLOUD_RUN_WORKER_URL"
           value = "https://${local.worker_service_name}-${data.google_project.current.number}.${var.region}.run.app"
+        }
+        env {
+          name  = "AGENT_DISPLAY_NAME"
+          value = local.ge_agent_display_name
         }
         env {
           name  = "ENABLE_BACKGROUND_WATCHDOG"

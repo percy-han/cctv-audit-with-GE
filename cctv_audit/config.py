@@ -141,6 +141,10 @@ class AuditConfig(BaseModel):
     local_work_dir: Path = Field(
         default_factory=lambda: Path(os.environ.get("LOCAL_WORK_DIR", "/tmp/chagee_audit"))
     )
+    agent_display_name: str = Field(
+        default_factory=lambda: os.environ.get("AGENT_DISPLAY_NAME", "CHAGEE 门店视频 AI 稽核专家").strip()
+        or "CHAGEE 门店视频 AI 稽核专家"
+    )
 
     @field_validator("master_prompt_sheet_id", mode="before")
     @classmethod

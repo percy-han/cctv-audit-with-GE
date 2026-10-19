@@ -117,6 +117,7 @@ def verify_url_verbatim(decision: TurnDecision, raw_conversation_text: str) -> T
     if decision.action == TurnAction.INSPECT:
         candidate = (decision.drive_url or "").strip()
         if not candidate or candidate not in raw_conversation_text:
+            agent_handle = f"@{config.agent_display_name}"
             return TurnDecision(
                 action=TurnAction.UNCLEAR,
                 drive_url="",
@@ -124,8 +125,8 @@ def verify_url_verbatim(decision: TurnDecision, raw_conversation_text: str) -> T
                 target_prompt_tab="",
                 reply_summary=(
                     "未在您的消息中识别到有效的 Google Drive 文件夹链接或 GCS 目录。\n"
-                    "• 💡 **如果您想完整稽核整个视频（日常全量稽核）**，请输入：「`请帮忙稽核视频，<视频文件夹链接>`」\n"
-                    "• 🧪 **如果您想做专项抽检或测试新 SOP**，请先在总控表 `Tab4_专项测试表` 更新规则，再输入：「`【仅测 Tab4_专项测试表】请帮忙稽核视频，<视频文件夹链接>`」"
+                    f"• 💡 **如果您想完整稽核整个视频（日常全量稽核）**，请在 GE 对话框 `@` 本 Agent 输入：「`{agent_handle} 请帮忙稽核视频，<视频文件夹链接>`」\n"
+                    f"• 🧪 **如果您想做专项抽检或测试新 SOP**，请先在总控表 `Tab4_专项测试表` 更新规则，再 `@` 本 Agent（或点击【仅测 Tab4_专项测试表】气泡）输入：「`{agent_handle} 【仅测 Tab4_专项测试表】请帮忙稽核视频，<视频文件夹链接>`」"
                 ),
             )
         return decision.model_copy(
@@ -141,12 +142,13 @@ async def classify_turn_with_llm(
     """Uses Gemini structured output (`TurnDecision` schema) to route the user's natural language turn."""
     cleaned = (conversation_text or "").strip()
     if not cleaned:
+        agent_handle = f"@{config.agent_display_name}"
         return TurnDecision(
             action=TurnAction.UNCLEAR,
             reply_summary=(
-                "请粘贴您需要稽核的监控视频文件夹链接：\n"
-                "• 💡 **如果您想完整稽核整个视频（日常全量稽核）**，请在提示词中输入：「`请帮忙稽核视频，<视频文件夹链接>`」\n"
-                "• 🧪 **如果您想做专项抽检或测试新 SOP**，请点击【仅测 Tab4_专项测试表】气泡并贴上视频文件夹链接。"
+                f"请先在 Gemini Enterprise 对话框确认已选中或 `{agent_handle}`，并粘贴您需要稽核的监控视频文件夹链接：\n"
+                f"• 💡 **如果您想完整稽核整个视频（日常全量稽核）**，请在提示词中输入：「`{agent_handle} 请帮忙稽核视频，<视频文件夹链接>`」\n"
+                f"• 🧪 **如果您想做专项抽检或测试新 SOP**，请点击【仅测 Tab4_专项测试表】气泡（或 `{agent_handle}`）并贴上视频文件夹链接。"
             ),
         )
 

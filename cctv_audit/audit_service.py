@@ -198,7 +198,7 @@ class AuditService:
                     videos=[],
                     message_to_user=(
                         f"❌ 专项抽检 / 新 SOP 测试预检未通过（预检单号 `{job.job_id}`，本次 0 Token 消耗）：{exc}\n"
-                        f"• 💡 如果您本意是做**完整的日常全量稽核**，请直接发送：「`请帮忙稽核视频，{drive_url}`」"
+                        f"• 💡 如果您本意是做**完整的日常全量稽核**，请在 GE 对话框 `@` 稽核 Agent 直接发送：「`@CHAGEE 门店视频 AI 稽核专家 请帮忙稽核视频，{drive_url}`」"
                     ),
                 )
                 job = job.model_copy(
@@ -231,7 +231,7 @@ class AuditService:
                 mode_banner = (
                     f"⚠️ **【当前为专项抽检 / 新 SOP 测试模式（非全量稽核）】**\n"
                     f"• 🧪 **锁定规则页签**：`{cleaned_tab}`（本次仅核查 {len(spot_cfg.rules)} 条规则：{rule_summary}；其余正式 SOP 条款本次不执行）\n"
-                    f"• 💡 **防误触提示**：如果您本意是做**完整的日常全量稽核**，请勿确认，直接重新发送：「`请帮忙稽核视频，{drive_url}`」\n\n"
+                    f"• 💡 **防误触提示**：如果您本意是做**完整的日常全量稽核**，请勿确认，直接在 GE 对话框 `@` 稽核 Agent 重新发送：「`@{config.agent_display_name} 请帮忙稽核视频，{drive_url}`」\n\n"
                 )
                 inspect_res = inspect_res.model_copy(
                     update={"message_to_user": mode_banner + inspect_res.message_to_user}

@@ -10,6 +10,7 @@ from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event
 from google.genai import types
 
+from .config import config
 from .server import audit_service
 from .turn import detect_spot_check_tab
 
@@ -38,11 +39,12 @@ class ChageeCctvAuditAdkAgent(BaseAgent):
                 else f"Job {job.job_id}: {job.state.value}"
             )
         else:
+            agent_handle = f"@{config.agent_display_name}"
             reply = (
-                "请粘贴您的 Google Drive 监控视频文件夹链接（如 `https://drive.google.com/drive/folders/...`）或 GCS 目录（如 `gs://存储桶/门店目录`），"
+                f"请先在 Gemini Enterprise 对话框确认已选中或 `{agent_handle}`，并粘贴您的 Google Drive 监控视频文件夹链接（如 `https://drive.google.com/drive/folders/...`）或 GCS 目录（如 `gs://存储桶/门店目录`），"
                 "系统将先执行 `<720P` 分辨率秒级预检与 Token 估算。\n"
-                "• 💡 **如果您想完整稽核整个视频（日常全量稽核）**，请输入：「`请帮忙稽核视频，<视频文件夹链接>`」\n"
-                "• 🧪 **如果您想做专项抽检或测试新 SOP**，请先在总控表 `Tab4_专项测试表` 更新规则，再输入：「`【仅测 Tab4_专项测试表】请帮忙稽核视频，<视频文件夹链接>`」"
+                f"• 💡 **如果您想完整稽核整个视频（日常全量稽核）**，请输入：「`{agent_handle} 请帮忙稽核视频，<视频文件夹链接>`」\n"
+                f"• 🧪 **如果您想做专项抽检或测试新 SOP**，请先在总控表 `Tab4_专项测试表` 更新规则，再输入：「`{agent_handle} 【仅测 Tab4_专项测试表】请帮忙稽核视频，<视频文件夹链接>`」"
             )
 
         yield Event(
