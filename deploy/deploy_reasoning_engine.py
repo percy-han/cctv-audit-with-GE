@@ -488,11 +488,15 @@ def ensure_gemini_enterprise_and_bind_agent(
         "languageCode": "zh-CN",
         "sharingConfig": {"scope": "ALL_USERS"},
         "starterPrompts": [
-            {"text": f"帮我预检这个门店监控 Google Drive 文件夹：{folder_example}"},
+            {"text": f"请帮忙稽核视频：{folder_example}"},
+            {"text": f"【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频：{folder_example}"},
             {"text": "确认开始稽核"},
             {"text": "查询我刚才提交的稽核任务进度"},
         ],
-        "customPlaceholderText": "粘贴 Google Drive 门店监控文件夹链接启动预检，或输入「确认开始」「查询进度」",
+        "customPlaceholderText": (
+            "如果想完整稽核整个视频，请在提示词中输入「请帮忙稽核视频，<视频链接>」；"
+            "专项抽检或测试新SOP请点击【仅测 Tab4_专项测试表】气泡"
+        ),
     }
 
     engine_cache: dict[str, dict[str, Any]] = {}

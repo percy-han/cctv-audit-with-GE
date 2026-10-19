@@ -1108,9 +1108,12 @@ class GcsStorageGateway:
         tab2_rows: List,
         *,
         reuse_suffix: str = "",
+        audited_rule_ids: Optional[Sequence[str]] = None,
     ) -> Tuple[str, str]:
         """Writes the dual-tab `.xlsx` report into the prefix, preserving historical rows from
         previously audited videos in the same folder (Method 1: Same-Sheet Smart Append).
+        When `audited_rule_ids` is non-empty (`Tab4_专项测试表` spot-check), preserves existing rows
+        for other SOP rules on the same video.
         """
         bucket, prefix = parse_gcs_uri(parent_folder_id)
         _assert_not_internal_state_prefix(bucket, prefix)
@@ -1122,6 +1125,16 @@ class GcsStorageGateway:
             for r in (*tab1_rows, *tab2_rows)
             if str(getattr(r, "video_filename", "")).strip()
         }
+        scoped_rules = {
+            str(r).strip().upper()
+            for r in (audited_rule_ids or [])
+            if str(r).strip()
+        }
+        current_prompt_versions = {
+            str(getattr(r, "prompt_version_used", "")).strip()
+            for r in tab2_rows
+            if str(getattr(r, "prompt_version_used", "")).strip()
+        }
 
         def _write() -> Tuple[str, str]:
             kept_tab1_rows: List[List[Any]] = []
@@ -1132,10 +1145,11 @@ class GcsStorageGateway:
                     if ex_status == 200 and ex_body:
                         ex_sheets = read_xlsx_sheets(ex_body)
                         for raw_row in (ex_sheets.get(TAB1_TITLE) or [])[1:]:
-                            if (
-                                len(raw_row) > 1
-                                and str(raw_row[1]).strip()
-                                and str(raw_row[1]).strip() not in audited_video_filenames
+                            row_video = str(raw_row[1]).strip() if len(raw_row) > 1 else ""
+                            row_rule = str(raw_row[3]).strip().upper() if len(raw_row) > 3 else ""
+                            if row_video and (
+                                row_video not in audited_video_filenames
+                                or (bool(scoped_rules) and row_rule not in scoped_rules)
                             ):
                                 padded = [str(c) for c in raw_row[:11]] + [""] * max(0, 11 - len(raw_row))
                                 try:
@@ -1144,10 +1158,15 @@ class GcsStorageGateway:
                                     padded[6] = 0.0
                                 kept_tab1_rows.append(padded)
                         for raw_row in (ex_sheets.get(TAB2_TITLE) or [])[1:]:
-                            if (
-                                len(raw_row) > 2
-                                and str(raw_row[2]).strip()
-                                and str(raw_row[2]).strip() not in audited_video_filenames
+                            row_video2 = str(raw_row[2]).strip() if len(raw_row) > 2 else ""
+                            row_prompt2 = str(raw_row[6]).strip() if len(raw_row) > 6 else ""
+                            if row_video2 and (
+                                row_video2 not in audited_video_filenames
+                                or (
+                                    bool(scoped_rules)
+                                    and bool(current_prompt_versions)
+                                    and row_prompt2 not in current_prompt_versions
+                                )
                             ):
                                 padded2: List[Any] = [str(c) for c in raw_row[:15]] + [""] * max(
                                     0, 15 - len(raw_row)
@@ -1350,9 +1369,15 @@ class RoutingStorageGateway:
         tab2_rows: List,
         *,
         reuse_suffix: str = "",
+        audited_rule_ids: Optional[Sequence[str]] = None,
     ) -> Tuple[str, str]:
         return await self._for(parent_folder_id).create_dual_tab_report_sheet(
-            parent_folder_id, title, tab1_rows, tab2_rows, reuse_suffix=reuse_suffix
+            parent_folder_id,
+            title,
+            tab1_rows,
+            tab2_rows,
+            reuse_suffix=reuse_suffix,
+            audited_rule_ids=audited_rule_ids,
         )
 
     async def read_report_sheet_data(

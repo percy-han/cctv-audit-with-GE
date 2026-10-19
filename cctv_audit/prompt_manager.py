@@ -183,6 +183,23 @@ DEFAULT_TAB3_SAMPLE_ROW: tuple[str, ...] = (
     "默认示例（未启动；选择 START_EVAL 后将在 15 分钟内自动执行）",
 )
 
+TAB4_SPOT_CHECK_TITLE = "Tab4_专项测试表"
+DEFAULT_TAB4_SAMPLE_ROW: tuple[str, ...] = (
+    "B4",
+    "B4 · 红边毛巾（参数表 3.1）",
+    "【B】制冰机与冰块管理（Week 2 主模块 + 常态冰铲检查）",
+    "RED_LINE",
+    "presence",
+    "FALSE",
+    (
+        "擦拭制冰机内腔、布水管、挡水帘与白色门板内壁时，必须使用**从专用贴标消毒桶中随用随取的干净红边毛巾**；\n"
+        "- 🔴 毛巾未从专用贴标消毒桶取用（如随手放在水槽边、台面、设备顶或水龙头上反复使用）→ 红线违规；\n"
+        "- 🔴 红、蓝、黄三色毛巾混用（如用蓝边吧台毛巾或黄边器具毛巾擦拭制冰机内胆）→ 红线违规。"
+    ),
+    "从专用贴标消毒桶随用随取干净红边毛巾擦拭制冰机内腔，三色毛巾严格分区不混用",
+    "毛巾未从专用消毒桶取用（随手放置台面/水槽边复用）或红/蓝/黄三色毛巾混用",
+)
+
 
 class ScheduledEvalRule(BaseModel):
     """One row from `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) in the Master SOP Sheet."""
@@ -982,6 +999,7 @@ def render_v25_system_instruction(
     rules: List[SopRuleItem],
     visual_scan_targets: Optional[List[VisualScanTarget]] = None,
     layer1_template: Optional[str] = None,
+    is_spot_check: bool = False,
 ) -> str:
     """Renders 100% verbatim the canonical `CHAGEE_CCTV_Cloud_Auditor_Prompt_v1.0` with dynamic Sheet rules."""
     # Group rules by category (`【A】...`, `【B】...`, `【C】...`, `【D】...`) to preserve exact markdown hierarchy
@@ -996,6 +1014,18 @@ def render_v25_system_instruction(
                     "> 以下每一项都必须在报告中显式给出「已核查·未发现」或具体违规，**不得省略**。\n"
                 )
         grouped_blocks.append(f"### {r.name}\n{r.check_instruction}\n")
+
+    if is_spot_check or (prompt_version or "").strip() == TAB4_SPOT_CHECK_TITLE:
+        allowed_ids = "、".join(f"`{r.rule_id}`" for r in rules if r.rule_id) or "`无`"
+        grouped_blocks.insert(
+            0,
+            (
+                "> ⚠️ **【专项抽检 / 新 SOP 测试范围锁定（Scope Lock）】**\n"
+                f"> 本次运行在 `{TAB4_SPOT_CHECK_TITLE}` 专项测试模式下，**仅核查下方列出的 {len(rules)} 条指定规则（{allowed_ids}）**。\n"
+                "> - 请100%严格执行「步骤 0 时间轴校准」、「步骤 1 人员建档与多人独立追踪」、「步骤 2 视觉判定规则」与「步骤 4 漏检自查」，确保不漏检、不产生时间漂移；\n"
+                f"> - **严禁上报不在本次专项清单（{allowed_ids}）内的其他任何 SOP 条款**；输出 JSON 的 `findings` 数组中所有记录的 `rule_id` 必须严格属于 `{allowed_ids}`。\n"
+            ),
+        )
 
     step3_checklist_md = "\n".join(grouped_blocks).strip()
     tpl = layer1_template if layer1_template is not None else DEFAULT_LAYER1_TEMPLATE
@@ -1683,8 +1713,11 @@ def build_master_sheet_validation_requests(
                 }
             )
 
-    # 2. Prompt_* tabs: severity (D), detection_type (E), requires_full_context (F)
-    for p_title in discovered_prompt_tabs:
+    # 2. Prompt_* tabs + Tab4_专项测试表: severity (D), detection_type (E), requires_full_context (F)
+    rule_table_tabs = list(discovered_prompt_tabs)
+    if TAB4_SPOT_CHECK_TITLE in title_to_id and TAB4_SPOT_CHECK_TITLE not in rule_table_tabs:
+        rule_table_tabs.append(TAB4_SPOT_CHECK_TITLE)
+    for p_title in rule_table_tabs:
         p_sid = title_to_id[p_title]
         requests.extend(
             [
@@ -1988,6 +2021,7 @@ class GoogleSheetsConfigClient:
     TAB0_TITLE = "Tab0_版本总控与回滚开关"
     TAB2_SCHEDULED_TITLE = TAB2_SCHEDULED_TITLE
     TAB3_EVAL_TITLE = TAB3_EVAL_TITLE
+    TAB4_SPOT_CHECK_TITLE = TAB4_SPOT_CHECK_TITLE
 
     def __init__(self, gcs_gateway: Optional[object] = None) -> None:
         # Zero-GWS: `gs://` sheet IDs are read from GCS (`GcsStorageGateway.download_object_bytes`).
@@ -2299,6 +2333,35 @@ class GoogleSheetsConfigClient:
                         body={"values": migrated_t3},
                     ).execute(num_retries=3)
 
+            if self.TAB4_SPOT_CHECK_TITLE not in tab_titles:
+                svc.spreadsheets().batchUpdate(
+                    spreadsheetId=sheet_id,
+                    body={
+                        "requests": [
+                            {
+                                "addSheet": {
+                                    "properties": {
+                                        "title": self.TAB4_SPOT_CHECK_TITLE,
+                                        "gridProperties": {"frozenRowCount": 1},
+                                    }
+                                }
+                            }
+                        ]
+                    },
+                ).execute(num_retries=3)
+                svc.spreadsheets().values().update(
+                    spreadsheetId=sheet_id,
+                    range=f"'{self.TAB4_SPOT_CHECK_TITLE}'!A1",
+                    valueInputOption="RAW",
+                    body={
+                        "values": [
+                            list(SHEET_RULE_HEADER),
+                            list(DEFAULT_TAB4_SAMPLE_ROW),
+                        ]
+                    },
+                ).execute(num_retries=3)
+                meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute(num_retries=3)
+
             reqs = build_master_sheet_validation_requests(meta)
             if reqs:
                 svc.spreadsheets().batchUpdate(
@@ -2313,6 +2376,7 @@ class GoogleSheetsConfigClient:
                 _VALID_SHEET_CACHE.add(sheet_id)
                 _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB2_SCHEDULED_TITLE}!A1:I200", None)
                 _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB3_EVAL_TITLE}!A1:J200", None)
+                _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB4_SPOT_CHECK_TITLE}!A1:I100", None)
             return ok
         except Exception as exc:
             logger.warning(
@@ -2574,45 +2638,101 @@ class PromptManager:
     async def load_config_for_tab(
         self,
         prompt_tab_name: str,
-        model_version: str,
+        model_version: str = "",
         sheet_id: Optional[str] = None,
+        *,
+        probe_model: bool = True,
     ) -> PromptModelConfig:
-        """Loads a specific `Prompt_*` tab and `model_version` directly from the Master SOP Sheet.
+        """Loads a specific `Prompt_*` tab or `Tab4_专项测试表` and `model_version` directly from the Master SOP Sheet.
 
-        Used by `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) so customer-created `Prompt_*`
-        tabs in Google Sheets can be evaluated without requiring a local `eval/rounds/` directory.
+        Used by `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) and `[Tab 4: 专项测试表]` (`Tab4_专项测试表`).
+        When `model_version` is omitted/empty, inherits `Active_Model_Version` / `Fallback_Model_Version`
+        from `[Tab 0]` so spot-checks and new-SOP tests automatically run on the active production model.
         """
         target_sheet_id = self._resolve_target_sheet_id(sheet_id)
         clean_tab = (prompt_tab_name or "").strip()
-        clean_model = (model_version or "").strip() or config.fallback_model_version
+        clean_model = (model_version or "").strip()
+        fallback_model_ver = config.fallback_model_version
         scan_targets, bundled_rules = await asyncio.to_thread(load_rules_from_yaml, self._yaml_path)
 
         rules: List[SopRuleItem] = []
         if target_sheet_id and self._sheet_client is not None:
-            tab_rules = await asyncio.wait_for(
-                self._sheet_client.read_prompt_tab_rules(target_sheet_id, clean_tab),
-                timeout=15.0,
-            )
+            if not clean_model:
+                try:
+                    pointers = await asyncio.wait_for(
+                        self._sheet_client.read_tab0_pointers(target_sheet_id),
+                        timeout=10.0,
+                    )
+                    clean_model = (
+                        pointers.get("Active_Model_Version")
+                        or pointers.get("Fallback_Model_Version")
+                        or config.fallback_model_version
+                    )
+                    fallback_model_ver = (
+                        pointers.get("Fallback_Model_Version") or config.fallback_model_version
+                    )
+                except Exception as exc:
+                    logger.warning("Could not read Tab0 model pointers for %s: %s", clean_tab, exc)
+                    clean_model = config.fallback_model_version
+            if clean_tab == TAB4_SPOT_CHECK_TITLE:
+                _SHEET_RANGE_CACHE.pop(f"{target_sheet_id}:{clean_tab}!A1:I100", None)
+            try:
+                tab_rules = await asyncio.wait_for(
+                    self._sheet_client.read_prompt_tab_rules(target_sheet_id, clean_tab),
+                    timeout=15.0,
+                )
+            except Exception as exc:
+                if clean_tab == TAB4_SPOT_CHECK_TITLE:
+                    try:
+                        await self.ensure_master_sheet_validations(sheet_id=target_sheet_id, force=True)
+                        tab_rules = await asyncio.wait_for(
+                            self._sheet_client.read_prompt_tab_rules(target_sheet_id, clean_tab),
+                            timeout=15.0,
+                        )
+                    except Exception:
+                        raise ValueError(
+                            f"无法读取总控表中的 `{clean_tab}` 分表（{exc}）。请确认总控表中存在 `{clean_tab}` 且已填写至少 1 条规则。"
+                        ) from exc
+                else:
+                    raise
             if tab_rules:
                 rules = tab_rules
         elif clean_tab == config.default_prompt_version:
             rules = bundled_rules
+        elif clean_tab == TAB4_SPOT_CHECK_TITLE:
+            rules = parse_rules_from_sheet_rows(
+                [list(SHEET_RULE_HEADER), list(DEFAULT_TAB4_SAMPLE_ROW)]
+            )
+
+        if not clean_model:
+            clean_model = config.fallback_model_version
 
         if not rules:
+            if clean_tab == TAB4_SPOT_CHECK_TITLE:
+                raise ValueError(
+                    f"总控表的 `{TAB4_SPOT_CHECK_TITLE}` 当前为空（未读取到任何有效 SOP 规则行）。"
+                    f"请先在总控表的 `{TAB4_SPOT_CHECK_TITLE}` 页签中粘贴或编写至少 1 条要抽检/测试的 SOP 规则（A列 Rule_ID 不能为空），再重新发起专项测试。"
+                )
             raise ValueError(
                 f"未在总控表中找到名为 '{clean_tab}' 的有效 SOP 规则分表（或分表内容为空）"
             )
 
-        resolved_model, model_warning = await self.resolve_and_probe_model(
-            clean_model, config.fallback_model_version
-        )
+        if probe_model:
+            resolved_model, model_warning = await self.resolve_and_probe_model(
+                clean_model, fallback_model_ver
+            )
+        else:
+            resolved_model, model_warning = clean_model, None
         sys_instruction = render_v25_system_instruction(
-            clean_tab, rules, visual_scan_targets=scan_targets
+            clean_tab,
+            rules,
+            visual_scan_targets=scan_targets,
+            is_spot_check=(clean_tab == TAB4_SPOT_CHECK_TITLE),
         )
         return PromptModelConfig(
             active_prompt_version=clean_tab,
             active_model_version=resolved_model,
-            fallback_model_version=config.fallback_model_version,
+            fallback_model_version=fallback_model_ver,
             model_fallback_warning=model_warning,
             visual_scan_targets=scan_targets,
             rules=rules,

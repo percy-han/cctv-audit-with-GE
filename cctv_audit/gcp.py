@@ -16,7 +16,7 @@ import math
 import logging
 import os
 import threading
-from typing import Any, NoReturn, Optional, List
+from typing import Any, NoReturn, Optional, List, Sequence
 
 from pathlib import Path
 
@@ -867,14 +867,28 @@ class GoogleWorkspaceGateway:
         tab2_rows: List,
         *,
         reuse_suffix: str = "",
+        audited_rule_ids: Optional[Sequence[str]] = None,
     ) -> tuple[str, str]:
         """Creates the dual-tab report Sheet in `parent_folder_id` (owned by the Workspace identity).
 
         `reuse_suffix` (e.g. `_<audit_id>`) makes a watchdog-resumed job re-publish into the Sheet it
         already created instead of leaving a duplicate. Only this job's own Sheet is ever reused --
         never an unrelated spreadsheet that happens to sit in the folder.
+        When `audited_rule_ids` is non-empty (spot-check / new SOP testing via `Tab4_专项测试表`),
+        enforces Rule-Scoped Smart Append so existing Tab 1 rows for OTHER SOP rules on the same video
+        (and Tab 2 rows from full audits) are preserved.
         """
         loop = asyncio.get_running_loop()
+        scoped_rules = {
+            str(r).strip().upper()
+            for r in (audited_rule_ids or [])
+            if str(r).strip()
+        }
+        current_prompt_versions = {
+            str(getattr(r, "prompt_version_used", "")).strip()
+            for r in tab2_rows
+            if str(getattr(r, "prompt_version_used", "")).strip()
+        }
 
         def _create_or_update() -> tuple[str, str]:
             drive = self._drive_service()
@@ -997,10 +1011,11 @@ class GoogleWorkspaceGateway:
                             .execute(num_retries=3)
                         )
                         for raw_row in res1.get("values", []) or []:
-                            if (
-                                len(raw_row) > 1
-                                and str(raw_row[1]).strip()
-                                and str(raw_row[1]).strip() not in audited_video_filenames
+                            row_video = str(raw_row[1]).strip() if len(raw_row) > 1 else ""
+                            row_rule = str(raw_row[3]).strip().upper() if len(raw_row) > 3 else ""
+                            if row_video and (
+                                row_video not in audited_video_filenames
+                                or (bool(scoped_rules) and row_rule not in scoped_rules)
                             ):
                                 padded = [str(c) for c in raw_row[:11]] + [""] * max(0, 11 - len(raw_row))
                                 try:
@@ -1016,10 +1031,15 @@ class GoogleWorkspaceGateway:
                             .execute(num_retries=3)
                         )
                         for raw_row in res2.get("values", []) or []:
-                            if (
-                                len(raw_row) > 2
-                                and str(raw_row[2]).strip()
-                                and str(raw_row[2]).strip() not in audited_video_filenames
+                            row_video2 = str(raw_row[2]).strip() if len(raw_row) > 2 else ""
+                            row_prompt2 = str(raw_row[6]).strip() if len(raw_row) > 6 else ""
+                            if row_video2 and (
+                                row_video2 not in audited_video_filenames
+                                or (
+                                    bool(scoped_rules)
+                                    and bool(current_prompt_versions)
+                                    and row_prompt2 not in current_prompt_versions
+                                )
                             ):
                                 padded2: List[Any] = [str(c) for c in raw_row[:15]] + [""] * max(
                                     0, 15 - len(raw_row)

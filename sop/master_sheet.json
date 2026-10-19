@@ -937,6 +937,33 @@
      "默认示例（未启动；选择 START_EVAL 后将在 15 分钟内自动执行）"
     ]
    ]
+  },
+  {
+   "title": "Tab4_专项测试表",
+   "values": [
+    [
+     "条款编号 (Rule_ID)",
+     "条款名称 (Rule_Name)",
+     "所属模块 (Category)",
+     "严重等级 (Severity: RED_LINE/NORMAL)",
+     "核查模式 (Check_Mode: presence/absence)",
+     "是否跨切片接力 (Requires_Carryover: TRUE/FALSE)",
+     "AI多模态核查指令 (Check_Instruction - 可直接编辑调优)",
+     "合规放行标准 (Pass_Criteria)",
+     "违规抓拍标准 (Fail_Criteria)"
+    ],
+    [
+     "B4",
+     "B4 · 三色毛巾、消毒桶取用起点溯源与四周边框擦拭（专项抽检与新 SOP 测试示例）",
+     "【B】制冰机周清洁（专项抽检测试）",
+     "RED_LINE",
+     "presence",
+     "FALSE",
+     "凡观察到员工持毛巾擦拭制冰机内腔、布水管、舱门内壁、白色外盖门板（white cover）或挡水帘（water curtain），必须向前逆推 5 秒核查该毛巾是否从盛有消毒液的专用贴标消毒桶（sanitizing bucket）中取出，并核查擦拭白色外盖门板与挡水帘时是否完整覆盖正反面与四周侧面边缘（sides of white cover）。",
+     "全程使用从专用贴标消毒桶中取出的干净红边毛巾擦拭制冰机内腔与可拆件，并完整擦拭四周侧面边缘",
+     "未使用从专用消毒桶中取出的干净红边毛巾擦拭制冰机、漏擦白色外盖或挡水帘四周侧面边缘、或三色毛巾混用"
+    ]
+   ]
   }
  ]
 }

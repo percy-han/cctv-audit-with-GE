@@ -11,6 +11,7 @@ from google.adk.events import Event
 from google.genai import types
 
 from .server import audit_service
+from .turn import detect_spot_check_tab
 
 
 class ChageeCctvAuditAdkAgent(BaseAgent):
@@ -29,6 +30,7 @@ class ChageeCctvAuditAdkAgent(BaseAgent):
                 user_id=user_email,
                 drive_url=user_text,
                 session_id=ctx.session.id if ctx.session else "local",
+                target_prompt_tab=detect_spot_check_tab(user_text),
             )
             reply = (
                 job.preflight_report.message_to_user
@@ -38,7 +40,9 @@ class ChageeCctvAuditAdkAgent(BaseAgent):
         else:
             reply = (
                 "请粘贴您的 Google Drive 监控视频文件夹链接（如 `https://drive.google.com/drive/folders/...`）或 GCS 目录（如 `gs://存储桶/门店目录`），"
-                "系统将先执行 `<720P` 分辨率秒级预检与 Token 估算。"
+                "系统将先执行 `<720P` 分辨率秒级预检与 Token 估算。\n"
+                "• 💡 **如果您想完整稽核整个视频（日常全量稽核）**，请输入：「`请帮忙稽核视频，<视频文件夹链接>`」\n"
+                "• 🧪 **如果您想做专项抽检或测试新 SOP**，请先在总控表 `Tab4_专项测试表` 更新规则，再输入：「`【仅测 Tab4_专项测试表】请帮忙稽核视频，<视频文件夹链接>`」"
             )
 
         yield Event(

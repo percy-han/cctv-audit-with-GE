@@ -136,6 +136,20 @@ class AuditJob(BaseModel):
             "supervisor fixes the setup and replies 确认开始, which clears the flag."
         ),
     )
+    target_prompt_tab: str = Field(
+        default="",
+        description=(
+            "Optional fixed Prompt tab override (e.g. 'Tab4_专项测试表' for targeted SOP spot-check "
+            "or new SOP rule testing without modifying Tab0)."
+        ),
+    )
+    audited_rule_ids: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Explicit list of SOP rule IDs audited when running a spot-check tab (`target_prompt_tab`), "
+            "used for Rule-Scoped Same-Sheet Smart Append so other SOP rules' rows on the same video are preserved."
+        ),
+    )
 
     @property
     def is_terminal(self) -> bool:

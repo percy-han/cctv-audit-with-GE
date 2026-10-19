@@ -18,7 +18,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import httpx
 from pydantic import BaseModel, Field
@@ -87,6 +87,7 @@ class WorkspaceDriveSheetsGatewayProtocol(Protocol):
         tab2_rows: List[TokenLedgerRow],
         *,
         reuse_suffix: str = "",
+        audited_rule_ids: Optional[Sequence[str]] = None,
     ) -> tuple[str, str]: ...
     async def read_report_sheet_data(
         self, folder_id: str, report_sheet_url: str = ""
@@ -165,6 +166,7 @@ class WorkspaceReporter:
         findings_by_video: List[tuple[str, List[Finding]]],
         ledger_rows: List[TokenLedgerRow],
         suppress_notification: bool = False,
+        audited_rule_ids: Optional[Sequence[str]] = None,
     ) -> AuditReportArtifact:
         """Creates `Evidence/` subfolder + Dual-Tab Google Sheet inside `parent_folder_id` and notifies user."""
         sheet_title = REPORT_SHEET_TITLE
@@ -210,15 +212,30 @@ class WorkspaceReporter:
             )
 
         if self._gateway is not None:
-            sheet_id, sheet_url = await asyncio.wait_for(
-                self._gateway.create_dual_tab_report_sheet(
-                    parent_folder_id,
-                    sheet_title,
-                    all_tab1_rows,
-                    ledger_rows,
-                ),
-                timeout=60.0,
-            )
+            sheet_kwargs: Dict[str, Any] = {}
+            if audited_rule_ids:
+                sheet_kwargs["audited_rule_ids"] = list(audited_rule_ids)
+            try:
+                sheet_id, sheet_url = await asyncio.wait_for(
+                    self._gateway.create_dual_tab_report_sheet(
+                        parent_folder_id,
+                        sheet_title,
+                        all_tab1_rows,
+                        ledger_rows,
+                        **sheet_kwargs,
+                    ),
+                    timeout=60.0,
+                )
+            except TypeError:
+                sheet_id, sheet_url = await asyncio.wait_for(
+                    self._gateway.create_dual_tab_report_sheet(
+                        parent_folder_id,
+                        sheet_title,
+                        all_tab1_rows,
+                        ledger_rows,
+                    ),
+                    timeout=60.0,
+                )
         else:
             sheet_id = f"sheet_{audit_id}"
             sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"

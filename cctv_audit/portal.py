@@ -26,7 +26,7 @@ from pathlib import Path
 import re
 import time
 import urllib.parse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .agentic_auditor import Status
 from .config import config
@@ -250,56 +250,115 @@ _DEFAULT_RECTIFICATION_BY_RULE: Dict[str, str] = {
 }
 
 
-def load_sop_catalog() -> List[Dict[str, str]]:
-    """Loads the built-in 24-rule SOP catalog from `sop/master_sheet.json` or `DEFAULT_CHAGEE_V25_RULES`."""
+def load_sop_catalog(extra_rules: Optional[Sequence[Any]] = None) -> List[Dict[str, str]]:
+    """Loads the built-in 24-rule SOP catalog from `sop/master_sheet.json` or `DEFAULT_CHAGEE_V25_RULES`,
+    merging any custom/spot-check rules from `Tab4_专项测试表` or `extra_rules` by `rule_id`.
+    """
+    from .prompt_manager import DEFAULT_CHAGEE_V25_RULES, TAB4_SPOT_CHECK_TITLE
+
     sop_path = Path(__file__).resolve().parent.parent / "sop" / "master_sheet.json"
-    rules: List[Dict[str, str]] = []
+    rules_by_id: Dict[str, Dict[str, str]] = {}
     if sop_path.exists():
         try:
             doc = json.loads(sop_path.read_text(encoding="utf-8"))
-            for tab in doc.get("tabs", []):
+            tabs = doc.get("tabs", [])
+            for tab in tabs:
                 if str(tab.get("title") or "").startswith("Prompt_"):
                     values = tab.get("values") or []
                     for row in values[1:]:
                         if len(row) >= 9 and str(row[0]).strip():
                             rid = str(row[0]).strip()
-                            rules.append(
-                                {
+                            rules_by_id[rid] = {
+                                "rule_id": rid,
+                                "name": str(row[1]).strip(),
+                                "category": str(row[2]).strip(),
+                                "severity": str(row[3]).strip() or "NORMAL",
+                                "doc_ref": _DEFAULT_DOC_REF_BY_PREFIX.get(
+                                    rid, "APAC Cloud Audit Parameters 2026 v1.0"
+                                ),
+                                "check_instruction": str(row[6]).strip(),
+                                "pass_criteria": str(row[7]).strip(),
+                                "fail_criteria": str(row[8]).strip(),
+                            }
+                    break
+            for tab in tabs:
+                if str(tab.get("title") or "").strip() == TAB4_SPOT_CHECK_TITLE:
+                    values = tab.get("values") or []
+                    for row in values[1:]:
+                        if len(row) >= 9 and str(row[0]).strip():
+                            rid = str(row[0]).strip()
+                            if rid not in rules_by_id:
+                                rules_by_id[rid] = {
                                     "rule_id": rid,
                                     "name": str(row[1]).strip(),
                                     "category": str(row[2]).strip(),
                                     "severity": str(row[3]).strip() or "NORMAL",
                                     "doc_ref": _DEFAULT_DOC_REF_BY_PREFIX.get(
-                                        rid, "APAC Cloud Audit Parameters 2026 v1.0"
+                                        rid, f"{TAB4_SPOT_CHECK_TITLE} · 专项抽检与新 SOP 测试"
                                     ),
                                     "check_instruction": str(row[6]).strip(),
                                     "pass_criteria": str(row[7]).strip(),
                                     "fail_criteria": str(row[8]).strip(),
                                 }
-                            )
-                    break
         except Exception as exc:
             logger.warning("Failed to read sop/master_sheet.json: %s", exc)
-    if not rules:
-        from .prompt_manager import DEFAULT_CHAGEE_V25_RULES
-
+    if not rules_by_id:
         for item in DEFAULT_CHAGEE_V25_RULES:
             rid = str(item.rule_id).strip()
-            rules.append(
-                {
-                    "rule_id": rid,
-                    "name": str(item.name).strip(),
-                    "category": str(item.category).strip(),
-                    "severity": str(item.severity).strip() or "NORMAL",
-                    "doc_ref": _DEFAULT_DOC_REF_BY_PREFIX.get(
-                        rid, "APAC Cloud Audit Parameters 2026 v1.0"
-                    ),
-                    "check_instruction": str(item.check_instruction).strip(),
-                    "pass_criteria": str(item.pass_criteria).strip(),
-                    "fail_criteria": str(item.fail_criteria).strip(),
-                }
-            )
-    return rules
+            rules_by_id[rid] = {
+                "rule_id": rid,
+                "name": str(item.name).strip(),
+                "category": str(item.category).strip(),
+                "severity": str(item.severity).strip() or "NORMAL",
+                "doc_ref": _DEFAULT_DOC_REF_BY_PREFIX.get(
+                    rid, "APAC Cloud Audit Parameters 2026 v1.0"
+                ),
+                "check_instruction": str(item.check_instruction).strip(),
+                "pass_criteria": str(item.pass_criteria).strip(),
+                "fail_criteria": str(item.fail_criteria).strip(),
+            }
+    for extra in extra_rules or []:
+        rid = str(
+            extra.get("rule_id", "") if isinstance(extra, dict) else getattr(extra, "rule_id", "")
+        ).strip()
+        if not rid:
+            continue
+        name = str(
+            extra.get("name", "") if isinstance(extra, dict) else getattr(extra, "name", "")
+        ).strip()
+        category = str(
+            extra.get("category", "") if isinstance(extra, dict) else getattr(extra, "category", "")
+        ).strip()
+        sev_raw = extra.get("severity", "NORMAL") if isinstance(extra, dict) else getattr(extra, "severity", "NORMAL")
+        sev_val = str(getattr(sev_raw, "value", sev_raw) or "NORMAL").strip()
+        check_inst = str(
+            extra.get("check_instruction", "")
+            if isinstance(extra, dict)
+            else getattr(extra, "check_instruction", "")
+        ).strip()
+        pass_crit = str(
+            extra.get("pass_criteria", "")
+            if isinstance(extra, dict)
+            else getattr(extra, "pass_criteria", "")
+        ).strip()
+        fail_crit = str(
+            extra.get("fail_criteria", "")
+            if isinstance(extra, dict)
+            else getattr(extra, "fail_criteria", "")
+        ).strip()
+        rules_by_id[rid] = {
+            "rule_id": rid,
+            "name": name or f"{rid} · 专项测试规则",
+            "category": category or "专项测试",
+            "severity": sev_val,
+            "doc_ref": _DEFAULT_DOC_REF_BY_PREFIX.get(
+                rid, f"{TAB4_SPOT_CHECK_TITLE} · 专项抽检与新 SOP 测试"
+            ),
+            "check_instruction": check_inst,
+            "pass_criteria": pass_crit,
+            "fail_criteria": fail_crit,
+        }
+    return list(rules_by_id.values())
 
 
 _STAFF_RE = re.compile(r"员工[A-Z0-9]+")
@@ -758,6 +817,20 @@ async def load_portal_payload(
 
     if not tab1_rows and not tab2_rows and target_job.completed_segments:
         tab1_rows, tab2_rows = _fallback_rows_from_job(target_job)
+
+    spot_tab = (getattr(target_job, "target_prompt_tab", "") or "").strip()
+    if not spot_tab and str(getattr(target_job, "active_prompt_version", "")).startswith("Tab4_专项测试表"):
+        spot_tab = "Tab4_专项测试表"
+    if spot_tab and audit_service is not None and getattr(audit_service, "prompt_manager", None) is not None:
+        try:
+            spot_cfg = await audit_service.prompt_manager.load_config_for_tab(
+                spot_tab,
+                sheet_id=config.effective_sop_source(target_job.folder_id),
+                probe_model=False,
+            )
+            sop_catalog = load_sop_catalog(extra_rules=spot_cfg.rules)
+        except Exception as exc:
+            logger.debug("Portal dynamic SOP catalog lookup for %s skipped: %s", spot_tab, exc)
 
     findings, token_ledger = _build_findings_and_ledger_from_rows(
         audit_id=target_job.job_id,

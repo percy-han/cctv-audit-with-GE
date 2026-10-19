@@ -366,6 +366,7 @@ async def _handle_conversation_turn(
             user_id=user_id,
             drive_url=decision.drive_url,
             session_id=session_id,
+            target_prompt_tab=decision.target_prompt_tab,
         )
         return (
             job.preflight_report.message_to_user
@@ -390,6 +391,11 @@ async def _handle_conversation_turn(
             if len(job.completed_segments) > 0
             else ""
         )
+        mode_line = (
+            f"• 🧪 **稽核模式**：专项抽检 / 新 SOP 测试（仅核查 `{job.target_prompt_tab}` 中的 `{','.join(job.audited_rule_ids)}` 条款，不覆盖该视频其他正式 SOP 记录）\n"
+            if getattr(job, "target_prompt_tab", "")
+            else "• ✅ **稽核模式**：日常全量稽核（覆盖 `Tab0` 当前生效全部正式 SOP 条款）\n"
+        )
         output_line = (
             f"• 稽核完成后将在 GCS 目录 `{job.folder_id}/` 内自动生成 `📁 违规证据切片_Evidence/` 与《门店稽核报告与 Token 账单》Excel（`.xlsx`）报告；期间可随时在本对话中询问「进度怎么样了」查看实时进度。"
             if is_gcs_target(job.folder_id)
@@ -398,6 +404,7 @@ async def _handle_conversation_turn(
         return (
             f"🚀 **后台 AI 稽核已正式启动（单号 `{job.job_id}`）**\n"
             f"{resume_banner}"
+            f"{mode_line}"
             f"• **生效模型版本**：`{job.active_model_version}`\n"
             f"• **生效提示词版本**：`{job.active_prompt_version}`\n"
             f"{output_line}"
@@ -475,6 +482,7 @@ class InspectRequestPayload(BaseModel):
     drive_url: str = Field(description="Google Drive folder URL or ID")
     session_id: str = Field(default="")
     preloaded_items: Optional[List[VideoMetadataItem]] = Field(default=None)
+    target_prompt_tab: str = Field(default="")
 
 
 class ExecuteRequestPayload(BaseModel):
@@ -653,6 +661,7 @@ async def http_inspect(payload: InspectRequestPayload, request: Request = None) 
         drive_url=payload.drive_url,
         session_id=payload.session_id,
         preloaded_items=payload.preloaded_items,
+        target_prompt_tab=payload.target_prompt_tab,
     )
     return job.model_dump()
 
@@ -861,7 +870,13 @@ async def ge_unary_endpoint(request: Request) -> Dict[str, Any]:
         return {"output": {"status": "ok", "service": AUTHOR}}
     if method == "preflight":
         drive_url = str(payload.get("target") or payload.get("drive_url") or "")
-        job = await audit_service.preflight(user_id=user_id, drive_url=drive_url, session_id=session_id)
+        target_prompt_tab = str(payload.get("target_prompt_tab") or "").strip()
+        job = await audit_service.preflight(
+            user_id=user_id,
+            drive_url=drive_url,
+            session_id=session_id,
+            target_prompt_tab=target_prompt_tab,
+        )
         return {"output": job.model_dump()}
     if method == "start_audit":
         job = await audit_service.start_audit(
@@ -918,9 +933,7 @@ async def internal_execute_job(
     job = await audit_service.jobs.get(req.user_id, req.job_id)
     if job is None:
         return {"dispatched": False, "error": f"job {req.job_id} not found for {req.user_id}"}
-    prompt_cfg = await audit_service.prompt_manager.load_active_config(
-        sheet_id=config.effective_sop_source(job.folder_id)
-    )
+    prompt_cfg = await audit_service._load_prompt_config_for_job(job)
     if req.hold_connection:
         await audit_service._run_detached_audit(job, prompt_cfg)
         return {"dispatched": True, "completed": True, "job_id": job.job_id, "user_id": job.user_id}

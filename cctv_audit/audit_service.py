@@ -32,7 +32,7 @@ from .config import config
 from .gcp import WorkspaceConfigError, gemini_timeout_ms_for_slice
 from .gcs_gateway import build_source_video_url, safe_storage_id_slug
 from .jobs import AuditJob, JobState, SegmentCheckpoint, UserScopedJobStore
-from .prompt_manager import PromptManager, PromptModelConfig
+from .prompt_manager import PromptManager, PromptModelConfig, TAB4_SPOT_CHECK_TITLE
 from .video_ingestor import (
     InspectFolderResponse,
     VideoIngestor,
@@ -84,21 +84,47 @@ class AuditService:
         self._warmup_tasks: Set[asyncio.Task] = set()
         self._in_flight_jobs: Set[str] = set()
 
-    async def _warm_prompt_config_quietly(self, folder_id: str = "") -> None:
+    async def _warm_prompt_config_quietly(self, folder_id: str = "", target_prompt_tab: str = "") -> None:
         """Pre-warms the PromptManager Sheet TTL cache in the background after preflight
         so the subsequent `confirm` turn (`start_audit`) hits memory in <1ms without
         adding any latency to the `inspect` turn response.
         """
         try:
-            await self.prompt_manager.load_active_config(sheet_id=config.effective_sop_source(folder_id))
+            sop_src = config.effective_sop_source(folder_id)
+            if (target_prompt_tab or "").strip():
+                await self.prompt_manager.load_config_for_tab(
+                    target_prompt_tab.strip(),
+                    sheet_id=sop_src,
+                    probe_model=True,
+                )
+            else:
+                await self.prompt_manager.load_active_config(sheet_id=sop_src)
         except (asyncio.CancelledError, Exception) as exc:
             logger.debug("Background prompt config warm-up skipped/cancelled: %s", exc)
 
-    def _schedule_prompt_config_warmup(self, folder_id: str = "") -> asyncio.Task:
-        task = asyncio.create_task(self._warm_prompt_config_quietly(folder_id))
+    def _schedule_prompt_config_warmup(self, folder_id: str = "", target_prompt_tab: str = "") -> asyncio.Task:
+        task = asyncio.create_task(self._warm_prompt_config_quietly(folder_id, target_prompt_tab))
         self._warmup_tasks.add(task)
         task.add_done_callback(self._warmup_tasks.discard)
         return task
+
+    async def _load_prompt_config_for_job(
+        self, job: AuditJob, *, probe_model: bool = True
+    ) -> PromptModelConfig:
+        """Loads either the active master config (`Tab0`) or the explicit spot-check tab (`Tab4_专项测试表`)."""
+        sop_src = config.effective_sop_source(job.folder_id)
+        tab_override = (job.target_prompt_tab or "").strip()
+        if tab_override:
+            cfg = await self.prompt_manager.load_config_for_tab(
+                tab_override,
+                sheet_id=sop_src,
+                probe_model=probe_model,
+            )
+            rule_ids = [r.rule_id for r in cfg.rules]
+            rule_label = ",".join(rule_ids[:6]) + ("..." if len(rule_ids) > 6 else "")
+            version_tag = f"{tab_override}[{rule_label}]" if rule_label else tab_override
+            return cfg.model_copy(update={"active_prompt_version": version_tag})
+        return await self.prompt_manager.load_active_config(sheet_id=sop_src)
 
     async def preflight(
         self,
@@ -107,15 +133,18 @@ class AuditService:
         drive_url: str,
         session_id: str = "",
         preloaded_items: Optional[List[VideoMetadataItem]] = None,
+        target_prompt_tab: str = "",
     ) -> AuditJob:
         """Step 1 (`/inspect`): Runs `< 720P` resolution check in `< 3s` (zero token estimation)."""
         folder_id = extract_drive_id(drive_url)
+        cleaned_tab = (target_prompt_tab or "").strip()
         job = AuditJob(
             user_id=user_id,
             session_id=session_id,
             folder_id=folder_id,
             drive_url=drive_url,
             state=JobState.PROBING,
+            target_prompt_tab=cleaned_tab,
         )
         await self.jobs.save(job)
 
@@ -147,21 +176,88 @@ class AuditService:
             )
             return await self.jobs.save(job)
 
+        spot_cfg: Optional[PromptModelConfig] = None
+        if cleaned_tab:
+            try:
+                spot_cfg = await self.prompt_manager.load_config_for_tab(
+                    cleaned_tab,
+                    sheet_id=config.effective_sop_source(folder_id),
+                    probe_model=False,
+                )
+            except ValueError as exc:
+                rejected = InspectFolderResponse(
+                    folder_id=folder_id,
+                    passed=False,
+                    total_videos=0,
+                    total_duration_sec=0.0,
+                    planned_segments_count=0,
+                    estimated_tokens=0,
+                    estimated_cost_usd=0.0,
+                    estimated_minutes=0.0,
+                    rejected_videos=[],
+                    videos=[],
+                    message_to_user=(
+                        f"❌ 专项抽检 / 新 SOP 测试预检未通过（预检单号 `{job.job_id}`，本次 0 Token 消耗）：{exc}\n"
+                        f"• 💡 如果您本意是做**完整的日常全量稽核**，请直接发送：「`请帮忙稽核视频，{drive_url}`」"
+                    ),
+                )
+                job = job.model_copy(
+                    update={
+                        "state": JobState.REJECTED,
+                        "folder_name": detected_folder_name or job.folder_name,
+                        "preflight_report": rejected,
+                        "error_message": rejected.message_to_user,
+                    }
+                )
+                return await self.jobs.save(job)
+
         inspect_res = await self.ingestor.inspect_drive_videos(
             drive_url, preloaded_items=preloaded_items, job_id=job.job_id
         )
+        audited_rule_ids: List[str] = []
+        active_prompt_ver = job.active_prompt_version
+        if inspect_res.passed:
+            if cleaned_tab and spot_cfg is not None:
+                audited_rule_ids = [r.rule_id for r in spot_cfg.rules]
+                rule_summary = "、".join(
+                    f"`{r.rule_id}`（{r.name}）" for r in spot_cfg.rules[:6]
+                )
+                if len(spot_cfg.rules) > 6:
+                    rule_summary += f" 等共 {len(spot_cfg.rules)} 条"
+                rule_label = ",".join(audited_rule_ids[:6]) + (
+                    "..." if len(audited_rule_ids) > 6 else ""
+                )
+                active_prompt_ver = f"{cleaned_tab}[{rule_label}]"
+                mode_banner = (
+                    f"⚠️ **【当前为专项抽检 / 新 SOP 测试模式（非全量稽核）】**\n"
+                    f"• 🧪 **锁定规则页签**：`{cleaned_tab}`（本次仅核查 {len(spot_cfg.rules)} 条规则：{rule_summary}；其余正式 SOP 条款本次不执行）\n"
+                    f"• 💡 **防误触提示**：如果您本意是做**完整的日常全量稽核**，请勿确认，直接重新发送：「`请帮忙稽核视频，{drive_url}`」\n\n"
+                )
+                inspect_res = inspect_res.model_copy(
+                    update={"message_to_user": mode_banner + inspect_res.message_to_user}
+                )
+            else:
+                mode_banner = (
+                    "✅ **稽核模式：【日常全量稽核】**（自动加载总控表 `Tab0` 当前生效主规则库，覆盖全部正式 SOP 条款）\n"
+                )
+                inspect_res = inspect_res.model_copy(
+                    update={"message_to_user": mode_banner + inspect_res.message_to_user}
+                )
+
         new_state = JobState.READY if inspect_res.passed else JobState.REJECTED
         job = job.model_copy(
             update={
                 "state": new_state,
                 "folder_name": detected_folder_name or job.folder_name,
                 "preflight_report": inspect_res,
+                "audited_rule_ids": audited_rule_ids,
+                "active_prompt_version": active_prompt_ver,
                 "error_message": None if inspect_res.passed else inspect_res.message_to_user,
             }
         )
         saved_job = await self.jobs.save(job)
         if new_state == JobState.READY and preloaded_items is None:
-            self._schedule_prompt_config_warmup(folder_id)
+            self._schedule_prompt_config_warmup(folder_id, cleaned_tab)
         return saved_job
 
     async def _workspace_setup_problem_with_name(self, folder_id: str) -> tuple[str, str]:
@@ -258,14 +354,18 @@ class AuditService:
         should_send_start = (
             not job.start_notification_sent and not is_restart and not job.batch_id
         )
-        prompt_cfg = await self.prompt_manager.load_active_config(
-            sheet_id=config.effective_sop_source(job.folder_id)
+        prompt_cfg = await self._load_prompt_config_for_job(job)
+        audited_rule_ids = (
+            [r.rule_id for r in prompt_cfg.rules]
+            if (job.target_prompt_tab or "").strip()
+            else []
         )
         job = job.model_copy(
             update={
                 "state": JobState.RUNNING,
                 "active_model_version": prompt_cfg.active_model_version,
                 "active_prompt_version": prompt_cfg.active_prompt_version,
+                "audited_rule_ids": audited_rule_ids,
                 "resume_count": job.resume_count + (1 if is_restart else 0),
                 "error_message": None,
                 "needs_operator_fix": False,
@@ -689,6 +789,11 @@ class AuditService:
                 )
                 findings_by_video.append((video_item.filename, deduped_findings))
 
+            spot_rule_ids = (
+                list(job.audited_rule_ids or [r.rule_id for r in prompt_cfg.rules])
+                if (job.target_prompt_tab or "").strip()
+                else None
+            )
             report = await self.reporter.publish_in_folder_report(
                 audit_id=job.job_id,
                 user_email=job.user_id,
@@ -696,6 +801,7 @@ class AuditService:
                 findings_by_video=findings_by_video,
                 ledger_rows=ledger_rows,
                 suppress_notification=bool(getattr(job, "batch_id", "")),
+                audited_rule_ids=spot_rule_ids,
             )
             done_job = job.model_copy(
                 update={
@@ -824,9 +930,7 @@ class AuditService:
                 time.time() - job.heartbeat_at,
                 len(job.completed_segments),
             )
-            prompt_cfg = await self.prompt_manager.load_active_config(
-                sheet_id=config.effective_sop_source(job.folder_id)
-            )
+            prompt_cfg = await self._load_prompt_config_for_job(job)
             job = job.model_copy(
                 update={
                     "resume_count": job.resume_count + 1,
