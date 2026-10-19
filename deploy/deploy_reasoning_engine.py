@@ -358,37 +358,23 @@ GE_DATASTORE_FALLBACK_SUFFIX = "-store-v2"
 
 
 def build_engine_prompt_chips(
-    agent_display_name: str,
+    agent_display_name: str = "",
     example_folder_url: str = "",
 ) -> list[tuple[str, dict[str, Any]]]:
-    """Builds the Discovery Engine `cannedQueries` (Console `Prompt chips` / GE new-session homepage pills).
-
-    In Gemini Enterprise (`ucs-search-bar.ts` & `ucs-prompt-card.ts`):
-    - Before an Agent is selected or `@`-mentioned, the search bar's default placeholder is hardcoded in
-      the GE web bundle; `Agent.starterPrompts` and `Agent.customPlaceholderText` only appear *after*
-      selecting/`@`-mentioning the Agent.
-    - However, `assistants/default_assistant/cannedQueries` (`Prompt chips` in Cloud Console) are rendered
-      directly on the GE new-session homepage right below the input box. Clicking a chip sets the input
-      box placeholder to `defaultTexts.prefix` and opens a dropdown of `defaultTexts.suggestedPrompts`.
-    """
-    folder_example = example_folder_url or "<粘贴门店监控 Google Drive 文件夹链接>"
+    """Builds the Discovery Engine `cannedQueries` (Console `Prompt chips` / GE new-session homepage pills)."""
+    _ = (agent_display_name, example_folder_url)
     return [
         (
             "cctv-full-audit",
             {
                 "displayName": "门店视频日常全量稽核",
                 "defaultTexts": {
-                    "title": "📹 门店视频全量稽核（请先 @稽核专家）",
-                    "prefix": (
-                        f"请先输入 @ 选中「{agent_display_name}」，"
-                        "再输入：请帮忙稽核视频，<视频文件夹链接>"
-                    ),
+                    "title": "门店视频日常全量稽核",
+                    "prefix": "请根据你要稽核的内容选择如下的气泡",
                     "suggestedPrompts": [
-                        {"promptText": f"@{agent_display_name} 请帮忙稽核视频：{folder_example}"},
                         {
                             "promptText": (
-                                f"@{agent_display_name} 请帮忙稽核视频："
-                                "<粘贴门店监控 Google Drive 文件夹链接或 gs:// 目录>"
+                                "请帮忙稽核视频：<门店监控 Google Drive 文件夹链接或 gs:// 目录>"
                             )
                         },
                     ],
@@ -399,47 +385,28 @@ def build_engine_prompt_chips(
         (
             "cctv-tab4-spot-check",
             {
-                "displayName": "Tab4 专项抽检与新SOP测试",
+                "displayName": "专项抽检与新SOP测试",
                 "defaultTexts": {
-                    "title": "🧪 专项抽检与新规测试（仅测4号专项测试表，请先 @稽核专家）",
-                    "prefix": (
-                        f"请先输入 @ 选中「{agent_display_name}」，"
-                        "再输入：【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频，<视频文件夹链接>"
-                    ),
+                    "title": "专项抽检与新SOP测试",
+                    "prefix": "请根据你要稽核的内容选择如下的气泡",
                     "suggestedPrompts": [
                         {
                             "promptText": (
-                                f"@{agent_display_name} 【仅测 Tab4_专项测试表（非全量）】"
-                                f"请帮忙稽核视频：{folder_example}"
+                                "【仅测 Tab4_专项测试表（非全量）】"
+                                "请帮忙稽核视频：<门店监控 Google Drive 文件夹链接>"
                             )
                         },
-                        {
-                            "promptText": (
-                                f"@{agent_display_name} 【仅测 Tab4_专项测试表（非全量）】"
-                                "请帮忙稽核视频：<粘贴门店监控 Google Drive 文件夹链接>"
-                            )
-                        },
-                    ],
-                },
-                "enabled": True,
-            },
-        ),
-        (
-            "cctv-confirm-and-status",
-            {
-                "displayName": "确认开始稽核与进度查询",
-                "defaultTexts": {
-                    "title": "✅ 确认开始稽核 / 查询任务进度（请先 @稽核专家）",
-                    "prefix": f"请先确保已 @ 选中「{agent_display_name}」，再点击下方指令或输入：确认开始稽核",
-                    "suggestedPrompts": [
-                        {"promptText": f"@{agent_display_name} 确认开始稽核"},
-                        {"promptText": f"@{agent_display_name} 查询我刚才提交的稽核任务进度"},
                     ],
                 },
                 "enabled": True,
             },
         ),
     ]
+
+
+_DEPRECATED_CUSTOM_CHIP_IDS: frozenset[str] = frozenset(
+    {"videocheck", "cctv-confirm-and-status"}
+)
 
 
 def ensure_engine_prompt_chips(
@@ -467,9 +434,23 @@ def ensure_engine_prompt_chips(
         cq_id = name.rsplit("/", 1)[-1] if "/" in name else ""
         if cq_id:
             existing_by_id[cq_id] = cq
-        # Disable Google-defined default office chips (and legacy manual `videocheck` chip) so only
-        # the CCTV Audit prompt chips appear on the GE new-session homepage.
-        if (cq.get("googleDefined") or cq_id == "videocheck") and cq.get("enabled"):
+        if cq_id in _DEPRECATED_CUSTOM_CHIP_IDS and name:
+            del_url = f"https://discoveryengine.googleapis.com/v1alpha/{name}"
+            del_res = _call("DELETE", del_url, project_id=project_id, ignore_errors=True)
+            if del_res.get("_http_error") and cq.get("enabled"):
+                patch_url = f"{del_url}?updateMask=enabled"
+                _call(
+                    "PATCH",
+                    patch_url,
+                    body={"name": name, "enabled": False},
+                    project_id=project_id,
+                    ignore_errors=True,
+                )
+            else:
+                print(f"🧹 Deleted deprecated Prompt Chip `{cq_id}` in GE Engine `{eng}`")
+            continue
+        # Disable Google-defined default office chips so only the CCTV Audit prompt chips appear.
+        if cq.get("googleDefined") and cq.get("enabled"):
             patch_url = f"https://discoveryengine.googleapis.com/v1alpha/{name}?updateMask=enabled"
             _call(
                 "PATCH",
@@ -636,13 +617,13 @@ def ensure_gemini_enterprise_and_bind_agent(
             continue
         target_engines.append(extra)
 
-    folder_example = example_folder_url or "<粘贴门店监控 Google Drive 文件夹链接>"
+    folder_example = example_folder_url or "<门店监控 Google Drive 文件夹链接或 gs:// 目录>"
     agent_payload = {
         "displayName": agent_display_name,
         "description": (
             f"负责{tenant_label}门店 CCTV 监控视频 SOP 合规稽核。使用时请在 GE 对话框 @{agent_display_name}（或在左侧选中本 Agent）："
             "日常完整稽核请输入「请帮忙稽核视频，<视频文件夹链接>」；特定 SOP 专项抽检或新 SOP 测试请先在总控表 Tab4_专项测试表 更新规则，"
-            "再点击【仅测 Tab4_专项测试表】气泡并粘贴链接。"
+            "再点击【专项抽检与新SOP测试】气泡并粘贴链接。"
         ),
         "adkAgentDefinition": {
             "provisionedReasoningEngine": {
@@ -654,14 +635,9 @@ def ensure_gemini_enterprise_and_bind_agent(
         "sharingConfig": {"scope": "ALL_USERS"},
         "starterPrompts": [
             {"text": f"请帮忙稽核视频：{folder_example}"},
-            {"text": f"【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频：{folder_example}"},
-            {"text": "确认开始稽核"},
-            {"text": "查询我刚才提交的稽核任务进度"},
+            {"text": "【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频：<门店监控 Google Drive 文件夹链接>"},
         ],
-        "customPlaceholderText": (
-            f"请确认已选中或 @{agent_display_name}：完整稽核整个视频请输入「@{agent_display_name} 请帮忙稽核视频，<视频链接>」；"
-            "专项抽检或测新SOP请点【仅测 Tab4_专项测试表】气泡"
-        ),
+        "customPlaceholderText": "请根据你要稽核的内容选择如下的气泡",
     }
 
     engine_cache: dict[str, dict[str, Any]] = {}

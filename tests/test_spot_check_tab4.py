@@ -613,13 +613,19 @@ def test_engine_prompt_chips_canned_queries_sync(monkeypatch: pytest.MonkeyPatch
     folder_url = "https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
     chips = dre.build_engine_prompt_chips(agent_name, folder_url)
     chip_ids = [cid for cid, _ in chips]
-    assert chip_ids == ["cctv-full-audit", "cctv-tab4-spot-check", "cctv-confirm-and-status"]
+    assert chip_ids == ["cctv-full-audit", "cctv-tab4-spot-check"]
+    chip_map = dict(chips)
+    assert chip_map["cctv-full-audit"]["displayName"] == "门店视频日常全量稽核"
+    assert chip_map["cctv-full-audit"]["defaultTexts"]["suggestedPrompts"] == [
+        {"promptText": "请帮忙稽核视频：<门店监控 Google Drive 文件夹链接或 gs:// 目录>"}
+    ]
+    assert chip_map["cctv-tab4-spot-check"]["displayName"] == "专项抽检与新SOP测试"
+    assert chip_map["cctv-tab4-spot-check"]["defaultTexts"]["suggestedPrompts"] == [
+        {"promptText": "【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频：<门店监控 Google Drive 文件夹链接>"}
+    ]
     for _, body in chips:
         assert body["enabled"] is True
-        assert f"「{agent_name}」" in body["defaultTexts"]["prefix"]
-        assert len(body["defaultTexts"]["suggestedPrompts"]) >= 1
-        for sp in body["defaultTexts"]["suggestedPrompts"]:
-            assert sp["promptText"].startswith(f"@{agent_name} ")
+        assert body["defaultTexts"]["prefix"] == "请根据你要稽核的内容选择如下的气泡"
 
     calls: list[tuple[str, str, dict | None]] = []
 
@@ -646,6 +652,11 @@ def test_engine_prompt_chips_canned_queries_sync(monkeypatch: pytest.MonkeyPatch
                         "enabled": True,
                     },
                     {
+                        "name": "projects/p/locations/global/collections/default_collection/engines/eng1/assistants/default_assistant/cannedQueries/cctv-confirm-and-status",
+                        "displayName": "确认开始稽核与进度查询",
+                        "enabled": True,
+                    },
+                    {
                         "name": "projects/p/locations/global/collections/default_collection/engines/eng1/assistants/default_assistant/cannedQueries/cctv-full-audit",
                         "displayName": "门店视频日常全量稽核",
                         "enabled": True,
@@ -663,23 +674,24 @@ def test_engine_prompt_chips_canned_queries_sync(monkeypatch: pytest.MonkeyPatch
         agent_display_name=agent_name,
         example_folder_url=folder_url,
     )
-    assert len(synced) == 3
+    assert len(synced) == 2
 
-    # Google-defined default chip and legacy `videocheck` chip must be disabled
+    # Google-defined default chip is disabled; deprecated custom chips (`videocheck`, `cctv-confirm-and-status`) are deleted
     disabled_urls = [
         url for m, url, b in calls if m == "PATCH" and b and b.get("enabled") is False
     ]
+    deleted_urls = [url for m, url, _ in calls if m == "DELETE"]
     assert any("goog_start_my_day?updateMask=enabled" in u for u in disabled_urls)
-    assert any("videocheck?updateMask=enabled" in u for u in disabled_urls)
+    assert any(u.endswith("/cannedQueries/videocheck") for u in deleted_urls)
+    assert any(u.endswith("/cannedQueries/cctv-confirm-and-status") for u in deleted_urls)
 
-    # Existing `cctv-full-audit` is PATCHed, while `cctv-tab4-spot-check` and `cctv-confirm-and-status` are POSTed
+    # Existing `cctv-full-audit` is PATCHed, while `cctv-tab4-spot-check` is POSTed
     patched_custom = [
         url for m, url, b in calls if m == "PATCH" and b and b.get("enabled") is True
     ]
     posted_custom = [url for m, url, _ in calls if m == "POST"]
     assert len(patched_custom) == 1
     assert "cctv-full-audit?updateMask=displayName,defaultTexts,enabled" in patched_custom[0]
-    assert len(posted_custom) == 2
+    assert len(posted_custom) == 1
     assert any("cannedQueryId=cctv-tab4-spot-check" in u for u in posted_custom)
-    assert any("cannedQueryId=cctv-confirm-and-status" in u for u in posted_custom)
 

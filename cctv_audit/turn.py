@@ -27,6 +27,7 @@ from .prompt_manager import TAB4_SPOT_CHECK_TITLE
 logger = logging.getLogger("cctv_audit.turn")
 
 _SPOT_CHECK_KEYWORDS: tuple[str, ...] = (
+    "仅测 tab4_专项测试表（非全量）",
     "tab4_专项测试表",
     "tab4",
     "tab 4",
