@@ -340,11 +340,7 @@ class WorkspaceReporter:
             return False
 
         chat_user_id = await asyncio.to_thread(resolve_chat_user_id, user_email)
-        initiator_line = (
-            f"<users/{chat_user_id}> (<code>{user_email}</code>)"
-            if chat_user_id
-            else f"<code>{user_email}</code>"
-        )
+        initiator_line = f"<code>{user_email}</code>"
         folder_url = (
             build_gcs_console_folder_url(folder_id)
             if is_gcs_target(folder_id)
@@ -360,13 +356,19 @@ class WorkspaceReporter:
             }
         ]
 
-        payload = {
+        header_title = f"🚀 门店视频 AI 稽核已启动 (#{audit_id})"
+        payload: Dict[str, Any] = {
+            **(
+                {"text": f"🔔 <users/{chat_user_id}> {header_title}"}
+                if chat_user_id
+                else {}
+            ),
             "cardsV2": [
                 {
                     "cardId": f"job-start-{audit_id}",
                     "card": {
                         "header": {
-                            "title": f"🚀 门店视频 AI 稽核已启动 (#{audit_id})",
+                            "title": header_title,
                             "subtitle": f"门店：{store_label} · 共 {video_count} 支视频（约 {duration_min} 分钟）· 预计耗时约 {estimated_minutes:.1f} 分钟",
                         },
                         "sections": [
@@ -424,11 +426,7 @@ class WorkspaceReporter:
             return False
 
         chat_user_id = await asyncio.to_thread(resolve_chat_user_id, user_email)
-        initiator_line = (
-            f"<users/{chat_user_id}> (<code>{user_email}</code>)"
-            if chat_user_id
-            else f"<code>{user_email}</code>"
-        )
+        initiator_line = f"<code>{user_email}</code>"
         portal_url = build_portal_url(job_id=audit_id, user_id=user_email)
         buttons: List[dict] = []
         if portal_url.startswith("http"):
@@ -446,13 +444,19 @@ class WorkspaceReporter:
                 }
             )
 
-        payload = {
+        header_title = f"✅ 门店视频 AI 稽核已完成 (#{audit_id})"
+        payload: Dict[str, Any] = {
+            **(
+                {"text": f"🔔 <users/{chat_user_id}> {header_title}"}
+                if chat_user_id
+                else {}
+            ),
             "cardsV2": [
                 {
                     "cardId": f"job-done-{audit_id}",
                     "card": {
                         "header": {
-                            "title": f"✅ 门店视频 AI 稽核已完成 (#{audit_id})",
+                            "title": header_title,
                             "subtitle": f"共检出 {violations_count} 项待复核事件 · 消耗 {total_tokens:,} Tokens",
                         },
                         "sections": [
@@ -514,11 +518,7 @@ class WorkspaceReporter:
             return False
 
         chat_user_id = await asyncio.to_thread(resolve_chat_user_id, supervisor_email)
-        initiator_line = (
-            f"<users/{chat_user_id}> (<code>{supervisor_email}</code>)"
-            if chat_user_id
-            else f"<code>{supervisor_email}</code>"
-        )
+        initiator_line = f"<code>{supervisor_email}</code>"
         total_stores = len(store_summaries)
         running_stores = sum(
             1 for s in store_summaries if str(s.get("state") or "").upper() == "RUNNING"
@@ -577,13 +577,19 @@ class WorkspaceReporter:
                 }
             )
 
-        payload = {
+        header_title = f"🚀 定时自动巡检已启动：{rule_name} ({rule_id})"
+        payload: Dict[str, Any] = {
+            **(
+                {"text": f"🔔 <users/{chat_user_id}> {header_title}"}
+                if chat_user_id
+                else {}
+            ),
             "cardsV2": [
                 {
                     "cardId": f"scheduled-batch-start-{batch_id}",
                     "card": {
                         "header": {
-                            "title": f"🚀 定时自动巡检已启动：{rule_name} ({rule_id})",
+                            "title": header_title,
                             "subtitle": f"Batch ID: {batch_id} · 共 {total_stores} 家门店 / {total_videos} 支新增视频",
                         },
                         "sections": [
@@ -629,11 +635,7 @@ class WorkspaceReporter:
             return False
 
         chat_user_id = await asyncio.to_thread(resolve_chat_user_id, supervisor_email)
-        initiator_line = (
-            f"<users/{chat_user_id}> (<code>{supervisor_email}</code>)"
-            if chat_user_id
-            else f"<code>{supervisor_email}</code>"
-        )
+        initiator_line = f"<code>{supervisor_email}</code>"
         total_stores = len(store_summaries)
         succeeded_stores = sum(1 for s in store_summaries if str(s.get("state") or "").upper() == "DONE")
         failed_stores = total_stores - succeeded_stores
@@ -741,7 +743,12 @@ class WorkspaceReporter:
         else:
             header_title = f"⚠️ 定时巡检部分完成（含预检拦截）：{rule_name} ({rule_id})"
 
-        payload = {
+        payload: Dict[str, Any] = {
+            **(
+                {"text": f"🔔 <users/{chat_user_id}> {header_title}"}
+                if chat_user_id
+                else {}
+            ),
             "cardsV2": [
                 {
                     "cardId": f"scheduled-batch-{batch_id}",
@@ -796,11 +803,7 @@ class WorkspaceReporter:
             return False
 
         chat_user_id = await asyncio.to_thread(resolve_chat_user_id, supervisor_email)
-        initiator_line = (
-            f"<users/{chat_user_id}> (<code>{supervisor_email}</code>)"
-            if chat_user_id
-            else f"<code>{supervisor_email or '督导'}</code>"
-        )
+        initiator_line = f"<code>{supervisor_email or '督导'}</code>"
 
         widgets: list[dict[str, Any]] = [
             {
@@ -841,13 +844,19 @@ class WorkspaceReporter:
         if buttons:
             widgets.append({"buttonList": {"buttons": buttons}})
 
-        payload = {
+        header_title = f"🚀 黄金集评测已启动：{eval_name} ({eval_id})"
+        payload: Dict[str, Any] = {
+            **(
+                {"text": f"🔔 <users/{chat_user_id}> {header_title}"}
+                if chat_user_id
+                else {}
+            ),
             "cardsV2": [
                 {
                     "cardId": f"scheduled-eval-start-{run_id or eval_id}",
                     "card": {
                         "header": {
-                            "title": f"🚀 黄金集评测已启动：{eval_name} ({eval_id})",
+                            "title": header_title,
                             "subtitle": f"Run ID: {run_id} · SOP: {prompt_tab_name} · 模型: {model_version}",
                         },
                         "sections": [
@@ -896,11 +905,7 @@ class WorkspaceReporter:
             return False
 
         chat_user_id = await asyncio.to_thread(resolve_chat_user_id, supervisor_email)
-        initiator_line = (
-            f"<users/{chat_user_id}> (<code>{supervisor_email}</code>)"
-            if chat_user_id
-            else f"<code>{supervisor_email or '督导'}</code>"
-        )
+        initiator_line = f"<code>{supervisor_email or '督导'}</code>"
 
         is_done = str(status).upper() == "DONE"
         summary = summary or {}
@@ -971,7 +976,12 @@ class WorkspaceReporter:
             if is_done
             else f"⚠️ 黄金集评测未通过/执行异常：{eval_name} ({eval_id})"
         )
-        payload = {
+        payload: Dict[str, Any] = {
+            **(
+                {"text": f"🔔 <users/{chat_user_id}> {header_title}"}
+                if chat_user_id
+                else {}
+            ),
             "cardsV2": [
                 {
                     "cardId": f"scheduled-eval-{run_id or eval_id}",

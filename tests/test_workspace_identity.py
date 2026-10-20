@@ -854,11 +854,74 @@ def test_resolve_chat_user_id_and_completion_notification_mention(monkeypatch):
             )
         )
         assert ok is True
-        assert "text" not in posted[-1][1]
-        p1_str = json.dumps(posted[-1][1], ensure_ascii=False)
-        assert "<users/104120710022716991580> (<code>test-1@example.com</code>)" in p1_str
+        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> ✅ 门店视频 AI 稽核已完成 (#42e5d3)"
+        p1_cards_str = json.dumps(posted[-1][1]["cardsV2"], ensure_ascii=False)
+        assert "<b>发起督导</b>：<code>test-1@example.com</code>" in p1_cards_str
+        assert "<users/" not in p1_cards_str
 
-        # When DWD is absent or fails for an unknown user, falls back gracefully to plain email
+        # Verify the remaining 5 notification methods also emit top-level payload["text"] <users/{sub}>
+        assert asyncio.run(
+            reporter.send_job_start_notification(
+                user_email="test-1@example.com",
+                audit_id="42e5d3",
+                folder_id="folder_1",
+                folder_name="Store_01",
+                video_count=2,
+            )
+        ) is True
+        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> 🚀 门店视频 AI 稽核已启动 (#42e5d3)"
+
+        assert asyncio.run(
+            reporter.send_batch_start_notification(
+                batch_id="batch_1",
+                rule_id="RULE-01",
+                rule_name="定时巡检",
+                supervisor_email="test-1@example.com",
+                root_folder_url="https://drive.google.com/drive/folders/r1",
+                store_summaries=[{"folder_name": "Store_01", "job_id": "j1", "video_count": 2, "state": "RUNNING"}],
+            )
+        ) is True
+        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> 🚀 定时自动巡检已启动：定时巡检 (RULE-01)"
+
+        assert asyncio.run(
+            reporter.send_batch_summary_notification(
+                batch_id="batch_1",
+                rule_id="RULE-01",
+                rule_name="定时巡检",
+                supervisor_email="test-1@example.com",
+                root_folder_url="https://drive.google.com/drive/folders/r1",
+                store_summaries=[{"folder_name": "Store_01", "job_id": "j1", "video_count": 2, "state": "DONE", "violations_found": 1, "total_tokens": 1000}],
+            )
+        ) is True
+        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> ✅ 定时巡检已完成：定时巡检 (RULE-01)"
+
+        assert asyncio.run(
+            reporter.send_eval_start_notification(
+                eval_id="EVAL-01",
+                eval_name="基线评测",
+                run_id="run_1",
+                prompt_tab_name="Prompt_v2.5",
+                model_version="gemini-3.8-flash",
+                supervisor_email="test-1@example.com",
+            )
+        ) is True
+        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> 🚀 黄金集评测已启动：基线评测 (EVAL-01)"
+
+        assert asyncio.run(
+            reporter.send_eval_completion_notification(
+                eval_id="EVAL-01",
+                eval_name="基线评测",
+                run_id="run_1",
+                prompt_tab_name="Prompt_v2.5",
+                model_version="gemini-3.8-flash",
+                supervisor_email="test-1@example.com",
+                status="DONE",
+                summary={"overall_recall": 0.5, "total_tokens": 1000},
+            )
+        ) is True
+        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> ✅ 黄金集评测已完成：基线评测 (EVAL-01)"
+
+        # When DWD is absent or fails for an unknown user, falls back gracefully to plain email (no top-level text)
         monkeypatch.delenv("WORKSPACE_DWD_SERVICE_ACCOUNT", raising=False)
         ok2 = asyncio.run(
             reporter.send_completion_notification(
@@ -891,7 +954,7 @@ def test_resolve_chat_user_id_and_completion_notification_mention(monkeypatch):
                 )
             )
             assert ok3 is False
-            assert len(posted) == 2
+            assert len(posted) == 7
 
         monkeypatch.setenv("ENABLE_GOOGLE_CHAT_NOTIFICATION", "true")
         assert AuditConfig().enable_google_chat_notification is True

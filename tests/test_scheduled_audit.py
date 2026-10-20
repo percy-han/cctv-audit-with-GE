@@ -1290,10 +1290,18 @@ def test_req015_portal_hmac_signing_and_composite_key_review_writeback(
         )
         assert len(payload["findings"]) == 2
         assert len(payload["sop_rules"]) == 24
+        assert payload["sop_rules"][0]["clean_subtitle"]
+        assert payload["sop_rules"][0]["module_code"] == "A"
+        assert payload["findings"][0]["severity"] == "RED_LINE"
+        assert payload["findings"][0]["rule_subtitle"]
         html_out = render_supervisor_portal_html(payload)
         assert "CHAGEE 霸王茶姬 · 门店 AI 视频稽核督导工作台" in html_out
         assert "Store_Bau_Cat" in html_out
         assert "cam01_morning.mp4" in html_out
+        assert "function exportXLSX()" in html_out
+        assert "function setAuthUser(" in html_out
+        assert "async function persistReviewsToSheet(" in html_out
+        assert "/api/portal/review" in html_out
 
         # 4. Load multi-store batch portal & verify Batch Store Switcher ([P1-2])
         valid_batch_sig = compute_portal_signature(batch_id="batch_999", exp=valid_exp)
