@@ -73,7 +73,9 @@ def canonical_manifest_sha256(manifest: Mapping[str, Any] | None) -> str:
 VERSION_SCHEME = "ruler-v2"
 # Golden-line fields nothing in scoring reads (provenance only); excluded from the ruler hash.
 PROVENANCE_ITEM_FIELDS = frozenset({"source_sheet_id", "source_sha256", "outlet_no"})
-RULER_OVERRIDE_KEYS = ("sop_category", "temporal_mode", "stable_baseline")
+RULER_OVERRIDE_KEYS = (
+    "sop_category", "temporal_mode", "stable_baseline", "dwell_sec", "window_before_sec", "window_after_sec",
+)
 
 
 def ruler_golden_sha256(raw: bytes) -> str:
@@ -239,7 +241,7 @@ def _apply_overrides(items: list[dict[str, Any]], manifest: Mapping[str, Any]) -
     unknown = sorted(set(overrides) - known)
     if unknown:
         raise GoldenSetError(f"manifest item_overrides 含黄金集中不存在的 item_id: {unknown}")
-    allowed = {"sop_category", "temporal_mode", "stable_baseline"}
+    allowed = set(RULER_OVERRIDE_KEYS)
     for it in items:
         ov = overrides.get(str(it["item_id"])) or {}
         bad = sorted(set(ov) - allowed)

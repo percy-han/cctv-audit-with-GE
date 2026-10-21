@@ -78,8 +78,21 @@ async def get_genai_client() -> genai.Client:
     return _client
 
 
+# Vertex answers a request whose video Part carries `media_processing=AGENTIC` with
+# `400 INVALID_ARGUMENT: Agentic video processing is not enabled for this model` when the model
+# has no agentic video serving (live probe on `global`, 2026-10-20: gemini-3.5-flash and
+# gemini-3.1-pro-preview; gemini-3.8-flash accepts it). `agentic_auditor.analyze_segment` falls
+# back to static sampling on this marker, so it must surface immediately, never be retried.
+AGENTIC_NOT_ENABLED_MARKER = "Agentic video processing is not enabled"
+
+
 def _is_transient_error(exc: BaseException) -> bool:
     msg = str(exc)
+    if AGENTIC_NOT_ENABLED_MARKER in msg:
+        # Deterministic per model: every attempt gets the same 400, so backoff only delays the
+        # auditor's static-sampling fallback (and a stray "500"/"503" inside the error body or a
+        # request id must not turn it into 4 attempts).
+        return False
     return any(
         code in msg
         for code in ("429", "500", "502", "503", "504", "RESOURCE_EXHAUSTED", "UNAVAILABLE", "DeadlineExceeded")

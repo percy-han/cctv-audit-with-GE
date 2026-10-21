@@ -1450,11 +1450,16 @@ class ScheduledAuditEngine:
             cost_usd = float(summary.get("total_cost_usd", 0.0))
             guardrails_ok = bool(summary.get("guardrails_passed", False))
             guard_tag = "护栏通过" if guardrails_ok else "触发护栏"
+            # Effective video mode (`agentic` / `static`): a model without agentic video serving
+            # runs static, and a Tab3 model comparison must show that next to the recall.
+            media_mode = str(summary.get("media_mode") or "").strip()
             report_msg = (
                 f"✅ 评测完成 ({task_rec.eval_task_id})：总体召回率 {overall_pct:.1f}% "
                 f"(仅 CONFIRMED {confirmed_pct:.1f}%) | "
                 f"密度 {fpc:.2f} 条/段 ({guard_tag}) | 成本 ${cost_usd:.2f}"
             )
+            if media_mode:
+                report_msg += f" | 视频模式 {media_mode}"
             if sheet_url:
                 report_msg += f" | 报告：{sheet_url}"
             elif summary.get("sheet_error"):

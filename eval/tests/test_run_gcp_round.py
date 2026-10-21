@@ -256,5 +256,65 @@ class ScoreRunApiTest(unittest.TestCase):
                 sr.score_run(run_dir=d, golden_path="x", project="p", run_label="l", judge_fn=_fake_judge)
 
 
+class EffectiveMediaModeRecordTest(unittest.TestCase):
+    """Round 79: the run record says which mode the model really ran in, not the configured switch.
+
+    A model that rejects agentic video (``400 Agentic video processing is not enabled``) is marked
+    in ``cctv_audit.agentic_auditor`` and its slices run static; ``eval_history.jsonl`` and the
+    round averages must then carry ``media_mode=static`` so Tab3 comparisons are apples to apples.
+    """
+
+    def _replay(self, tmp: Path, model: str, run_id: str) -> dict:
+        rounds = tmp / "rounds"
+        if not rounds.exists():
+            shutil.copytree(THIS_DIR / "rounds", rounds)
+        args = argparse.Namespace(
+            round="r01", run_id=run_id, rounds_dir=rounds, results_dir=tmp / "results",
+            golden=THIS_DIR / "data" / "golden_v1.jsonl", judge_model=None,
+            folder_concurrency=2, sync_sop_tab=False, skip_gcs_sync=True, skip_sheet_report=True,
+            ckpt_local_dir=tmp / f"ckpt_{run_id}")
+        active = mock.MagicMock(active_model_version=model, fallback_model_version=model,
+                                model_fallback_warning=None)
+        pm = mock.MagicMock()
+        pm.load_active_config = mock.AsyncMock(return_value=active)
+        env = {"GCP_PROJECT": "test-project", "STAGING_BUCKET": "test-bucket", "VIDEO_MEDIA_PROCESSING": "agentic"}
+        with mock.patch.dict("os.environ", env), \
+                mock.patch.object(rgr, "config", rgr.AuditConfig(gcp_project="test-project",
+                                                                 staging_bucket="test-bucket")), \
+                mock.patch.object(rgr, "AgenticAuditor", return_value=FakeAuditor()), \
+                mock.patch.object(rgr, "resolve_or_ingest_video_slice", _fake_slice), \
+                mock.patch.object(rgr, "GoogleSheetsConfigClient"), \
+                mock.patch.object(rgr, "PromptManager", return_value=pm), \
+                mock.patch.object(rgr, "GoogleWorkspaceGateway"), \
+                mock.patch.object(rgr, "score_run", partial(sr.score_run, judge_fn=_fake_judge)):
+            self.assertEqual(asyncio.run(rgr.run_round_async(args)), 0)
+        return json.loads((tmp / "results" / run_id / "monitoring_record.json").read_text(encoding="utf-8"))
+
+    def test_fallen_back_model_is_recorded_as_static_and_supporting_model_as_agentic(self):
+        from cctv_audit import agentic_auditor
+
+        tmp = Path(tempfile.mkdtemp(prefix="rgr_media_mode_"))
+        run_ids = ("test_media_mode_static", "test_media_mode_agentic")
+        try:
+            with mock.patch.object(agentic_auditor, "_AGENTIC_UNSUPPORTED_MODELS", {"gemini-3.5-flash"}):
+                rec_static = self._replay(tmp, "gemini-3.5-flash", run_ids[0])
+                rec_agentic = self._replay(tmp, "gemini-3.8-flash", run_ids[1])
+            self.assertEqual((rec_static["model_version"], rec_static["media_mode"]), ("gemini-3.5-flash", "static"))
+            self.assertEqual((rec_agentic["model_version"], rec_agentic["media_mode"]), ("gemini-3.8-flash", "agentic"))
+
+            history = [json.loads(l) for l in (tmp / "rounds" / "eval_history.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+            by_run = {h["run_id"]: h for h in history}
+            self.assertEqual(by_run[run_ids[0]]["media_mode"], "static")
+            self.assertEqual(by_run[run_ids[1]]["media_mode"], "agentic")
+            averages = [json.loads(l) for l in (tmp / "rounds" / "eval_round_averages.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+            modes = {(a["model_version"], a["media_mode"]) for a in averages if a.get("round_id") == "r01"}
+            self.assertIn(("gemini-3.5-flash", "static"), modes)
+            self.assertIn(("gemini-3.8-flash", "agentic"), modes)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            for rid in run_ids:
+                shutil.rmtree(rgr.THIS_DIR / "data" / "runs" / rid, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

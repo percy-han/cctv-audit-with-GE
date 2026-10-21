@@ -438,7 +438,7 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
 | **A 列** | `Eval_ID` | **必填**，唯一的评测任务编号 | `EVAL-01` |
 | **B 列** | `Eval_Name` | 评测说明名称（显示在 Google Chat 卡片与报告中） | `V2.5标准版提示词回归评测` |
 | **C 列** | `Prompt_Tab_Name` | **必填（下拉框）**，选择本次要评测的 SOP 规则页签（直接读取该页签规则评测，**无需改动 `Tab0` 线上生产开关，零生产影响**） | `Prompt_v2.5_V10全量17条标准版` |
-| **D 列** | `Model_Version` | **必填（下拉框）**，选择本次要评测的模型版本 | `gemini-3.8-flash` |
+| **D 列** | `Model_Version` | **必填（下拉框）**，选择本次要评测的模型版本（候选项 = 内置基线 + `Tab0` `候选列表` 中的模型名，新模型先加到 `Tab0` 即可选，见 8.2；不支持 agentic 视频理解的模型会自动以 static 模式评测并如实记录） | `gemini-3.8-flash` |
 | **E 列** | `Golden_Videos_Folder_URL` | **必填**，第一步准备的黄金集视频根目录 Google Drive 链接 | `https://drive.google.com/drive/folders/1tAX...` |
 | **F 列** | `Human_Labels_Sheet_URL` | **必填**，第二步准备的人工标注结果 Google Sheet 链接 | `https://docs.google.com/spreadsheets/d/1VBu...` |
 | **G 列** | `Results_Folder_URL` | **必填**，第三步准备的测评报告归档文件夹 Google Drive 链接 | `https://drive.google.com/drive/folders/1ky2...` |
@@ -468,6 +468,8 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
   - **瞬时定点动作（`POINT` 模式：`1.5 Handwashing and Sanitation Standard` 洗手台瞬时动作）**：采用 **`±20 秒`（前后共 40 秒跨度）** 严格时间窗口，并计算 AI 报出时刻与人工标注时刻的 **时间戳定位误差（`timestamp_drift_sec`）**。
   - **持续过程 / 静置计时 / 跨阶段因果链（`WINDOW` 模式：制冰机 5–10 分钟静置、泡茶 30 秒内搅拌、摸头发后未洗手复工等）**：保留 **`±60 秒` 窗口（及起止时间段包含匹配）**，且**豁免单点时间戳误差统计**。
 - **黄金集版本防串台（`golden_version`，`ruler-v2`）**：每次评测自动计算 `golden_version` 哈希；当且仅当两轮评测使用完全相同的黄金集题目与视频集合时，`Tab 3: 历史轮次对比` 才会将它们纳入同一张图表对比。
+- **模型下拉框候选来自 `Tab0`**：`Tab0` 的 `B3/B4`（`Active_Model_Version` / `Fallback_Model_Version`）与 `Tab3` 的 `D 列 Model_Version` 下拉框选项 = 内置基线模型 + `Tab0_版本总控与回滚开关` 中出现的所有模型名（`Active_Model_Version` / `Fallback_Model_Version` / `Candidate_Models_Discovered` 行的 B 列，以及任意行的 `D 列 候选列表`，以 `|` 分隔，括注如 `(🆕 新模型可用待测试)` 会被自动剥离）。**想评测一个新模型（如 `gemini-3.5-flash`、`gemini-3.1-pro-preview`），只需把它追加到 `Tab0` 的 `候选列表` 单元格里**，下一次 15 分钟调度刻度即自动刷新两处下拉框，无需重启或改代码。
+- **不支持 agentic 视频理解的模型自动回退 static**：Vertex 对不支持 agentic 视频理解的模型（实测 `gemini-3.5-flash`、`gemini-3.1-pro-preview`）返回 `400 INVALID_ARGUMENT: Agentic video processing is not enabled for this model`；系统在首个切片收到该错误后自动改为 static 抽帧并对本进程内该模型的后续切片直接走 static，该次评测在 `eval_history.jsonl`、轮次均值与测评报告 Sheet 中记录为 **`media_mode=static`**（`Tab3` 的 `J 列` 摘要与 Chat 卡片同样标注 `视频模式`）。**要做模型间的同口径对比，请让所有候选模型跑同一种模式**：Cloud Build 传 `_MEDIA_MODE=static`（`eval/cloudbuild_round.yaml` 的 `VIDEO_MEDIA_PROCESSING=${_MEDIA_MODE}`，默认 `agentic`）。
 - **常用模块 CLI（均支持 `--help`）**：
   - `eval/run_gcp_round.py`：在本地或通过 `eval/cloudbuild_round.yaml` 运行评测轮次；
   - `eval/sheet_report.py`：为已有运行补生成或原地刷新 5-Tab Google Sheet 报告（`python -m eval.sheet_report --history eval/rounds/eval_history.jsonl --score eval/results/<run_id>/score.json --folder-id <文件夹ID>`）；

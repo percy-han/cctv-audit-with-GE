@@ -292,7 +292,9 @@ def build_items_table(
                 item.get("focus", ""),
                 item.get("sop_category", ""),
                 part.get("temporal_mode", ""),
-                _blank(part.get("window_sec")),
+                (part.get("window_label") if part.get("window_label") and (
+                    part.get("dwell_sec") or part.get("window_before_sec") != part.get("window_after_sec"))
+                 else _blank(part.get("window_sec"))),
                 gpart.get("description") or item.get("finding_verbatim", ""),
                 ", ".join(gpart.get("osd_times") or []),
                 score,

@@ -108,7 +108,62 @@ VALID_TRIGGER_MINUTES_UTC: tuple[str, ...] = ("00", "15", "30", "45")
 VALID_LOOKBACK_DAYS_OPTIONS: tuple[str, ...] = ("0.5", "1", "2", "3", "4", "5", "6", "7")
 VALID_LOOKBACK_DAYS_VALUES: frozenset[float] = frozenset({0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0})
 VALID_ENABLED_DROPDOWN_OPTIONS: tuple[str, ...] = ("ENABLED", "PAUSED")
-_VALID_SHEET_CACHE: set[str] = set()
+# `ensure_master_sheet_validations` memo: sheet_id -> the model dropdown options it last applied
+# (the `tuple(models)` signature). Each scheduler tick re-reads Tab0, recomputes the options and
+# compares them with this, so a model name typed into the Tab0 候选列表 reaches the Tab0 B3:B4 and
+# Tab3 column D dropdowns on the next tick without a restart. Whole-sheet work (migrations +
+# `batchUpdate`) only runs when the signature changed or `force=True`.
+_VALID_SHEET_CACHE: dict[str, tuple[str, ...]] = {}
+
+# Tab0 rows whose column B (`当前生效值`) may name a model. Column D (`候选列表`) is read on every row.
+TAB0_MODEL_VALUE_KEYS: frozenset[str] = frozenset(
+    {"Active_Model_Version", "Fallback_Model_Version", "Candidate_Models_Discovered"}
+)
+TAB0_MODEL_CANDIDATES_RANGE = "A1:D30"
+# A Vertex Gemini model id, e.g. gemini-3.8-flash / gemini-3.1-pro-preview / gemini-2.5-flash.
+# ASCII on purpose: `\w` would otherwise swallow CJK text glued to a name.
+_MODEL_CANDIDATE_RE = re.compile(r"^gemini-\d[\w.\-]*$", re.ASCII)
+# Trailing operator / runtime notes such as `gemini-x (🆕 新模型可用待测试)` or `gemini-y（已测）`.
+_TRAILING_PAREN_NOTE_RE = re.compile(r"(?:\s*[（(][^()（）]*[)）])+\s*$")
+
+
+def collect_model_candidates_from_tab0(rows: Sequence[Sequence[str]]) -> list[str]:
+    """Model names an operator may pick, read from `Tab0_版本总控与回滚开关` rows (`A1:D30`).
+
+    Row layout: `配置项 (Config_Key)` | `当前生效值 (Active_Value)` | `说明` | `候选列表 (Candidates)`.
+    Collects column B of the `Active_Model_Version` / `Fallback_Model_Version` /
+    `Candidate_Models_Discovered` rows and column D of every row; each cell is split on `|`,
+    every token loses surrounding whitespace and any trailing parenthetical note (`(...)` /
+    `（...）`), and only tokens that look like a Gemini model id (`^gemini-\\d[\\w.\\-]*$`) are
+    kept. Returns the ordered, de-duplicated list (first occurrence wins). Header rows, empty
+    cells and non-model text (`AUTO_LATEST_FLASH`, notes, URLs) are ignored.
+    """
+    found: dict[str, None] = {}
+
+    def _take(cell: object) -> None:
+        for raw_token in str(cell or "").split("|"):
+            token = _TRAILING_PAREN_NOTE_RE.sub("", raw_token.strip()).strip()
+            if token and _MODEL_CANDIDATE_RE.match(token):
+                found.setdefault(token, None)
+
+    for row in rows or []:
+        cells = [str(c) if c is not None else "" for c in row]
+        key = cells[0].strip() if cells else ""
+        if key in TAB0_MODEL_VALUE_KEYS and len(cells) > 1:
+            _take(cells[1])
+        if len(cells) > 3:
+            _take(cells[3])
+    return list(found)
+
+
+def default_model_dropdown_options() -> list[str]:
+    """The baseline model options every dropdown carries even when Tab0 names none."""
+    return [config.fallback_model_version, "gemini-3-flash-preview", "gemini-2.5-flash"]
+
+
+def model_dropdown_options(tab0_rows: Sequence[Sequence[str]]) -> list[str]:
+    """Baseline options followed by the Tab0 candidates, de-duplicated in order."""
+    return list(dict.fromkeys(default_model_dropdown_options() + collect_model_candidates_from_tab0(tab0_rows)))
 
 
 class ScheduledAuditRule(BaseModel):
@@ -1647,18 +1702,9 @@ def build_master_sheet_validation_requests(
                 discovered_prompt_tabs.append(title)
 
     effective_prompt_versions = list(prompt_versions or discovered_prompt_tabs or [config.default_prompt_version])
-    effective_models = list(
-        dict.fromkeys(
-            list(
-                model_versions
-                or [
-                    config.fallback_model_version,
-                    "gemini-3-flash-preview",
-                    "gemini-2.5-flash",
-                ]
-            )
-        )
-    )
+    # `model_versions` is normally `model_dropdown_options(tab0_rows)` (baseline + Tab0 候选列表);
+    # the baseline alone is the fallback when the caller has no Tab0 rows.
+    effective_models = list(dict.fromkeys(list(model_versions or default_model_dropdown_options())))
 
     def _one_of_list_rule(options: Sequence[str], input_msg: str) -> dict:
         return {
@@ -2242,20 +2288,68 @@ class GoogleSheetsConfigClient:
                 exc,
             )
 
+    @staticmethod
+    def _http_status_of(exc: BaseException) -> Optional[int]:
+        """HTTP status of a googleapiclient `HttpError` (`None` for anything else)."""
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        try:
+            return int(status) if status is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _read_model_dropdown_options_sync(self, svc, sheet_id: str) -> tuple[str, ...]:
+        """Model dropdown options for `sheet_id`: the baseline plus every model Tab0 names
+        (`model_dropdown_options`), from one uncached `values.get` so operator edits show up on
+        the next tick.
+
+        A missing Tab0 (HTTP 400 `Unable to parse range`) yields the baseline only. Any other
+        failure (403 / 429 / 5xx / network) is raised so the caller leaves the sheet and the memo
+        untouched this tick, instead of shrinking the strict dropdowns to the baseline and
+        flagging every Tab3 row that already names a Tab0 candidate.
+        """
+        try:
+            resp = (
+                svc.spreadsheets()
+                .values()
+                .get(
+                    spreadsheetId=sheet_id,
+                    range=f"'{self.TAB0_TITLE}'!{TAB0_MODEL_CANDIDATES_RANGE}",
+                )
+                .execute(num_retries=3)
+            )
+        except Exception as exc:
+            if self._http_status_of(exc) == 400:
+                logger.warning(
+                    "Tab %r of %s is not readable (%s); model dropdowns keep the baseline list only",
+                    self.TAB0_TITLE,
+                    sheet_id,
+                    exc,
+                )
+                return tuple(default_model_dropdown_options())
+            raise
+        rows = [[str(c) for c in r] for r in (resp.get("values") or [])]
+        return tuple(model_dropdown_options(rows))
+
     async def ensure_master_sheet_validations(
         self, sheet_id: str, *, force: bool = False
     ) -> bool:
         """Idempotently migrates legacy `Tab2_定时巡检配置表` rows to the UTC dropdown schema,
         migrates or auto-creates `Tab3_黄金集评测工作台` (10-column 3-path schema), and applies native
         Google Sheets `setDataValidation` rules across Tab 0, Prompt_*, Tab 2, and Tab 3.
+
+        The model dropdowns (Tab0 B3:B4, Tab3 column D) list the baseline models plus every model
+        named in Tab0 (`collect_model_candidates_from_tab0`). Tab0 is re-read on every call; the
+        whole-sheet work only runs when that list differs from the one last applied to `sheet_id`
+        (`_VALID_SHEET_CACHE`) or `force=True`.
         """
         if not sheet_id or sheet_id.startswith("gs://"):
             return False
-        if not force and sheet_id in _VALID_SHEET_CACHE:
-            return True
 
-        def _migrate_and_validate_sync() -> bool:
+        def _migrate_and_validate_sync() -> tuple[tuple[str, ...], bool]:
             svc = self._sheets_service()
+            models = self._read_model_dropdown_options_sync(svc, sheet_id)
+            if not force and _VALID_SHEET_CACHE.get(sheet_id) == models:
+                return models, False
             meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute(num_retries=3)
             tab_titles = {
                 str((s.get("properties") or {}).get("title") or "")
@@ -2362,22 +2456,27 @@ class GoogleSheetsConfigClient:
                 ).execute(num_retries=3)
                 meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute(num_retries=3)
 
-            reqs = build_master_sheet_validation_requests(meta)
+            reqs = build_master_sheet_validation_requests(meta, model_versions=list(models))
             if reqs:
                 svc.spreadsheets().batchUpdate(
                     spreadsheetId=sheet_id,
                     body={"requests": reqs},
                 ).execute(num_retries=3)
-            return True
+            logger.info(
+                "Applied master sheet validations on %s; model dropdown options: %s",
+                sheet_id,
+                ", ".join(models),
+            )
+            return models, True
 
         try:
-            ok = await asyncio.to_thread(_migrate_and_validate_sync)
-            if ok:
-                _VALID_SHEET_CACHE.add(sheet_id)
+            models, applied = await asyncio.to_thread(_migrate_and_validate_sync)
+            _VALID_SHEET_CACHE[sheet_id] = models
+            if applied:
                 _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB2_SCHEDULED_TITLE}!A1:I200", None)
                 _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB3_EVAL_TITLE}!A1:J200", None)
                 _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB4_SPOT_CHECK_TITLE}!A1:I100", None)
-            return ok
+            return True
         except Exception as exc:
             logger.warning(
                 "Could not apply master sheet validations on %s: %s", sheet_id, exc

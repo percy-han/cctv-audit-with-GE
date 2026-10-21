@@ -1143,7 +1143,7 @@ def test_multi_session_concurrent_gcs_and_drive_no_job_id_collision(tmp_path, mo
     user = "supervisor@example.com"
     s1, s2 = "3643623919782948205", "13472844817418706168"
     gcs_url = "gs://store-videos/store-a"
-    drive_url = "https://drive.google.com/drive/folders/1YFrYPRhqYAh3ZYpp6P8UxOr8yRkkuftj?usp=drive_link"
+    drive_url = "https://drive.google.com/drive/folders/1ExampleStoreFolderId000000000000?usp=drive_link"
     monkeypatch.setattr(audit_service_module.config, "master_prompt_sheet_id", "")
     monkeypatch.setattr(audit_service_module.config, "gcs_sop_uri", "")
 
@@ -1197,7 +1197,7 @@ def test_multi_session_concurrent_gcs_and_drive_no_job_id_collision(tmp_path, mo
     assert job_gcs.job_id != job_drive.job_id
     assert f"预检单号 `{job_gcs.job_id}`" in r1 and f"单号 `{job_gcs.job_id}`" in r1
     assert f"预检单号 `{job_drive.job_id}`" in r2 and job_gcs.job_id not in r2
-    assert job_gcs.folder_id == gcs_url and job_drive.folder_id == "1YFrYPRhqYAh3ZYpp6P8UxOr8yRkkuftj"
+    assert job_gcs.folder_id == gcs_url and job_drive.folder_id == "1ExampleStoreFolderId000000000000"
 
     # 2. CONFIRM in session 1 -> job_gcs RUNNING and now the most recently updated job of the user.
     c1 = turn(s1, "确认")

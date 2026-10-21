@@ -42,25 +42,25 @@ from cctv_audit.workspace_reporter import ViolationSheetRow, WorkspaceReporter
 def test_detect_spot_check_tab_strictly_inspects_latest_user_utterance() -> None:
     assert (
         detect_spot_check_tab(
-            "请帮忙稽核视频：https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
+            "请帮忙稽核视频：https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000"
         )
         == ""
     )
     assert (
         detect_spot_check_tab(
-            "@CHAGEE 门店视频 AI 稽核专家 请帮忙稽核视频：https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
+            "@CHAGEE 门店视频 AI 稽核专家 请帮忙稽核视频：https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000"
         )
         == ""
     )
     assert (
         detect_spot_check_tab(
-            "【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频：https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
+            "【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频：https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000"
         )
         == TAB4_SPOT_CHECK_TITLE
     )
     assert (
         detect_spot_check_tab(
-            "@CHAGEE 门店视频 AI 稽核专家 【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频：https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
+            "@CHAGEE 门店视频 AI 稽核专家 【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频：https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000"
         )
         == TAB4_SPOT_CHECK_TITLE
     )
@@ -73,14 +73,14 @@ def test_detect_spot_check_tab_strictly_inspects_latest_user_utterance() -> None
     multi_turn = (
         "[user] 【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频：<历史链接>\n"
         "[assistant] ⚠️ 【当前为专项抽检 / 新 SOP 测试模式（非全量稽核）】\n"
-        "[user] @CHAGEE 门店视频 AI 稽核专家 请帮忙稽核视频，https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
+        "[user] @CHAGEE 门店视频 AI 稽核专家 请帮忙稽核视频，https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000"
     )
     assert detect_spot_check_tab(multi_turn) == ""
 
 
 def test_classify_turn_populates_target_prompt_tab_and_anti_confusion_fallback() -> None:
     async def _run() -> None:
-        folder_url = "https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
+        folder_url = "https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000"
 
         d_full = verify_url_verbatim(
             TurnDecision(action=TurnAction.INSPECT, drive_url=folder_url, target_prompt_tab="Tab4_专项测试表"),
@@ -118,7 +118,7 @@ def test_classify_turn_populates_target_prompt_tab_and_anti_confusion_fallback()
 
 def test_prompt_manager_tab4_scope_lock_and_empty_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _run() -> None:
-        monkeypatch.setattr(config, "master_prompt_sheet_id", "1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w")
+        monkeypatch.setattr(config, "master_prompt_sheet_id", "1ExampleMasterSopSheetId00000000000000000000")
         custom_rule = SopRuleItem(
             rule_id="C9",
             name="C9 · 新增果糖机喷嘴清洁测试",
@@ -223,7 +223,7 @@ def test_master_sheet_validation_requests_include_tab4() -> None:
 
 def test_two_step_spot_check_preflight_confirm_and_worker_execute(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def _run() -> None:
-        monkeypatch.setattr(config, "master_prompt_sheet_id", "1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w")
+        monkeypatch.setattr(config, "master_prompt_sheet_id", "1ExampleMasterSopSheetId00000000000000000000")
         store = UserScopedJobStore(state_dir=tmp_path / "jobs", gcs_bucket="")
         video = VideoMetadataItem(
             file_id="vid_1",
@@ -300,7 +300,7 @@ def test_two_step_spot_check_preflight_confirm_and_worker_execute(tmp_path: Path
             reporter=WorkspaceReporter(gateway=None, enable_notification=False),
         )
 
-        folder_url = "https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
+        folder_url = "https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000"
 
         job_spot = await svc.preflight(
             user_id="sup@chagee.com",
@@ -517,7 +517,7 @@ def test_rule_scoped_smart_append_preserves_other_rules_on_same_video() -> None:
 
 def test_portal_renders_custom_new_sop_rule_from_tab4(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def _run() -> None:
-        monkeypatch.setattr(config, "master_prompt_sheet_id", "1yPHZgVtOsmrfVaC8aqM3GZ9ftm3T8cep9MqTRDroo8w")
+        monkeypatch.setattr(config, "master_prompt_sheet_id", "1ExampleMasterSopSheetId00000000000000000000")
         store = UserScopedJobStore(state_dir=tmp_path / "jobs", gcs_bucket="")
         job = AuditJob(
             job_id="ab12cd",
@@ -610,7 +610,7 @@ def test_engine_prompt_chips_canned_queries_sync(monkeypatch: pytest.MonkeyPatch
     from deploy import deploy_reasoning_engine as dre
 
     agent_name = "霸王茶姬 (CHAGEE) 门店监控 AI 稽核专家"
-    folder_url = "https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
+    folder_url = "https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000"
     chips = dre.build_engine_prompt_chips(agent_name, folder_url)
     chip_ids = [cid for cid, _ in chips]
     assert chip_ids == ["cctv-full-audit", "cctv-tab4-spot-check"]
@@ -701,15 +701,15 @@ def test_extract_drive_id_handles_ge_smart_chip_syntax() -> None:
 
     assert (
         extract_drive_id(
-            "https://drive.google.com/drive/folders/1TfNVXCpc2clCzCCTX47CNviN-9J42fp1?usp=drive_link:1-Bau Cat"
+            "https://drive.google.com/drive/folders/1ExampleStoreFolderId222222222222?usp=drive_link:1-Bau Cat"
         )
-        == "1TfNVXCpc2clCzCCTX47CNviN-9J42fp1"
+        == "1ExampleStoreFolderId222222222222"
     )
     assert (
         extract_drive_id(
-            "https://drive.google.com/drive/folders/1TfNVXCpc2clCzCCTX47CNviN-9J42fp1:1-Bau Cat]"
+            "https://drive.google.com/drive/folders/1ExampleStoreFolderId222222222222:1-Bau Cat]"
         )
-        == "1TfNVXCpc2clCzCCTX47CNviN-9J42fp1"
+        == "1ExampleStoreFolderId222222222222"
     )
 
 

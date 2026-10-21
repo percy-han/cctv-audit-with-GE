@@ -1044,7 +1044,7 @@ def test_sop_sheet_url_extraction_and_hot_switch() -> None:
 
     # A URL-shaped value we cannot parse (e.g. a Drive *folder* link) must fail fast at
     # config construction, never reach the Sheets API, and never silently degrade the prompt.
-    folder_url = "https://drive.google.com/drive/folders/1yJW83oOINAdFcWEIIOwmFAFiy2Sr2fLE"
+    folder_url = "https://drive.google.com/drive/folders/1ExampleAuditFolderId000000000000"
     for bad_value in (folder_url, ""):
         try:
             extract_spreadsheet_id(bad_value)
@@ -1221,7 +1221,7 @@ def test_ge_a2a_and_adk_wire_protocols_and_is_busy_probe() -> None:
 
         preflight_rep = InspectFolderResponse(
             passed=True,
-            folder_id="1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ",
+            folder_id="1ExampleTestFolderId0000000000000",
             total_videos=2,
             total_size_mb=950.0,
             total_duration_sec=4170.0,
@@ -1260,7 +1260,7 @@ def test_ge_a2a_and_adk_wire_protocols_and_is_busy_probe() -> None:
                 job_id="275db5",
                 user_id="auditor_sg@chagee.com",
                 session_id="sess-001",
-                folder_id="1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ",
+                folder_id="1ExampleTestFolderId0000000000000",
                 state=job_state,
                 preflight_report=rep,
                 completed_segments={},
@@ -1305,7 +1305,7 @@ def test_zero_db_cross_instance_job_store_continuity() -> None:
                 job_id="job_cross_instance_01",
                 user_id="auditor_vn@chagee.com",
                 session_id="sess-vn-01",
-                folder_id="1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ",
+                folder_id="1ExampleTestFolderId0000000000000",
                 state=JobState.READY,
             )
             await instance_1.save(job_turn1)
@@ -1320,7 +1320,7 @@ def test_zero_db_cross_instance_job_store_continuity() -> None:
             assert rehydrated is not None
             assert rehydrated.job_id == "job_cross_instance_01"
             assert rehydrated.state == JobState.READY
-            assert rehydrated.folder_id == "1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
+            assert rehydrated.folder_id == "1ExampleTestFolderId0000000000000"
 
         asyncio.run(_run())
     finally:
@@ -1438,7 +1438,7 @@ def test_tier1_tier2_crash_checkpoint_and_resume_zero_duplicate_tokens() -> None
             )
             job = await svc_1.preflight(
                 user_id="auditor_crash@chagee.com",
-                drive_url="https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ",
+                drive_url="https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000",
                 preloaded_items=[item],
             )
             crashed_job = await svc_1.start_audit(
@@ -1587,7 +1587,7 @@ def test_unattended_watchdog_auto_resumes_crashed_tier2_after_20_min_without_use
             )
             job = await svc_1.preflight(
                 user_id="supervisor_offline@chagee.com",
-                drive_url="https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ",
+                drive_url="https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000",
                 preloaded_items=[item],
             )
             ckpt_0 = SegmentCheckpoint(
@@ -1850,7 +1850,7 @@ def test_tc017_ge_stream_heartbeat_and_turn_latency_optimizations() -> None:
                 "content": {
                     "parts": [
                         {
-                            "text": "帮我检查 https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
+                            "text": "帮我检查 https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000"
                         }
                     ]
                 },
@@ -1861,7 +1861,7 @@ def test_tc017_ge_stream_heartbeat_and_turn_latency_optimizations() -> None:
                     "parts": [
                         {
                             "text": (
-                                "✅ 预检通过（单号 `275db5`） https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ\n"
+                                "✅ 预检通过（单号 `275db5`） https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000\n"
                                 "| 视频 | 分辨率 | 时长 |\n"
                                 "| --- | --- | --- |\n"
                                 + ("| Footage.mp4 | 1920x1080 | 300s |\n" * 40)
@@ -1876,14 +1876,14 @@ def test_tc017_ge_stream_heartbeat_and_turn_latency_optimizations() -> None:
     lines = extracted.splitlines()
     assert len(lines) == 5  # last 4 historical events + 1 current user line
     assert "Old turn 0" not in extracted and "Old turn 3" not in extracted
-    assert "1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ" not in extracted
+    assert "1ExampleTestFolderId0000000000000" not in extracted
     assert "<历史链接>" in extracted
     assert "| 视频 | 分辨率 |" not in extracted
     assert lines[-1] == "[user] 确认开始"
     # If the LLM router ever mis-picks INSPECT with Turn 1's URL on Turn 2, verify_url_verbatim blocks it!
     misrouted = TurnDecision(
         action=TurnAction.INSPECT,
-        drive_url="https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ",
+        drive_url="https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000",
         reply_summary="误把确认当成预检",
     )
     assert verify_url_verbatim(misrouted, extracted).action == TurnAction.UNCLEAR
@@ -1896,7 +1896,7 @@ def test_tc017_ge_stream_heartbeat_and_turn_latency_optimizations() -> None:
         return SimpleNamespace(
             parsed=TurnDecision(
                 action=TurnAction.INSPECT,
-                drive_url="https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ",
+                drive_url="https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000",
                 reply_summary="发起预检",
             ),
             text="",
@@ -1905,7 +1905,7 @@ def test_tc017_ge_stream_heartbeat_and_turn_latency_optimizations() -> None:
     async def _run_async_checks() -> None:
         with mock.patch.object(turn_mod, "generate_content_with_retry", _fake_router_generate):
             dec = await turn_mod.classify_turn_with_llm(
-                "请预检 https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ"
+                "请预检 https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000"
             )
         assert dec.action == TurnAction.INSPECT
         assert len(captured_gen_configs) == 1

@@ -532,6 +532,7 @@ def build_agent_platform_evaluation_items(
             part_id = str(part.get("part_id") or "")
             t_mode = score_run.classify_temporal_mode(item, part)
             w_sec = score_run.part_window_sec(t_mode)
+            pw = score_run.part_time_window(item, part, t_mode)
             ref_text = score_run.render_reference(item, part)
             video_filenames = list(item.get("video_filenames") or [])
             cands = score_run.prefilter(
@@ -539,6 +540,8 @@ def build_agent_platform_evaluation_items(
                 video_filenames,
                 findings,
                 window_sec=w_sec,
+                window_before_sec=pw.before,
+                window_after_sec=pw.after,
             )
             raw_resp = score_run.render_candidates(cands) or "（该时间窗内无候选告警）"
             p_info = part_score_map.get(part_id, {})
@@ -553,7 +556,7 @@ def build_agent_platform_evaluation_items(
             outlet_name = str(item.get("outlet_name") or "")
             split = str(item.get("split") or "holdout")
             prompt_display = (
-                f"[{part_id} | {split} | {sop_cat} | {outlet_name} | {t_mode} ±{w_sec}s]\n"
+                f"[{part_id} | {split} | {sop_cat} | {outlet_name} | {t_mode} {pw.label()}]\n"
                 f"{ref_text}"
             )
             items_out.append(
@@ -571,6 +574,9 @@ def build_agent_platform_evaluation_items(
                     "sop_category": sop_cat,
                     "temporal_mode": t_mode,
                     "window_sec": w_sec,
+                    "window_before_sec": pw.before,
+                    "window_after_sec": pw.after,
+                    "dwell_sec": pw.dwell_sec,
                     "round_id": round_id,
                     "run_id": run_id,
                     "sop_version": sop_version,

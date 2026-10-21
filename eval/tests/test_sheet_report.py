@@ -17,7 +17,7 @@ HISTORY = EVAL_DIR / "rounds" / "eval_history.jsonl"
 SCORE = EVAL_DIR / "results" / "r02_run2" / "score.json"
 GOLDEN = EVAL_DIR / "data" / "golden_v1.jsonl"
 NOW = datetime(2026, 10, 10, 1, 2, 3, tzinfo=timezone.utc)
-FOLDER = "1ky221gNbzgIT83981ghVpFc03and4s-g"
+FOLDER = "1ExampleEvalResultsFolderId000000"
 
 
 def _fixture():

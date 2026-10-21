@@ -56,6 +56,7 @@ from cctv_audit.agentic_auditor import (  # noqa: E402
     TokenLedgerRow,
     WindowResult,
     deduplicate_overlapping_findings,
+    effective_media_mode,
 )
 from cctv_audit.config import AuditConfig, config  # noqa: E402
 from cctv_audit.gcp import GoogleWorkspaceGateway, workspace_credentials  # noqa: E402
@@ -737,13 +738,17 @@ async def run_round_async(args: argparse.Namespace) -> int:
     )
 
     updated_manifest = json.loads((round_dir / "manifest.json").read_text(encoding="utf-8"))
+    # The mode the model actually ran in: a model that rejected agentic video fell back to static
+    # inside `AgenticAuditor.analyze_segment`, and the history / round averages / Sheet report
+    # must say so, or two runs of different modes would be compared as equals.
+    media_mode = effective_media_mode(str(prompt_cfg.active_model_version), cfg.video_media_processing)
     mon_record = build_eval_monitoring_record(
         project_id=cfg.gcp_project,
         round_id=args.round,
         run_id=run_id,
         model_version=str(prompt_cfg.active_model_version),
         sop_version=str(prompt_cfg.active_prompt_version),
-        media_mode=str(cfg.video_media_processing),
+        media_mode=media_mode,
         score_doc=score_doc,
         job_docs=job_docs,
         round_manifest=updated_manifest,
@@ -970,13 +975,16 @@ async def run_sheet_triggered_eval(
         "sop_tab_name": prompt_cfg.active_prompt_version,
         "hypothesis": f"Sheet Workbench Evaluation: {eval_name} ({eval_id})",
     }
+    # Effective, not configured: see `run_round_async` (a model that rejected agentic video is
+    # recorded as `static`). Tab3 model comparisons read this column.
+    media_mode = effective_media_mode(str(prompt_cfg.active_model_version), cfg.video_media_processing)
     mon_record = build_eval_monitoring_record(
         project_id=cfg.gcp_project,
         round_id=round_id,
         run_id=run_id,
         model_version=str(prompt_cfg.active_model_version),
         sop_version=str(prompt_cfg.active_prompt_version),
-        media_mode=str(cfg.video_media_processing),
+        media_mode=media_mode,
         score_doc=score_doc,
         job_docs=job_docs,
         round_manifest=round_manifest,
@@ -1041,6 +1049,7 @@ async def run_sheet_triggered_eval(
         "run_id": run_id,
         "prompt_tab_name": str(prompt_cfg.active_prompt_version),
         "model_version": str(prompt_cfg.active_model_version),
+        "media_mode": media_mode,
         "overall_recall": float(m.get("overall_recall", 0.0)),
         "confirmed_only_recall": float(m.get("confirmed_only_recall", m.get("overall_recall", 0.0))),
         "holdout_recall": float(m.get("holdout_recall", 0.0)),

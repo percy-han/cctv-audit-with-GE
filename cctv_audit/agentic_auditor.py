@@ -4,7 +4,10 @@ Adapts the battle-tested `Disposition` / `Status` / `Finding` schema and `_norma
 from `percy-han/cctv-audit/cctv_audit/analyzer/schema.py` & `video_analyzer.py`, upgraded for:
 1. Video sampling per slice: agentic video understanding (`types.Part.media_processing =
    MediaProcessing.AGENTIC` on the video Part) by default when the Tab 0 `Active_Model_Version`
-   is a Gemini 3.x model (`VIDEO_MEDIA_PROCESSING` defaults to `"agentic"`).
+   is a Gemini 3.x model (`VIDEO_MEDIA_PROCESSING` defaults to `"agentic"`). A 3.x model that
+   answers `400 ... Agentic video processing is not enabled for this model` is marked in
+   `_AGENTIC_UNSUPPORTED_MODELS` and falls back to static sampling for the rest of the process
+   (`effective_media_mode` reports which mode a model is really running in).
 2. `gemini_semaphore = asyncio.Semaphore(5)` concurrency gate.
 3. 100-word `carryover_state_summary` for seamless temporal stitching across 30-min segments.
 4. `extract_evidence_clip()`: FFmpeg 5-10s MP4 video clipping for `FRAMEABLE = (CONFIRMED, SUSPECTED)`
@@ -23,13 +26,13 @@ import time
 import unicodedata
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from google.genai import types
 from pydantic import BaseModel, Field, field_validator
 
 from .config import config
-from .gcp import gemini_timeout_ms_for_slice, generate_content_with_retry
+from .gcp import AGENTIC_NOT_ENABLED_MARKER, gemini_timeout_ms_for_slice, generate_content_with_retry
 from .gcs_gateway import build_source_video_url
 from .prompt_manager import PromptModelConfig
 from .video_ingestor import VideoSliceSegment
@@ -503,15 +506,52 @@ def _parse_window_result_or_repair(raw_text: str) -> WindowResult:
 # Agentic video understanding is only served for Gemini 3.x models.
 AGENTIC_VIDEO_MODEL_MARKER = "gemini-3"
 
+# Not every Gemini 3.x model has agentic video enabled: on Vertex `global` (probe 2026-10-20)
+# `gemini-3.8-flash` accepts `media_processing=AGENTIC`, while `gemini-3.5-flash` and
+# `gemini-3.1-pro-preview` answer `400 INVALID_ARGUMENT: Agentic video processing is not enabled
+# for this model`. The first slice that hits that error marks the model here and every later
+# slice in this process goes straight to static sampling, so a Tab3 evaluation of such a model
+# costs one failed call instead of failing every clip. Per process on purpose: the registry is
+# learned from the live endpoint, so a model that gains agentic serving is picked up on restart.
+_AGENTIC_UNSUPPORTED_MODELS: set[str] = set()
+
+
+def is_agentic_not_enabled_error(exc: BaseException) -> bool:
+    """True when `exc` is Vertex's `Agentic video processing is not enabled for this model` 400.
+
+    google-genai's `APIError` keeps the server message in `.message` and repeats it inside
+    `str(exc)` (`400 INVALID_ARGUMENT. {'error': {...}}`); both are checked.
+    """
+    texts = (str(exc), str(getattr(exc, "message", "") or ""))
+    return any(AGENTIC_NOT_ENABLED_MARKER in text for text in texts)
+
+
+def mark_agentic_unsupported(model_name: str) -> None:
+    """Remembers for this process that `model_name` rejects agentic video (see `wants_agentic_video`)."""
+    if model_name:
+        _AGENTIC_UNSUPPORTED_MODELS.add(model_name)
+
 
 def wants_agentic_video(model_name: str, media_processing: Optional[str] = None) -> bool:
-    """True when agentic video mode is enabled (the default) AND `model_name` is a Gemini 3.x model.
+    """True when agentic video mode is enabled (the default) AND `model_name` is a Gemini 3.x model
+    that has not been marked as rejecting agentic video (`mark_agentic_unsupported`).
 
     `media_processing` defaults to `config.video_media_processing` (env `VIDEO_MEDIA_PROCESSING`,
     default "agentic"), read at call time.
     """
     mode = media_processing if media_processing is not None else config.video_media_processing
-    return mode == "agentic" and AGENTIC_VIDEO_MODEL_MARKER in (model_name or "")
+    if mode != "agentic" or AGENTIC_VIDEO_MODEL_MARKER not in (model_name or ""):
+        return False
+    return model_name not in _AGENTIC_UNSUPPORTED_MODELS
+
+
+def effective_media_mode(
+    model_name: str, media_processing: Optional[str] = None
+) -> Literal["agentic", "static"]:
+    """The sampling mode `build_video_part` uses for `model_name` right now: `"agentic"` only when
+    `wants_agentic_video` holds, `"static"` otherwise (switch off, non-3.x model, or a model that
+    fell back after the not-enabled 400). Eval records report this, not the configured switch."""
+    return "agentic" if wants_agentic_video(model_name, media_processing) else "static"
 
 
 def enable_agentic_media_processing(video_part: types.Part) -> bool:
@@ -559,7 +599,8 @@ def build_video_part(
 
 class AgenticAuditor:
     """Runs the Tab 0 `Active_Model_Version` over each slice (agentic video mode by default for
-    Gemini 3.x) under the Gemini semaphore and cuts 20s evidence clips."""
+    Gemini 3.x, static fallback for a model that rejects it) under the Gemini semaphore and cuts
+    20s evidence clips."""
 
     def __init__(self, gemini_concurrency: int = config.gemini_concurrency) -> None:
         self._gemini_semaphore = asyncio.Semaphore(gemini_concurrency)
@@ -592,7 +633,11 @@ class AgenticAuditor:
             f"4. 在 `carryover_state_summary` 中附上本段结尾 OSD 时间及所有尚未闭环的跨段追踪状态/计时起点。"
         )
 
-        video_part = build_video_part(segment, prompt_cfg.active_model_version)
+        model_name = prompt_cfg.active_model_version
+        # Decided before the call: a concurrent slice may mark the model unsupported while this
+        # request is in flight, and the fallback below must key off what THIS request sent.
+        sent_agentic = wants_agentic_video(model_name)
+        video_part = build_video_part(segment, model_name)
 
         gen_config = types.GenerateContentConfig(
             system_instruction=prompt_cfg.system_instruction,
@@ -601,16 +646,34 @@ class AgenticAuditor:
             temperature=0.0,
             max_output_tokens=65536,
         )
+        timeout_ms = gemini_timeout_ms_for_slice(segment.end_offset_sec - segment.start_offset_sec)
 
         async with self._gemini_semaphore:
-            response = await generate_content_with_retry(
-                model=prompt_cfg.active_model_version,
-                contents=[video_part, user_prompt],
-                gen_config=gen_config,
-                timeout_ms=gemini_timeout_ms_for_slice(
-                    segment.end_offset_sec - segment.start_offset_sec
-                ),
-            )
+            try:
+                response = await generate_content_with_retry(
+                    model=model_name,
+                    contents=[video_part, user_prompt],
+                    gen_config=gen_config,
+                    timeout_ms=timeout_ms,
+                )
+            except Exception as exc:
+                if not (sent_agentic and is_agentic_not_enabled_error(exc)):
+                    raise
+                # `_is_transient_error` excludes this marker, so the 400 arrives after a single
+                # attempt. Mark the model, rebuild the Part (now static) and call once more; any
+                # failure of the static call propagates unchanged.
+                mark_agentic_unsupported(model_name)
+                logger.warning(
+                    "Model %s does not support agentic video; falling back to static sampling for the rest of this process",
+                    model_name,
+                )
+                video_part = build_video_part(segment, model_name)
+                response = await generate_content_with_retry(
+                    model=model_name,
+                    contents=[video_part, user_prompt],
+                    gen_config=gen_config,
+                    timeout_ms=timeout_ms,
+                )
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         parsed: WindowResult = (

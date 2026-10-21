@@ -338,7 +338,7 @@ def build_a2a_agent_card(base_url: str) -> Dict[str, Any]:
                 "description": "输入 Google Drive 门店监控视频文件夹链接，执行 SOP 合规预检、启动后台多模态稽核或查询任务进度。",
                 "tags": ["cctv", "chagee", "sop-audit", "video-understanding"],
                 "examples": [
-                    "稽核这个门店监控文件夹：https://drive.google.com/drive/folders/1--hbVk8xE5i-aZrph7Pgy4vZwZdp9-NJ",
+                    "稽核这个门店监控文件夹：https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000",
                     "确认，开始稽核",
                     "刚才那单现在怎么样了？",
                 ],

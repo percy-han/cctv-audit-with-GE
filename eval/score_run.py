@@ -13,6 +13,30 @@ Pipeline
      for dev / holdout / all.
 
 Guardrail metric: alert density = findings per 5-minute clip (mean and max).
+
+Dwell-aware asymmetric windows (Round 80)
+  For "wait / dwell N minutes" SOP parts (sanitiser contact time before wiping / installing back,
+  "stir within 30s" ...) the human and the AI often anchor different moments of the same
+  violation: the label marks the spray (start) while the AI marks the premature wipe / install
+  (end), up to N minutes later. Every part therefore gets an asymmetric window
+  ``[label - before, label + after]`` on the 24-hour ring (signed gap = finding - label):
+
+  - Defaults (unchanged behaviour): POINT 20/20, WINDOW 60/60.
+  - Dwell parts (WINDOW only, never POINT): ``after = min(max(default_after, dwell + 30), 330)``
+    (``DWELL_PAD_SEC`` = 30, cap ``SPAN_MAX_SEC``); ``before`` stays the default. Rationale: every
+    observed miss had the AI *later* than the label (IC2 +56s, IC6 +33s, IC5a +101s), and the
+    customer's sentences ("After spray sanitiser, do not wait 5 minutes ... before wiping") read as
+    anchored on the spray. The mirror direction (``before = min(max(default_before, dwell + 30),
+    330)``) is applied only when the label text carries an explicit end-anchor cue
+    (``_END_ANCHOR`` e.g. "when wiping", "installed back at", "擦拭时", "装回时"). A finding that
+    describes the whole dwell as a span still matches through the unchanged span rule.
+  - Dwell detection precedence, deterministic: (a) explicit ``dwell_sec`` on the part, else on the
+    item (manifest ``item_overrides`` may also set it); (b) parse the part description (fallback:
+    item ``finding_verbatim``) with ``_DWELL_PATTERNS`` (EN ``not wait [for] N min|s``,
+    ``within N s|min``; ZH ``未满/不足/未等/静置/浸泡 N 分钟/秒``); (c) no dwell.
+    Explicit ``window_before_sec`` / ``window_after_sec`` (part, else item) override each side last.
+  - Derived at scoring time from the label text, so the golden file and ``golden_version`` are
+    unchanged. Near-miss diagnostics are computed outside the (new) window.
 """
 
 from __future__ import annotations
@@ -87,6 +111,91 @@ def temporal_mode_and_source(item: dict[str, Any], part: dict[str, Any] | None =
 def part_window_sec(mode: str) -> int:
     """Return the prefilter window in seconds for the given temporal mode."""
     return POINT_WINDOW_SEC if str(mode).upper() == "POINT" else WINDOW_SEC
+
+
+DWELL_PAD_SEC = 30  # slack after the dwell for the premature wipe / install to happen and be seen
+_UNIT_SEC = {"min": 60, "mins": 60, "minute": 60, "minutes": 60, "分钟": 60,
+             "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1, "秒": 1}
+_DWELL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"not\s+wait\s+(?:for\s+)?(\d+(?:\.\d+)?)\s*(minutes|minute|mins|min|seconds|secs|sec|s)\b", re.I),
+    re.compile(r"within\s+(\d+(?:\.\d+)?)\s*(minutes|minute|mins|min|seconds|secs|sec|s)\b", re.I),
+    re.compile(r"(?:未满|不足|未等|静置|浸泡)\s*(\d+(?:\.\d+)?)\s*(分钟|秒)"),
+)
+_END_ANCHOR = re.compile(
+    r"\b(?:when|while)\s+(?:wiping|brushing|installing|cleaning)\b|\binstall(?:ed|ing)?\s+back\s+at\b"
+    r"|\bwiped\s+at\b|(?:擦拭|装回|安装|刷洗)时",
+    re.I,
+)
+
+
+def parse_dwell_sec(text: str) -> int | None:
+    """Dwell / timer length in seconds named by a label text, or None. First pattern that matches
+    wins (see ``_DWELL_PATTERNS``); decimals are rounded to whole seconds."""
+    for pat in _DWELL_PATTERNS:
+        m = pat.search(text or "")
+        if m:
+            return int(round(float(m.group(1)) * _UNIT_SEC[m.group(2).lower()]))
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
+class PartWindow:
+    before: int  # seconds a finding may precede the label
+    after: int  # seconds a finding may follow the label
+    dwell_sec: int | None = None
+    dwell_source: str = ""  # "explicit" | "label_text" | ""
+
+    @property
+    def symmetric(self) -> bool:
+        return self.before == self.after
+
+    def label(self) -> str:
+        """Human-readable window, e.g. ``±60s`` or ``−60s / +330s（静置 5 分钟）``."""
+        core = f"±{self.before}s" if self.symmetric else f"−{self.before}s / +{self.after}s"
+        if self.dwell_sec:
+            d = self.dwell_sec
+            dwell_txt = f"{d // 60} 分钟" if d % 60 == 0 else f"{d} 秒"
+            core += f"（静置 {dwell_txt}）"
+        return core
+
+
+def _int_or_none(v: Any) -> int | None:
+    if v is None or v == "":
+        return None
+    return int(round(float(v)))
+
+
+def part_time_window(item: dict[str, Any], part: dict[str, Any] | None, mode: str) -> PartWindow:
+    """Asymmetric scoring window of a golden part (see the module docstring)."""
+    part = part or {}
+    default = part_window_sec(mode)
+    before, after = default, default
+    dwell, src = None, ""
+    if str(mode).upper() != "POINT":
+        explicit = _int_or_none(part.get("dwell_sec"))
+        if explicit is None:
+            explicit = _int_or_none(item.get("dwell_sec"))
+        text = str(part.get("description") or item.get("finding_verbatim") or "")
+        if explicit is not None:
+            dwell, src = (explicit or None), "explicit"
+        else:
+            dwell = parse_dwell_sec(text)
+            src = "label_text" if dwell else ""
+        if dwell:
+            ext = min(max(default, dwell + DWELL_PAD_SEC), SPAN_MAX_SEC)
+            after = ext
+            if _END_ANCHOR.search(text):
+                before = ext
+    for key, side in (("window_before_sec", "before"), ("window_after_sec", "after")):
+        v = _int_or_none(part.get(key))
+        if v is None:
+            v = _int_or_none(item.get(key))
+        if v is not None:
+            if side == "before":
+                before = v
+            else:
+                after = v
+    return PartWindow(before=before, after=after, dwell_sec=dwell, dwell_source=src if dwell else "")
 
 
 UNCATEGORIZED = "未分类"
@@ -216,14 +325,29 @@ def ring_gap(a: int, b: int) -> int:
     return min(d, 86400 - d)
 
 
-def time_matches(label_sec: int, times: list[int], window_sec: int = WINDOW_SEC) -> bool:
+def signed_ring_gap(finding_sec: int, label_sec: int) -> int:
+    """``finding - label`` in seconds on a 24-hour ring, in [-43200, 43200)."""
+    d = (finding_sec - label_sec) % 86400
+    return d - 86400 if d >= 43200 else d
+
+
+def time_matches_window(label_sec: int, times: list[int], before: int, after: int) -> bool:
+    """Asymmetric match: any finding time with signed gap in ``[-before, +after]``, or a described
+    span (``max - min`` <= span limit) containing the label. Span limit is ``2 * w`` for windows
+    narrower than ``WINDOW_SEC`` (``w = max(before, after)``) else ``SPAN_MAX_SEC`` -- identical to
+    the historical symmetric rule when ``before == after``."""
     if not times:
         return False
-    if any(ring_gap(t, label_sec) <= window_sec for t in times):
+    if any(-before <= signed_ring_gap(t, label_sec) <= after for t in times):
         return True
     lo, hi = min(times), max(times)
-    span_limit = (2 * window_sec) if window_sec < WINDOW_SEC else SPAN_MAX_SEC
+    w = max(before, after)
+    span_limit = (2 * w) if w < WINDOW_SEC else SPAN_MAX_SEC
     return hi - lo <= span_limit and lo <= label_sec <= hi
+
+
+def time_matches(label_sec: int, times: list[int], window_sec: int = WINDOW_SEC) -> bool:
+    return time_matches_window(label_sec, times, window_sec, window_sec)
 
 
 def prefilter(
@@ -231,13 +355,20 @@ def prefilter(
     files: list[str],
     findings: list[Finding],
     window_sec: int = WINDOW_SEC,
+    window_before_sec: int | None = None,
+    window_after_sec: int | None = None,
 ) -> list[Finding]:
+    """Same-video findings inside the part's window. ``window_before_sec`` / ``window_after_sec``
+    (each defaulting to ``window_sec``) give the asymmetric dwell window."""
+    before = window_sec if window_before_sec is None else int(window_before_sec)
+    after = window_sec if window_after_sec is None else int(window_after_sec)
     same_video = [f for f in findings if f.filename in files]
     label_secs = [hms_to_sec(t) for t in part["osd_times"]]
     label_secs = [s for s in label_secs if s is not None]
     if not label_secs:
         return same_video
-    return [f for f in same_video if any(time_matches(s, f.osd_times, window_sec=window_sec) for s in label_secs)]
+    return [f for f in same_video
+            if any(time_matches_window(s, f.osd_times, before, after) for s in label_secs)]
 
 
 def compute_point_timestamp_drift(
@@ -317,17 +448,27 @@ def pick_judge_model(model_names: list[str]) -> str:
 
 
 def near_misses(part: dict[str, Any], files: list[str], findings: list[Finding],
-                exclude: set[str]) -> list[str]:
-    """Same-video findings within NEAR_MISS_SEC but outside the scoring window.
-    Diagnostics for calibrating WINDOW_SEC; never used for the score."""
+                exclude: set[str], window: PartWindow | None = None) -> list[str]:
+    """Same-video findings just outside the scoring window. Diagnostics for calibrating the
+    window; never used for the score. The near band on each side is ``NEAR_MISS_SEC`` from the
+    label, or ``side + (NEAR_MISS_SEC - WINDOW_SEC)`` when a (dwell) side is wider than
+    ``WINDOW_SEC`` -- identical to the historical ``gap <= NEAR_MISS_SEC`` for default windows."""
     label_secs = [s for s in (hms_to_sec(t) for t in part["osd_times"]) if s is not None]
+    extra = NEAR_MISS_SEC - WINDOW_SEC
+
+    def band(side: int) -> int:
+        return side + extra if side > WINDOW_SEC else NEAR_MISS_SEC
+
+    lo_band = band(window.before) if window else NEAR_MISS_SEC
+    hi_band = band(window.after) if window else NEAR_MISS_SEC
     out = []
     for f in findings:
         if f.filename not in files or f.finding_id in exclude or not f.osd_times:
             continue
         for s in label_secs:
-            gap = min(ring_gap(t, s) for t in f.osd_times)
-            if gap <= NEAR_MISS_SEC:
+            gaps = [signed_ring_gap(t, s) for t in f.osd_times]
+            if any(-lo_band <= g <= hi_band for g in gaps):
+                gap = min(abs(g) for g in gaps)
                 out.append(f"{f.finding_id} {f.osd} {f.rule_id} (差 {gap}s)：{f.evidence[:60]}")
                 break
     return out
@@ -472,18 +613,23 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
         per_part: dict[str, list[Finding]] = {}
         part_modes: dict[str, str] = {}
         part_mode_src: dict[str, str] = {}
+        part_windows: dict[str, PartWindow] = {}
         for p in it["parts"]:
             mode, mode_src = temporal_mode_and_source(it, p)
+            pw = part_time_window(it, p, mode)
             part_modes[p["part_id"]] = mode
             part_mode_src[p["part_id"]] = mode_src
+            part_windows[p["part_id"]] = pw
             part_spec_by_id[p["part_id"]] = p
             per_part[p["part_id"]] = prefilter(
-                p, it["video_filenames"], findings, window_sec=part_window_sec(mode)
+                p, it["video_filenames"], findings, window_sec=part_window_sec(mode),
+                window_before_sec=pw.before, window_after_sec=pw.after,
             )
         assign_exclusive_candidates(it, per_part)
         for p in it["parts"]:
             mode = part_modes[p["part_id"]]
             w_sec = part_window_sec(mode)
+            pw = part_windows[p["part_id"]]
             cands = per_part[p["part_id"]]
             ids = [c.finding_id for c in cands]
             row = {
@@ -492,8 +638,13 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
                 "temporal_mode": mode,
                 "temporal_mode_source": part_mode_src[p["part_id"]],
                 "window_sec": w_sec,
+                "window_before_sec": pw.before,
+                "window_after_sec": pw.after,
+                "dwell_sec": pw.dwell_sec,
+                "dwell_source": pw.dwell_source,
+                "window_label": pw.label(),
                 "candidate_ids": ids,
-                "near_misses": near_misses(p, it["video_filenames"], findings, set(ids)),
+                "near_misses": near_misses(p, it["video_filenames"], findings, set(ids), pw),
             }
             if cands:
                 row["case_index"] = len(cases)
@@ -508,9 +659,10 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
         w_sec = int(row.get("window_sec") or WINDOW_SEC)
         mode = str(row.get("temporal_mode") or "WINDOW")
         if "case_index" not in row:
+            win_txt = row.get("window_label") or f"±{w_sec}s"
             row.update(
                 score=0.0,
-                explanation=f"代码预筛：同一视频 ±{w_sec} 秒内没有任何 AI 条目",
+                explanation=f"代码预筛：同一视频 {win_txt} 内没有任何 AI 条目",
                 matched_ids=[],
                 timestamp_drift_sec=None,
             )
@@ -661,6 +813,7 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
             "point_parts_total": len(point_parts),
             "point_parts_matched": len(point_drifts),
             "window_parts_total": len(window_parts),
+            "dwell_parts_total": sum(1 for p in part_rows if p.get("dwell_sec")),
             "mean_point_timestamp_drift_sec": mean_point_drift,
             "max_point_timestamp_drift_sec": max_point_drift,
         },
@@ -709,7 +862,7 @@ def render_markdown(run_label: str, rep: dict[str, Any]) -> str:
     for it in rep["items"]:
         grp = f"{it['focus'].split()[0]} · {it['outlet_name']}"
         modes = "/".join(
-            f"{p.get('temporal_mode', 'WINDOW')}(±{p.get('window_sec', WINDOW_SEC)}s"
+            f"{p.get('temporal_mode', 'WINDOW')}({p.get('window_label') or '±' + str(p.get('window_sec', WINDOW_SEC)) + 's'}"
             + (f",偏移{p['timestamp_drift_sec']}s)" if p.get("timestamp_drift_sec") is not None else ")")
             for p in it["parts"]
         )

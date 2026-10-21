@@ -2132,10 +2132,10 @@ def test_tab3_eval_workbench_parsing_and_dropdown_validations() -> None:
             "V10 基线评测",
             "Prompt_v2.5_V10全量17条标准版",
             "gemini-3.1-flash-preview",
-            "https://drive.google.com/drive/folders/1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY",
-            "https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit",
-            "https://drive.google.com/drive/folders/1ky221gNbzgIT83981ghVpFc03and4s-g",
-            "admin@percyhan.altostrat.com",
+            "https://drive.google.com/drive/folders/1ExampleGoldenVideosFolderId00000",
+            "https://docs.google.com/spreadsheets/d/1ExampleGoldenLabelsSheetId0000000000000000/edit",
+            "https://drive.google.com/drive/folders/1ExampleEvalResultsFolderId000000",
+            "auditor@example.com",
             "START_EVAL",
             "",
         ],
@@ -2144,10 +2144,10 @@ def test_tab3_eval_workbench_parsing_and_dropdown_validations() -> None:
             "无效 SOP 标签页",
             "Prompt_NonExistent",
             "gemini-3.1-flash-preview",
-            "https://drive.google.com/drive/folders/1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY",
-            "https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit",
-            "https://drive.google.com/drive/folders/1ky221gNbzgIT83981ghVpFc03and4s-g",
-            "admin@percyhan.altostrat.com",
+            "https://drive.google.com/drive/folders/1ExampleGoldenVideosFolderId00000",
+            "https://docs.google.com/spreadsheets/d/1ExampleGoldenLabelsSheetId0000000000000000/edit",
+            "https://drive.google.com/drive/folders/1ExampleEvalResultsFolderId000000",
+            "auditor@example.com",
             "START_EVAL",
             "",
         ],
@@ -2159,9 +2159,9 @@ def test_tab3_eval_workbench_parsing_and_dropdown_validations() -> None:
     assert len(valid_rules) == 1
     assert valid_rules[0].eval_id == "EVAL-01"
     assert valid_rules[0].trigger_action == "START_EVAL"
-    assert valid_rules[0].golden_videos_folder_id == "1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY"
-    assert valid_rules[0].golden_source_id == "1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0"
-    assert valid_rules[0].results_folder_id == "1ky221gNbzgIT83981ghVpFc03and4s-g"
+    assert valid_rules[0].golden_videos_folder_id == "1ExampleGoldenVideosFolderId00000"
+    assert valid_rules[0].golden_source_id == "1ExampleGoldenLabelsSheetId0000000000000000"
+    assert valid_rules[0].results_folder_id == "1ExampleEvalResultsFolderId000000"
     assert len(row_errors) == 1
     assert row_errors[0].row_index == 3
     assert "Prompt_NonExistent" in row_errors[0].error_message
@@ -2184,9 +2184,9 @@ def test_tab3_eval_workbench_parsing_and_dropdown_validations() -> None:
             "旧版9列评测",
             "Prompt_v2.5_V10全量17条标准版",
             "gemini-3.1-flash-preview",
-            "https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit",
-            "https://drive.google.com/drive/folders/1ky221gNbzgIT83981ghVpFc03and4s-g",
-            "admin@percyhan.altostrat.com",
+            "https://docs.google.com/spreadsheets/d/1ExampleGoldenLabelsSheetId0000000000000000/edit",
+            "https://drive.google.com/drive/folders/1ExampleEvalResultsFolderId000000",
+            "auditor@example.com",
             "IDLE",
             "",
         ],
@@ -2196,8 +2196,8 @@ def test_tab3_eval_workbench_parsing_and_dropdown_validations() -> None:
     assert migrated[0] == list(EVAL_WORKBENCH_HEADERS)
     assert len(migrated[1]) == 10
     assert migrated[1][4] == ""
-    assert migrated[1][5] == "https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit"
-    assert migrated[1][7] == "admin@percyhan.altostrat.com"
+    assert migrated[1][5] == "https://docs.google.com/spreadsheets/d/1ExampleGoldenLabelsSheetId0000000000000000/edit"
+    assert migrated[1][7] == "auditor@example.com"
     assert migrated[1][8] == "IDLE"
 
     sheet_meta = {
@@ -2279,14 +2279,14 @@ def test_tab3_eval_workbench_tick_lifecycle_and_preflight(
             eval_name="缺少归档目录测试",
             prompt_tab_name="Prompt_v2.5_V10全量17条标准版",
             model_version="gemini-3.1-flash-preview",
-            golden_videos_folder_url="https://drive.google.com/drive/folders/1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY",
-            golden_videos_folder_id="1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY",
-            human_labels_sheet_url="https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit",
-            golden_sheet_url="https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit",
-            golden_source_id="1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0",
+            golden_videos_folder_url="https://drive.google.com/drive/folders/1ExampleGoldenVideosFolderId00000",
+            golden_videos_folder_id="1ExampleGoldenVideosFolderId00000",
+            human_labels_sheet_url="https://docs.google.com/spreadsheets/d/1ExampleGoldenLabelsSheetId0000000000000000/edit",
+            golden_sheet_url="https://docs.google.com/spreadsheets/d/1ExampleGoldenLabelsSheetId0000000000000000/edit",
+            golden_source_id="1ExampleGoldenLabelsSheetId0000000000000000",
             results_folder_url="",
             results_folder_id="",
-            supervisor_email="admin@percyhan.altostrat.com",
+            supervisor_email="auditor@example.com",
             trigger_action="START_EVAL",
             last_eval_report="",
         )
@@ -2296,14 +2296,14 @@ def test_tab3_eval_workbench_tick_lifecycle_and_preflight(
             eval_name="V10.2 候选评测",
             prompt_tab_name="Prompt_v2.6_r02",
             model_version="gemini-3.1-flash-preview",
-            golden_videos_folder_url="https://drive.google.com/drive/folders/1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY",
-            golden_videos_folder_id="1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY",
-            human_labels_sheet_url="https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit",
-            golden_sheet_url="https://docs.google.com/spreadsheets/d/1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0/edit",
-            golden_source_id="1n_1m8gkN_R8MkzsUMqmvm7hNJbbRAhyoGERAOF0Clw0",
-            results_folder_url="https://drive.google.com/drive/folders/1ky221gNbzgIT83981ghVpFc03and4s-g",
-            results_folder_id="1ky221gNbzgIT83981ghVpFc03and4s-g",
-            supervisor_email="admin@percyhan.altostrat.com",
+            golden_videos_folder_url="https://drive.google.com/drive/folders/1ExampleGoldenVideosFolderId00000",
+            golden_videos_folder_id="1ExampleGoldenVideosFolderId00000",
+            human_labels_sheet_url="https://docs.google.com/spreadsheets/d/1ExampleGoldenLabelsSheetId0000000000000000/edit",
+            golden_sheet_url="https://docs.google.com/spreadsheets/d/1ExampleGoldenLabelsSheetId0000000000000000/edit",
+            golden_source_id="1ExampleGoldenLabelsSheetId0000000000000000",
+            results_folder_url="https://drive.google.com/drive/folders/1ExampleEvalResultsFolderId000000",
+            results_folder_id="1ExampleEvalResultsFolderId000000",
+            supervisor_email="auditor@example.com",
             trigger_action="START_EVAL",
             last_eval_report="",
         )
@@ -2350,7 +2350,7 @@ def test_tab3_eval_workbench_tick_lifecycle_and_preflight(
         assert res["triggered_evals"][0]["status"] == "preflight_failed"
         assert res["triggered_evals"][1]["status"] == "dispatched"
         assert len(seen_task_recs) == 1
-        assert seen_task_recs[0].golden_videos_folder_id == "1tAXA-HbRGFjyKxpvG0Pnm0d6CUlbnUQY"
+        assert seen_task_recs[0].golden_videos_folder_id == "1ExampleGoldenVideosFolderId00000"
 
         # Row 2 was marked FAILED on preflight
         row2_updates = [u for u in tab3_updates if u[0] == 2]

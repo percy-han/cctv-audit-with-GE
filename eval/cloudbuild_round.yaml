@@ -17,6 +17,10 @@
 #   _EVAL_REPORT_TIME_ZONE=$(terraform output -raw eval_report_time_zone),\
 #   _GOLDEN_URI=$(terraform output -raw eval_golden_uri),\
 #   _GOLDEN_SHEET_ID=$(terraform output -raw eval_golden_sheet_id) .
+# _MEDIA_MODE (default 'agentic') is the VIDEO_MEDIA_PROCESSING switch for the run. A model without
+# agentic video serving (e.g. gemini-3.5-flash, gemini-3.1-pro-preview) falls back to static on its
+# own and is recorded as media_mode=static; to compare models apples-to-apples, run every candidate
+# with _MEDIA_MODE=static (add it to --substitutions).
 # _GOLDEN_SHEET_ID = the customer's label Sheet with a 测评配置 tab (read live each run); set only one of
 # it and _GOLDEN_URI.
 # _GOLDEN_URI selects the golden set (gs://... or a path in the uploaded source tree; '' = the runner's
@@ -48,6 +52,7 @@ substitutions:
   _EVAL_REPORT_TIME_ZONE: 'Asia/Singapore' # main.tf output eval_report_time_zone
   _GOLDEN_URI: ''                 # main.tf output eval_golden_uri ('' = eval/data/golden_v1.jsonl)
   _GOLDEN_SHEET_ID: ''            # main.tf output eval_golden_sheet_id (label Sheet + 测评配置 tab)
+  _MEDIA_MODE: 'agentic'          # VIDEO_MEDIA_PROCESSING: 'agentic' | 'static' (see header)
 
 options:
   machineType: 'E2_HIGHCPU_8'
@@ -66,7 +71,7 @@ steps:
       - 'GCP_REGION=${_REGION}'
       - 'GCP_LOCATION=${_REGION}'
       - 'VERTEX_LOCATION=global'
-      - 'VIDEO_MEDIA_PROCESSING=agentic'
+      - 'VIDEO_MEDIA_PROCESSING=${_MEDIA_MODE}'
       - 'GCS_STAGING_BUCKET=${_STAGING_BUCKET}'
       # Eval-only: a hung Gemini call used to block a clip for the full 30 min production default
       # before the runner's per-clip retry kicked in (r01 lost ~2 h to 4 hangs). Normal calls take a few minutes.

@@ -56,7 +56,7 @@ variable "vertex_model_location" {
 }
 
 # ---- Name overrides. Empty = derived from name_prefix. Only for adopting names that existed before
-# ---- name_prefix did (see study-project-496907.tfvars); new stacks leave them empty.
+# ---- name_prefix did (see your first environment's tfvars); new stacks leave them empty.
 
 variable "artifact_repository_id" {
   description = "Image repository ID (created by bootstrap/; must equal its artifact_repository_id). Empty = <name_prefix>-images."

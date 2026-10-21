@@ -917,12 +917,17 @@ class WorkspaceReporter:
         total_cost_usd = float(summary.get("total_cost_usd", 0.0))
         total_tokens = int(summary.get("total_tokens", 0))
         guardrails_ok = bool(summary.get("guardrails_passed", False))
+        # Effective video mode of this run (`agentic` / `static`); absent for START / FAILED cards.
+        media_mode = str(summary.get("media_mode") or "").strip()
+        model_line = f"模型: <code>{model_version}</code>"
+        if media_mode:
+            model_line += f" · 模式: <code>{media_mode}</code>"
 
         widgets: list[dict[str, Any]] = [
             {
                 "decoratedText": {
                     "topLabel": "评测负责人 / 配方版本",
-                    "text": f"<b>负责督导</b>：{initiator_line} · SOP: <code>{prompt_tab_name}</code> · 模型: <code>{model_version}</code>",
+                    "text": f"<b>负责督导</b>：{initiator_line} · SOP: <code>{prompt_tab_name}</code> · {model_line}",
                 }
             },
         ]
