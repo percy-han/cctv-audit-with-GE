@@ -216,6 +216,34 @@ def build_eval_monitoring_record(
     dev_rec = float((rec.get("dev") or {}).get("recall", 0.0))
     holdout_rec = float((rec.get("holdout") or {}).get("recall", 0.0))
 
+    items_list = score_doc.get("items") or []
+
+    def _compute_split_lenient_recall(split_name: str | None, fallback_val: float) -> float:
+        sub_rec = (rec.get(split_name or "all") or {}) if isinstance(rec, dict) else {}
+        if sub_rec.get("lenient_recall") is not None:
+            return float(sub_rec["lenient_recall"])
+        rows = [
+            it for it in items_list
+            if split_name is None or it.get("split") == split_name
+        ]
+        if not rows:
+            return fallback_val
+        l_pts = 0.0
+        for it in rows:
+            if it.get("lenient_score") is not None:
+                l_pts += float(it["lenient_score"])
+            else:
+                parts = it.get("parts") or []
+                if parts:
+                    l_pts += sum(1.0 if float(p.get("score") or 0.0) >= 0.5 else 0.0 for p in parts) / len(parts)
+                else:
+                    l_pts += 1.0 if float(it.get("score") or 0.0) >= 0.5 else 0.0
+        return l_pts / len(rows)
+
+    all_lenient_rec = _compute_split_lenient_recall(None, all_rec)
+    dev_lenient_rec = _compute_split_lenient_recall("dev", dev_rec)
+    holdout_lenient_rec = _compute_split_lenient_recall("holdout", holdout_rec)
+
     density = score_doc.get("alert_density") or {}
     findings_per_clip = float(density.get("mean_per_clip", 0.0))
     total_findings = int(density.get("findings", 0))
@@ -257,8 +285,11 @@ def build_eval_monitoring_record(
         **golden_fields(golden, rec),
         "metrics": {
             "overall_recall": round(all_rec, 6),
+            "lenient_recall": round(all_lenient_rec, 6),
             "holdout_recall": round(holdout_rec, 6),
+            "holdout_lenient_recall": round(holdout_lenient_rec, 6),
             "dev_recall": round(dev_rec, 6),
+            "dev_lenient_recall": round(dev_lenient_rec, 6),
             "confirmed_only_recall": round(confirmed_only_recall, 6),
             "findings_per_clip": round(findings_per_clip, 6),
             "total_findings": total_findings,
@@ -300,8 +331,11 @@ def aggregate_round_monitoring_record(records_for_round: Sequence[dict[str, Any]
     last = records_for_round[-1]
     mean_keys = (
         "overall_recall",
+        "lenient_recall",
         "holdout_recall",
+        "holdout_lenient_recall",
         "dev_recall",
+        "dev_lenient_recall",
         "confirmed_only_recall",
         "findings_per_clip",
         "hit_rate",
@@ -309,12 +343,24 @@ def aggregate_round_monitoring_record(records_for_round: Sequence[dict[str, Any]
         "total_cost_usd",
         "mean_clip_latency_sec",
     )
+    fallback_metric_key = {
+        "lenient_recall": "overall_recall",
+        "holdout_lenient_recall": "holdout_recall",
+        "dev_lenient_recall": "dev_recall",
+    }
     avg_metrics: dict[str, Any] = {}
     for k in mean_keys:
+        fb_k = fallback_metric_key.get(k)
         vals = [
-            float((r.get("metrics") or {}).get(k, 0.0))
+            float(
+                (r.get("metrics") or {}).get(
+                    k,
+                    (r.get("metrics") or {}).get(fb_k) if fb_k else None,
+                )
+            )
             for r in records_for_round
             if (r.get("metrics") or {}).get(k) is not None
+            or (fb_k and (r.get("metrics") or {}).get(fb_k) is not None)
         ]
         avg_metrics[k] = round(sum(vals) / len(vals), 6) if vals else 0.0
 

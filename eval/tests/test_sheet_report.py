@@ -110,12 +110,16 @@ class SpecTest(unittest.TestCase):
         overview = {r[0]: r[1] for r in spec.tables[0].rows}
         self.assertEqual(overview["Overall Recall (19 items)"], score and record["metrics"]["overall_recall"])
         self.assertAlmostEqual(overview["Overall Recall (19 items)"], score["recall"]["all"]["recall"], places=5)
+        self.assertIn("Lenient Recall (Partial=1) (19 items)", overview)
         rounds = spec.tables[2]
+        self.assertIn("Lenient Recall (Partial=1)", rounds.rows[0])
         r02 = rounds.rows[3]
         self.assertAlmostEqual(r02[rounds.col("Overall Recall")], (0.434211 + 0.421053) / 2, places=5)
         items = spec.tables[1]
+        self.assertIn("Lenient Score (Partial=1)", items.rows[0])
         r08 = next(r for r in items.rows if r[0] == "R08")
         self.assertEqual(r08[items.col("Part Score")], 1.0)
+        self.assertEqual(r08[items.col("Lenient Score (Partial=1)")], 1.0)
         self.assertIn("F007", r08[items.col("Matched AI Findings")])
         self.assertEqual(r08[items.col("Human Label (Verbatim)")], "Footage 2: 080530 Soaping time is less than 20s")
         r11a = next(r for r in items.rows if r[0] == "R11a")

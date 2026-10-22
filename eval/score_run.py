@@ -683,14 +683,27 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
         drift_sec = compute_point_timestamp_drift(
             part_spec_by_id.get(row["part_id"], {}), matched_objs, mode
         ) if s > 0 else None
-        row.update(score=s, explanation=expl, matched_ids=matched, timestamp_drift_sec=drift_sec)
+        row.update(
+            score=s,
+            lenient_score=1.0 if s >= 0.5 else 0.0,
+            explanation=expl,
+            matched_ids=matched,
+            timestamp_drift_sec=drift_sec,
+        )
 
     results = []
     confirmed_only_total_pts = 0.0
+    lenient_total_pts = 0.0
     all_matched_fids: set[str] = set()
     for it in items:
         parts = [r for r in part_rows if r["item_id"] == it["item_id"]]
         row_score = sum(r["score"] for r in parts) / len(parts)
+        lenient_row_score = (
+            sum(1.0 if float(r["score"]) >= 0.5 else 0.0 for r in parts) / len(parts)
+            if parts
+            else 0.0
+        )
+        lenient_total_pts += lenient_row_score
         matched = [by_id[m] for r in parts for m in r["matched_ids"] if m in by_id]
         for m_obj in matched:
             all_matched_fids.add(m_obj.finding_id)
@@ -714,6 +727,7 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
             "finding_verbatim": it["finding_verbatim"],
             "video_filenames": it["video_filenames"],
             "score": row_score,
+            "lenient_score": lenient_row_score,
             "confirmed_only_score": confirmed_row_score,
             "parts": parts,
             "matched": [dataclasses.asdict(m) for m in matched],
@@ -722,7 +736,14 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
     def recall(split: str | None) -> dict[str, Any]:
         rows = [r for r in results if split is None or r["split"] == split]
         pts = sum(r["score"] for r in rows)
-        return {"points": pts, "rows": len(rows), "recall": pts / len(rows) if rows else 0.0}
+        lenient_pts = sum(r.get("lenient_score", r["score"]) for r in rows)
+        return {
+            "points": pts,
+            "lenient_points": lenient_pts,
+            "rows": len(rows),
+            "recall": pts / len(rows) if rows else 0.0,
+            "lenient_recall": lenient_pts / len(rows) if rows else 0.0,
+        }
 
     per_clip: dict[str, int] = {}
     for f in findings:
@@ -734,10 +755,13 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
         cat_rows = [r for r in results if r["sop_category"] == cat]
         if cat_rows:
             pts = sum(r["score"] for r in cat_rows)
+            lenient_pts = sum(r.get("lenient_score", r["score"]) for r in cat_rows)
             sop_category_recall[cat] = {
                 "points": pts,
+                "lenient_points": lenient_pts,
                 "rows": len(cat_rows),
                 "recall": pts / len(cat_rows),
+                "lenient_recall": lenient_pts / len(cat_rows),
             }
 
     # Drill-down 2: Recall by Outlet & Camera Focus
@@ -750,12 +774,15 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
     for of_key in seen_of_keys:
         of_rows = [r for r in results if f"{r['outlet_name']} | {r['focus']}" == of_key]
         pts = sum(r["score"] for r in of_rows)
+        lenient_pts = sum(r.get("lenient_score", r["score"]) for r in of_rows)
         outlet_focus_recall[of_key] = {
             "outlet_name": of_rows[0]["outlet_name"],
             "focus": of_rows[0]["focus"],
             "points": pts,
+            "lenient_points": lenient_pts,
             "rows": len(of_rows),
             "recall": pts / len(of_rows) if of_rows else 0.0,
+            "lenient_recall": lenient_pts / len(of_rows) if of_rows else 0.0,
         }
 
     # Drill-down 3: Per-video recall & alert count
@@ -771,10 +798,13 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
     for vf in all_video_names:
         v_rows = [r for r in results if vf in r["video_filenames"]]
         pts = sum(r["score"] for r in v_rows)
+        lenient_pts = sum(r.get("lenient_score", r["score"]) for r in v_rows)
         video_breakdown[vf] = {
             "points": pts,
+            "lenient_points": lenient_pts,
             "rows": len(v_rows),
             "recall": pts / len(v_rows) if v_rows else 0.0,
+            "lenient_recall": lenient_pts / len(v_rows) if v_rows else 0.0,
             "findings_count": per_clip.get(vf, 0),
         }
 
@@ -806,6 +836,8 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
         "outlet_focus_recall": outlet_focus_recall,
         "video_breakdown": video_breakdown,
         "quality_metrics": {
+            "lenient_points": lenient_total_pts,
+            "lenient_recall": (lenient_total_pts / total_rows) if total_rows else 0.0,
             "confirmed_only_points": confirmed_only_total_pts,
             "confirmed_only_recall": (confirmed_only_total_pts / total_rows) if total_rows else 0.0,
             "matched_findings_count": matched_findings_count,
@@ -849,11 +881,14 @@ def render_markdown(run_label: str, rep: dict[str, Any]) -> str:
         else f"no matched POINT instant actions (POINT ±{qm.get('point_window_sec', POINT_WINDOW_SEC)}s / WINDOW ±{qm.get('window_sec', WINDOW_SEC)}s)"
     )
     mark = {1.0: "✅ Hit", 0.5: "⚠️ Partial", 0.0: "❌ Miss"}
+    lenient_pts = r["all"].get("lenient_points", qm.get("lenient_points", r["all"]["points"]))
+    lenient_rec = r["all"].get("lenient_recall", qm.get("lenient_recall", r["all"]["recall"]))
     lines = [
         f"# Evaluation Score Report: {run_label}",
         "",
         f"- Golden Set: {(rep.get('golden') or {}).get('golden_version', 'unrecorded')} ({r['all']['rows']} items)",
         f"- Weighted Recall (all {r['all']['rows']} rows): **{r['all']['points']:.1f} / {r['all']['rows']} = {r['all']['recall']:.1%}**",
+        f"- Lenient Recall (Partial=1, all {r['all']['rows']} rows): **{lenient_pts:.1f} / {r['all']['rows']} = {lenient_rec:.1%}**",
         f"- CONFIRMED-Only Recall: {qm.get('confirmed_only_points', 0.0):.1f} / {r['all']['rows']} = {qm.get('confirmed_only_recall', 0.0):.1%}",
         f"- Alert Density: {ad['findings']} findings / {ad['clips']} clips = mean {ad['mean_per_clip']:.1f} findings/clip, max {ad['max_per_clip']} findings/clip (Hit Rate = {qm.get('hit_rate', 0.0):.1%})",
         f"- Instant-Action Timestamp Drift (POINT ±{qm.get('point_window_sec', POINT_WINDOW_SEC)}s): {drift_str}",

@@ -219,7 +219,17 @@ def build_overview_table(
         "")
     add("Judge Model (judge_model)", run_record.get("judge_model") or score_doc.get("judge_model"),
         f"Median of {score_doc.get('judge_passes', '')} passes per part" if score_doc.get("judge_passes") else "")
-    add(f"Overall Recall ({n_items} items)", m.get("overall_recall"), "Authoritative score from local eval/score_run.py", PERCENT)
+    add(f"Overall Recall ({n_items} items)", m.get("overall_recall"), "Authoritative weighted score from eval/score_run.py (Full=1.0, Partial=0.5)", PERCENT)
+    lenient_val = (
+        m.get("lenient_recall")
+        if m.get("lenient_recall") is not None
+        else (
+            ((score_doc.get("recall") or {}).get("all") or {}).get("lenient_recall")
+            if ((score_doc.get("recall") or {}).get("all") or {}).get("lenient_recall") is not None
+            else m.get("overall_recall")
+        )
+    )
+    add(f"Lenient Recall (Partial=1) ({n_items} items)", lenient_val, "Any hit (Full=1.0, Partial=1.0) counted as 1.0", PERCENT)
     add("CONFIRMED-Only Recall", m.get("confirmed_only_recall"), "Counts only findings with CONFIRMED disposition", PERCENT)
     add("Mean Alert Density / Clip (findings_per_clip)", m.get("findings_per_clip"),
         f"Guardrail <= {MAX_MEAN_ALERT_DENSITY:.1f}", DECIMAL_2)
@@ -283,7 +293,7 @@ def build_items_table(
 
     header = [
         "part_id", "Item ID (item_id)", "Outlet", "Audit Focus", "SOP Category", "Temporal Mode", "Time Window (±sec)",
-        "Human Label (Verbatim)", "Labelled Timestamp (OSD)", "Part Score", "Item Score", "Verdict",
+        "Human Label (Verbatim)", "Labelled Timestamp (OSD)", "Part Score", "Item Score", "Lenient Score (Partial=1)", "Verdict",
         "Temporal Mode Source", "SOP Category Source",
         "Matched AI Findings", "Timestamp Drift (sec)", "Judge Explanation",
     ]
@@ -300,6 +310,7 @@ def build_items_table(
                 for f in [matched_by_id.get(str(fid), {})]
             )
             score = float(part.get("score") or 0.0)
+            lenient_part_score = 1.0 if score >= 0.5 else 0.0
             cands = part.get("candidate_ids")
             expl = str(part.get("explanation") or "")
             rows.append([
@@ -316,6 +327,7 @@ def build_items_table(
                 ", ".join(gpart.get("osd_times") or []),
                 score,
                 float(item.get("score") or 0.0),
+                lenient_part_score,
                 _score_badge(score, candidate_ids=cands if isinstance(cands, list) else None, explanation=expl),
                 {"explicit": "Golden Set Explicit", "heuristic": "Rule Heuristic"}.get(
                     str(part.get("temporal_mode_source") or ""), "Unrecorded"),
@@ -365,7 +377,7 @@ def build_rounds_table(history: Sequence[dict[str, Any]]) -> tuple[Table, list[s
     ofs = sorted({k for r in rounds for k in (r.get("outlet_focus_recall") or {})})
     header = [
         "Round", "round_id", "SOP Version", "Model Version", "Media Mode", "Runs Count", "run_ids",
-        "Overall Recall", "CONFIRMED-Only Recall", "Alert Hit Rate",
+        "Overall Recall", "Lenient Recall (Partial=1)", "CONFIRMED-Only Recall", "Alert Hit Rate",
         *cats, *ofs,
         "Mean Findings / Clip", "Mean Timestamp Drift (sec)", "Mean Cost / Clip (USD)",
     ]
@@ -376,6 +388,7 @@ def build_rounds_table(history: Sequence[dict[str, Any]]) -> tuple[Table, list[s
             lbl, r.get("round_id", ""), r.get("sop_version", ""), r.get("model_version", ""),
             r.get("media_mode", ""), r.get("runs_count", 0), ", ".join(r.get("run_ids") or []),
             _blank(m.get("overall_recall")),
+            _blank(m.get("lenient_recall", m.get("overall_recall"))),
             _blank(m.get("confirmed_only_recall")), _blank(m.get("hit_rate")),
             *[_blank(((r.get("sop_category_recall") or {}).get(c) or {}).get("recall")) for c in cats],
             *[_blank(((r.get("outlet_focus_recall") or {}).get(o) or {}).get("recall")) for o in ofs],
@@ -383,7 +396,7 @@ def build_rounds_table(history: Sequence[dict[str, Any]]) -> tuple[Table, list[s
             _blank(m.get("cost_per_clip_usd")),
         ])
     t = Table(TAB_ROUNDS, rows)
-    pct = ["Overall Recall", "CONFIRMED-Only Recall", "Alert Hit Rate", *cats, *ofs]
+    pct = ["Overall Recall", "Lenient Recall (Partial=1)", "CONFIRMED-Only Recall", "Alert Hit Rate", *cats, *ofs]
     t.col_formats = {t.col(h): PERCENT for h in pct}
     t.col_formats[t.col("Mean Findings / Clip")] = DECIMAL_2
     t.col_formats[t.col("Mean Timestamp Drift (sec)")] = DECIMAL_2
@@ -397,7 +410,7 @@ GUARDRAIL_HEADER = f"Alert Density Guardrail ({MAX_MEAN_ALERT_DENSITY:.1f})"
 def build_runs_table(history: Sequence[dict[str, Any]], current_run_id: str) -> Table:
     header = [
         "Run", "Current", "round_id", "run_id", "SOP Version", "Model Version", "Media Mode",
-        "Overall Recall", "CONFIRMED-Only Recall", "Mean Findings / Clip", GUARDRAIL_HEADER,
+        "Overall Recall", "Lenient Recall (Partial=1)", "CONFIRMED-Only Recall", "Mean Findings / Clip", GUARDRAIL_HEADER,
         "Mean Timestamp Drift (sec)", "Mean Cost / Clip (USD)", "Total Cost (USD)",
         "Input Tokens", "Thinking Tokens", "Output Tokens", "Total Tokens",
         "Mean Clip Latency (sec)", "Guardrails Status",
@@ -414,7 +427,8 @@ def build_runs_table(history: Sequence[dict[str, Any]], current_run_id: str) -> 
             run_label(rec), "★" if rec.get("run_id") == current_run_id else "",
             rec.get("round_id", ""), rec.get("run_id", ""), rec.get("sop_version", ""),
             rec.get("model_version", ""), rec.get("media_mode", ""),
-            _blank(m.get("overall_recall")), _blank(m.get("confirmed_only_recall")),
+            _blank(m.get("overall_recall")), _blank(m.get("lenient_recall", m.get("overall_recall"))),
+            _blank(m.get("confirmed_only_recall")),
             _blank(m.get("findings_per_clip")), MAX_MEAN_ALERT_DENSITY,
             _blank(m.get("mean_point_timestamp_drift_sec")), _blank(m.get("cost_per_clip_usd")),
             _blank(m.get("total_cost_usd")),
@@ -424,7 +438,7 @@ def build_runs_table(history: Sequence[dict[str, Any]], current_run_id: str) -> 
             g_status,
         ])
     t = Table(TAB_RUNS, rows)
-    t.col_formats = {t.col(h): PERCENT for h in ("Overall Recall", "CONFIRMED-Only Recall")}
+    t.col_formats = {t.col(h): PERCENT for h in ("Overall Recall", "Lenient Recall (Partial=1)", "CONFIRMED-Only Recall")}
     for h in ("Mean Findings / Clip", GUARDRAIL_HEADER, "Mean Timestamp Drift (sec)", "Mean Clip Latency (sec)"):
         t.col_formats[t.col(h)] = DECIMAL_2
     for h in ("Mean Cost / Clip (USD)", "Total Cost (USD)"):
@@ -519,7 +533,9 @@ def build_chart_requests(rounds: Table, cats: Sequence[str], ofs: Sequence[str],
     reqs = [
         build_chart_request(
             rounds, title="Chart 1: Core Recall & Alert Hit Rate by Round", domain_header="Round",
-            series=[("Overall Recall", "COLUMN", "LEFT_AXIS"), ("CONFIRMED-Only Recall", "COLUMN", "LEFT_AXIS"),
+            series=[("Overall Recall", "COLUMN", "LEFT_AXIS"),
+                    ("Lenient Recall (Partial=1)", "COLUMN", "LEFT_AXIS"),
+                    ("CONFIRMED-Only Recall", "COLUMN", "LEFT_AXIS"),
                     ("Alert Hit Rate", "LINE", "LEFT_AXIS")],
             bottom_title="Round · SOP Version", left_title="Rate", anchor_row=base,
             max_data_rows=MAX_CHART_ROUNDS),

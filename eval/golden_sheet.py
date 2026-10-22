@@ -883,6 +883,23 @@ def _load_golden_from_sheet_and_folder(
         item_settings = list(optional_cfg.items)
     else:
         default_stable = {"R08", "R09", "R12", "R13", "R14", "R19"}
+        stable_signatures = (
+            "080530",
+            "080554",
+            "121604",
+            "apron not kept",
+            "125511",
+            "134235",
+        )
+        matched_by_sig = {
+            str(rec["item_id"])
+            for rec in records
+            if any(
+                sig in str(rec.get("finding_verbatim") or "").lower()
+                for sig in stable_signatures
+            )
+        }
+        effective_stable = matched_by_sig if matched_by_sig else default_stable
         item_settings = []
         for idx_r, rec in enumerate(records, 1):
             iid = str(rec["item_id"])
@@ -892,7 +909,7 @@ def _load_golden_from_sheet_and_folder(
                     item_id=iid,
                     sop_category=cat,
                     temporal_mode="",
-                    stable_baseline=iid in default_stable,
+                    stable_baseline=iid in effective_stable,
                     row=idx_r,
                 )
             )

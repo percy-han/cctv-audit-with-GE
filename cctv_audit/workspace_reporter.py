@@ -911,6 +911,7 @@ class WorkspaceReporter:
         summary = summary or {}
         sheet_url = str(summary.get("spreadsheet_url") or "")
         overall_recall = float(summary.get("overall_recall", 0.0)) * 100.0
+        lenient_recall = float(summary.get("lenient_recall", summary.get("overall_recall", 0.0))) * 100.0
         confirmed_only_recall = float(summary.get("confirmed_only_recall", summary.get("overall_recall", 0.0))) * 100.0
         findings_per_clip = float(summary.get("findings_per_clip", 0.0))
         hit_rate = float(summary.get("hit_rate", 0.0)) * 100.0
@@ -938,6 +939,7 @@ class WorkspaceReporter:
                         "topLabel": "Core Recall Metrics (Recall)",
                         "text": (
                             f"Overall Recall: <b>{overall_recall:.1f}%</b> | "
+                            f"Lenient Recall (Partial=1): <b>{lenient_recall:.1f}%</b> | "
                             f"CONFIRMED-Only Recall: <b>{confirmed_only_recall:.1f}%</b>"
                         ),
                     }

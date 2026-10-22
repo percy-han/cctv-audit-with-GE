@@ -1450,6 +1450,9 @@ class ScheduledAuditEngine:
 
             sheet_url = str(summary.get("spreadsheet_url") or "")
             overall_pct = float(summary.get("overall_recall", 0.0)) * 100.0
+            lenient_pct = float(
+                summary.get("lenient_recall", summary.get("overall_recall", 0.0))
+            ) * 100.0
             confirmed_pct = float(
                 summary.get("confirmed_only_recall", summary.get("overall_recall", 0.0))
             ) * 100.0
@@ -1462,7 +1465,7 @@ class ScheduledAuditEngine:
             media_mode = str(summary.get("media_mode") or "").strip()
             report_msg = (
                 f"✅ Completed ({task_rec.eval_task_id}) | Recall {overall_pct:.1f}% "
-                f"(CONFIRMED-only {confirmed_pct:.1f}%) | "
+                f"(Lenient Partial=1: {lenient_pct:.1f}%, CONFIRMED-only {confirmed_pct:.1f}%) | "
                 f"Density {fpc:.2f}/clip ({guard_tag}) | Cost ${cost_usd:.2f}"
             )
             if media_mode:
