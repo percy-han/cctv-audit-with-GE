@@ -721,7 +721,7 @@ class AgenticAuditor:
             response_mime_type="application/json",
             response_schema=WindowResult,
             temperature=0.0,
-            max_output_tokens=65536,
+            max_output_tokens=24576,
         )
         timeout_ms = gemini_timeout_ms_for_slice(segment.end_offset_sec - segment.start_offset_sec)
 

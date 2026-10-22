@@ -681,6 +681,10 @@ class AuditService:
                         await asyncio.to_thread(_upload_media)
                         seg.gcs_uri = f"gs://{self.jobs._gcs_bucket}/{gcs_obj_name}"
                     try:
+                        # Allow 2x the single-call stall budget so that if Attempt 1 hits Vertex AI's
+                        # 600s GFE gateway timeout (504 DEADLINE_EXCEEDED), tenacity Retry #1 inside
+                        # `generate_content_with_retry` still gets a full slice budget (~750s) instead
+                        # of being terminated at 875s (~274s into Retry #1, seconds before finishing).
                         win_res, ledger = await self._await_with_bounded_cleanup(
                             self.auditor.analyze_segment(
                                 audit_id=job.job_id,
@@ -690,7 +694,7 @@ class AuditService:
                                 prior_carryover_summary=carryover,
                                 evidence_dir=evidence_dir,
                             ),
-                            timeout_sec=_slice_stall_timeout_sec(seg.end_offset_sec - seg.start_offset_sec),
+                            timeout_sec=_slice_stall_timeout_sec(seg.end_offset_sec - seg.start_offset_sec) * 2.0,
                             label=f"Job {job.job_id} slice {ckpt_key}",
                         )
                     finally:
