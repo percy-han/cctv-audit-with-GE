@@ -426,8 +426,10 @@ def test_agentic_not_enabled_falls_back_to_static_once_per_process(monkeypatch: 
     assert effective_media_mode("gemini-3.8-flash") == "agentic"
     assert agentic_auditor._AGENTIC_UNSUPPORTED_MODELS == {"gemini-3.5-flash"}
 
-    # Explicit switch wins over the registry either way; a non-3.x model was never agentic.
+    # Explicit switch wins over the registry either way; a non-3.x/4.x model was never agentic.
     assert effective_media_mode("gemini-3.8-flash", "static") == "static"
+    assert effective_media_mode("gemini-4-argon") == "agentic"
+    assert wants_agentic_video("gemini-4-argon") is True
     assert effective_media_mode("gemini-2.5-flash") == "static"
     assert effective_media_mode("gemini-3.5-flash", "agentic") == "static"  # marked -> still static
 

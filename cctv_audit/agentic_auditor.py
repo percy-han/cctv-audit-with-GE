@@ -579,8 +579,11 @@ def _parse_window_result_or_repair(raw_text: str) -> WindowResult:
         raise first_err
 
 
-# Agentic video understanding is only served for Gemini 3.x models.
+# Agentic video understanding is served for Gemini 3.x and Gemini 4.x models (live probe on Vertex
+# `global` and `asia-southeast1`, 2026-10-22: `gemini-4-argon` and `gemini-3.8-flash` both accept
+# `media_processing=AGENTIC`).
 AGENTIC_VIDEO_MODEL_MARKER = "gemini-3"
+AGENTIC_VIDEO_MODEL_MARKERS = ("gemini-3", "gemini-4")
 
 # Not every Gemini 3.x model has agentic video enabled: on Vertex `global` (probe 2026-10-20)
 # `gemini-3.8-flash` accepts `media_processing=AGENTIC`, while `gemini-3.5-flash` and
@@ -616,7 +619,9 @@ def wants_agentic_video(model_name: str, media_processing: Optional[str] = None)
     default "agentic"), read at call time.
     """
     mode = media_processing if media_processing is not None else config.video_media_processing
-    if mode != "agentic" or AGENTIC_VIDEO_MODEL_MARKER not in (model_name or ""):
+    if mode != "agentic" or not any(
+        marker in (model_name or "") for marker in (AGENTIC_VIDEO_MODEL_MARKER, *AGENTIC_VIDEO_MODEL_MARKERS)
+    ):
         return False
     return model_name not in _AGENTIC_UNSUPPORTED_MODELS
 

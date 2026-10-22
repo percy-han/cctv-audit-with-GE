@@ -105,7 +105,7 @@ def build_master_sheet_payload() -> dict[str, Any]:
                         "Active_Model_Version",
                         "gemini-3.8-flash",
                         "Active production Vertex AI model version (AUTO_LATEST_FLASH prohibited)",
-                        "gemini-3.8-flash | gemini-2.5-flash",
+                        "gemini-3.8-flash | gemini-4-argon | gemini-2.5-flash",
                     ],
                     [
                         "Fallback_Model_Version",
@@ -428,10 +428,16 @@ def write_tabs(service: Any, sheet_id: str, tabs: list[dict[str, Any]], overwrit
 
     # Apply native Google Sheets dropdown & formula validations across Tab0, Prompt_*, and Tab2.
     _import_cctv_audit()
-    from cctv_audit.prompt_manager import build_master_sheet_validation_requests
+    from cctv_audit.prompt_manager import (
+        build_master_sheet_validation_requests,
+        model_dropdown_options,
+    )
 
+    tab0_values = next((t["values"] for t in tabs if t["title"] in (TAB0_TITLE, LEGACY_TAB0_TITLE)), [])
     updated_meta = service.spreadsheets().get(spreadsheetId=sheet_id, fields="sheets.properties").execute()
-    val_requests = build_master_sheet_validation_requests(updated_meta)
+    val_requests = build_master_sheet_validation_requests(
+        updated_meta, model_versions=model_dropdown_options(tab0_values)
+    )
     if val_requests:
         service.spreadsheets().batchUpdate(
             spreadsheetId=sheet_id, body={"requests": val_requests}
