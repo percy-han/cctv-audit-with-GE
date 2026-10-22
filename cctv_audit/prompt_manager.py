@@ -1,22 +1,23 @@
 """Module 3: Google Sheets Master Prompt & Model Version Control Engine (`prompt_manager.py`).
 
 Implements `REQ-013` (Dual-Layer Sheet Version Control & 0.1s 1-Click Rollback) and embeds
-100% verbatim the user's canonical `CHAGEE_CCTV_Cloud_Auditor_Prompt_v1.0`:
-1. **Layer 1: Code-Fixed Engine Kernel (固化在代码中的底座)**:
-   - `# 角色`
-   - `# 核心判定原则（优先级最高）`: 原则一（宁可误报，绝不漏报）、原则二（举证责任反转）、
-     原则三（四级处置标签）、原则四（临界值从严）、原则五（输出规范）+ 原则六（播放器相对进度
-     `timestamp_in_clip` 与监控画面 OSD 时钟分离防切片漂移）。
-   - `# 步骤 0：时间轴校准` (1–5)
-   - `# 步骤 1：人员建档（必须穷尽）`
-   - `# 步骤 2：视觉判定规则（高召回版）` (`2.1 接触判定: 疑似接触不再豁免 -> SUSPECTED`,
-     `2.2 状态变化溯源`, `2.3 姿态与遮挡`, `2.4 手到口部动作`)
-   - `# 步骤 4：漏检自查（强制执行，不可跳过）` (1–6)
-2. **Layer 2: Sheet-Managed Dynamic SOP Checklist (`SOP` 文件夹 Google Sheet 动态维护的业务规则)**:
-   - `# 步骤 3：SOP 检查清单` 的全部 **24 个完整子模块**（`A1`–`A5`、`B0`、`B1-1` Langtuo 15 项表、
-     `B1-2` Manitowoc 13 项表、`B2`–`B5`、`C1`–`C8`、`D1`–`D4` 运营与人效 IPLH）存储在
-     `CHAGEE_SOP_与模型版本总控台_Master_Config`（ID 由 `MASTER_PROMPT_SHEET_ID` 指定）中，
-     实时拉取后与第 1 层底座无缝拼装，100% 逐字还原您的最新提示词！
+the canonical `CHAGEE_CCTV_Cloud_Auditor_Prompt_v1.0` in English:
+1. **Layer 1: Code-Fixed Engine Kernel**:
+   - `# Role`
+   - `# Core Adjudication Principles (Highest Priority)`: Principle 1 (Prefer False Positives Over False Negatives),
+     Principle 2 (Burden-of-Proof Reversal), Principle 3 (Four-Tier Disposition Labels),
+     Principle 4 (Strict Boundary Rounding), Principle 5 (Output Specification & Timestamp Separation),
+     Principle 6 (One-Action-One-Record & Orthogonal Decomposition of Compound Violations).
+   - `# Step 0: Timeline Calibration` (1–6)
+   - `# Step 1: Personnel Cataloging & Independent Multi-Person Tracking`
+   - `# Step 2: Visual Adjudication Rules (High-Recall Edition)` (`2.1 Contact Determination`,
+     `2.2 State-Change Traceback`, `2.3 Posture & Occlusion`, `2.4 Hand-to-Mouth Actions`)
+   - `# Step 4: Missed-Detection Self-Audit (Mandatory, Cannot Skip)` (1–7)
+2. **Layer 2: Sheet-Managed Dynamic SOP Checklist**:
+   - `# Step 3: SOP Checklist` with all **24 complete submodules** (`A1`–`A5`, `B0`, `B1-1` Langtuo 15-step table,
+     `B1-2` Manitowoc 13-step table, `B2`–`B5`, `C1`–`C8`, `D1`–`D4` Operations & IPLH) stored in
+     `CHAGEE_SOP_and_Model_Control_Tower` (specified by `MASTER_PROMPT_SHEET_ID`),
+     fetched in real time and assembled seamlessly with the Layer 1 kernel.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ _GCS_WORKBOOK_CACHE_TTL_SEC = 60.0
 class VisualScanTarget(BaseModel):
     """Pre-verdict visual observation anchor (`visual_scan`)."""
 
-    subject: str = Field(description="Observation subject, e.g., 人员, 手部与手套")
+    subject: str = Field(description="Observation subject, e.g., Personnel, Hands & Gloves")
     question: str = Field(description="Mandatory visual grounding question before verdict")
 
 
@@ -59,7 +60,7 @@ class SopRuleItem(BaseModel):
 
     rule_id: str = Field(description="Rule ID, e.g., A1, A2, B1-1, C1, D1")
     name: str = Field(description="Rule display name")
-    category: str = Field(default="SOP", description="Category name, e.g., 【A】洗手与手部卫生")
+    category: str = Field(default="SOP", description="Category name, e.g., [A] Handwashing & Hand Hygiene")
     severity: str = Field(default="RED_LINE", description="RED_LINE or NORMAL")
     detection_type: str = Field(default="presence", description="presence or absence")
     requires_full_context: bool = Field(default=False, description="True if chain/duration dependent")
@@ -80,7 +81,72 @@ class PromptModelConfig(BaseModel):
     system_instruction: str = Field(default="")
 
 
-TAB2_SCHEDULED_TITLE = "Tab2_定时巡检配置表"
+TAB0_TITLE = "Tab0_Version_Control"
+TAB2_SCHEDULED_TITLE = "Tab2_Scheduled_Jobs"
+TAB3_EVAL_TITLE = "Tab3_Golden_Eval"
+TAB4_SPOT_CHECK_TITLE = "Tab4_Spot_Check"
+DEFAULT_PROMPT_TAB_TITLE = "Prompt_v2.5_Standard"
+
+TAB0_ALIASES: tuple[str, ...] = (
+    "Tab0_Version_Control",
+    "Tab0_版本总控与回滚开关",
+)
+TAB2_ALIASES: tuple[str, ...] = (
+    "Tab2_Scheduled_Jobs",
+    "Tab2_定时巡检配置表",
+    "Scheduled_Jobs",
+    "定时巡检配置表",
+)
+TAB3_ALIASES: tuple[str, ...] = (
+    "Tab3_Golden_Eval",
+    "Tab3_黄金集评测工作台",
+    "Golden_Eval",
+    "黄金集评测工作台",
+)
+TAB4_ALIASES: tuple[str, ...] = (
+    "Tab4_Spot_Check",
+    "Tab4_专项测试表",
+    "Spot_Check",
+    "专项测试表",
+)
+PROMPT_TAB_ALIASES: dict[str, str] = {
+    "Prompt_v2.5_Standard": "Prompt_v2.5_V10全量17条标准版",
+    "Prompt_v2.5_V10全量17条标准版": "Prompt_v2.5_Standard",
+    "Prompt_v2.5_Archive_Baseline": "Prompt_v2.5_归档基准",
+    "Prompt_v2.5_归档基准": "Prompt_v2.5_Archive_Baseline",
+}
+
+
+def _alias_candidates_for_tab(tab_name: str) -> list[str]:
+    """Returns `[tab_name, ...fallback_aliases]` for transparent English/Chinese tab resolution."""
+    cleaned = (tab_name or "").strip()
+    if not cleaned:
+        return []
+    out: list[str] = [cleaned]
+    for group in (TAB0_ALIASES, TAB2_ALIASES, TAB3_ALIASES, TAB4_ALIASES):
+        if cleaned in group:
+            for item in group:
+                if item not in out:
+                    out.append(item)
+    mapped = PROMPT_TAB_ALIASES.get(cleaned)
+    if mapped and mapped not in out:
+        out.append(mapped)
+    return out
+
+
+def _populate_workbook_tab_aliases(tabs: dict[str, list[list[str]]]) -> dict[str, list[list[str]]]:
+    """Populates both canonical English and legacy Chinese tab keys on an in-memory workbook dict."""
+    for group in (TAB0_ALIASES, TAB2_ALIASES, TAB3_ALIASES, TAB4_ALIASES):
+        present = next((t for t in group if t in tabs), None)
+        if present is not None:
+            for alias in group:
+                tabs.setdefault(alias, tabs[present])
+    for src, dst in list(PROMPT_TAB_ALIASES.items()):
+        if src in tabs and dst not in tabs:
+            tabs[dst] = tabs[src]
+    return tabs
+
+
 SCHEDULED_RULE_HEADERS: tuple[str, ...] = (
     "Rule_ID",
     "Rule_Name",
@@ -108,29 +174,21 @@ VALID_TRIGGER_MINUTES_UTC: tuple[str, ...] = ("00", "15", "30", "45")
 VALID_LOOKBACK_DAYS_OPTIONS: tuple[str, ...] = ("0.5", "1", "2", "3", "4", "5", "6", "7")
 VALID_LOOKBACK_DAYS_VALUES: frozenset[float] = frozenset({0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0})
 VALID_ENABLED_DROPDOWN_OPTIONS: tuple[str, ...] = ("ENABLED", "PAUSED")
-# `ensure_master_sheet_validations` memo: sheet_id -> the model dropdown options it last applied
-# (the `tuple(models)` signature). Each scheduler tick re-reads Tab0, recomputes the options and
-# compares them with this, so a model name typed into the Tab0 候选列表 reaches the Tab0 B3:B4 and
-# Tab3 column D dropdowns on the next tick without a restart. Whole-sheet work (migrations +
-# `batchUpdate`) only runs when the signature changed or `force=True`.
 _VALID_SHEET_CACHE: dict[str, tuple[str, ...]] = {}
 
-# Tab0 rows whose column B (`当前生效值`) may name a model. Column D (`候选列表`) is read on every row.
+# Tab0 rows whose column B (`Active_Value`) may name a model. Column D (`Candidates`) is read on every row.
 TAB0_MODEL_VALUE_KEYS: frozenset[str] = frozenset(
     {"Active_Model_Version", "Fallback_Model_Version", "Candidate_Models_Discovered"}
 )
 TAB0_MODEL_CANDIDATES_RANGE = "A1:D30"
-# A Vertex Gemini model id, e.g. gemini-3.8-flash / gemini-3.1-pro-preview / gemini-2.5-flash.
-# ASCII on purpose: `\w` would otherwise swallow CJK text glued to a name.
 _MODEL_CANDIDATE_RE = re.compile(r"^gemini-\d[\w.\-]*$", re.ASCII)
-# Trailing operator / runtime notes such as `gemini-x (🆕 新模型可用待测试)` or `gemini-y（已测）`.
 _TRAILING_PAREN_NOTE_RE = re.compile(r"(?:\s*[（(][^()（）]*[)）])+\s*$")
 
 
 def collect_model_candidates_from_tab0(rows: Sequence[Sequence[str]]) -> list[str]:
-    """Model names an operator may pick, read from `Tab0_版本总控与回滚开关` rows (`A1:D30`).
+    """Model names an operator may pick, read from `Tab0_Version_Control` (or legacy `Tab0_版本总控与回滚开关`) rows (`A1:D30`).
 
-    Row layout: `配置项 (Config_Key)` | `当前生效值 (Active_Value)` | `说明` | `候选列表 (Candidates)`.
+    Row layout: `Config_Key` | `Active_Value` | `Description` | `Candidates` (also supports legacy Chinese headers).
     Collects column B of the `Active_Model_Version` / `Fallback_Model_Version` /
     `Candidate_Models_Discovered` rows and column D of every row; each cell is split on `|`,
     every token loses surrounding whitespace and any trailing parenthetical note (`(...)` /
@@ -167,9 +225,9 @@ def model_dropdown_options(tab0_rows: Sequence[Sequence[str]]) -> list[str]:
 
 
 class ScheduledAuditRule(BaseModel):
-    """One row from `[Tab 2: 定时巡检配置表]` (`Tab2_定时巡检配置表`) in the Master SOP Sheet."""
+    """One row from `[Tab 2: Scheduled Jobs]` (`Tab2_Scheduled_Jobs`) in the Master SOP Sheet."""
 
-    row_index: int = Field(ge=2, description="1-based row number in Tab2_定时巡检配置表")
+    row_index: int = Field(ge=2, description="1-based row number in Tab2_Scheduled_Jobs")
     rule_id: str = Field(description="Unique schedule rule ID, e.g. SCHED-SG-01")
     rule_name: str = Field(default="", description="Human-readable rule name")
     root_folder_url: str = Field(description="Google Drive root folder URL/ID or gs:// prefix")
@@ -186,7 +244,7 @@ class ScheduledAuditRule(BaseModel):
 
 
 class ScheduledRuleRowError(BaseModel):
-    """Diagnostic record for an invalid row in `Tab2_定时巡检配置表` so the engine can write a loud error back to Column I (`Last_Run_Status`)."""
+    """Diagnostic record for an invalid row in `Tab2_Scheduled_Jobs` so the engine can write a loud error back to Column I (`Last_Run_Status`)."""
 
     row_index: int = Field(ge=2)
     rule_id: str = Field(default="")
@@ -194,7 +252,6 @@ class ScheduledRuleRowError(BaseModel):
     previous_status: str = Field(default="")
 
 
-TAB3_EVAL_TITLE = "Tab3_黄金集评测工作台"
 EVAL_WORKBENCH_HEADERS: tuple[str, ...] = (
     "Eval_ID",
     "Eval_Name",
@@ -227,39 +284,38 @@ VALID_EVAL_TRIGGER_ACTIONS: tuple[str, ...] = (
 )
 DEFAULT_TAB3_SAMPLE_ROW: tuple[str, ...] = (
     "EVAL-EXAMPLE-01",
-    "【示例】黄金标准集基准评测（分别填写黄金视频目录、人工标注 Sheet 与结果存放目录，将 Trigger_Action 改为 START_EVAL 后自动在后台运行）",
-    "Prompt_v2.5_V10全量17条标准版",
+    "[Example] Golden Dataset Baseline Evaluation (Provide Golden Videos Folder, Human Labels Sheet, and Results Folder; set Trigger_Action to START_EVAL to run in background)",
+    "Prompt_v2.5_Standard",
     "gemini-3.8-flash",
     "https://drive.google.com/drive/folders/1ExampleGoldenVideosFolderIdReplaceMe",
     "https://docs.google.com/spreadsheets/d/1ExampleGoldenSheetIdReplaceMe0000/edit",
     "https://drive.google.com/drive/folders/1ExampleEvalResultsFolderIdReplaceMe",
     "auditor@example.com",
     "IDLE",
-    "默认示例（未启动；选择 START_EVAL 后将在 15 分钟内自动执行）",
+    "Default example (Not started; select START_EVAL to execute automatically within 15 minutes)",
 )
 
-TAB4_SPOT_CHECK_TITLE = "Tab4_专项测试表"
 DEFAULT_TAB4_SAMPLE_ROW: tuple[str, ...] = (
     "B4",
-    "B4 · 红边毛巾（参数表 3.1）",
-    "【B】制冰机与冰块管理（Week 2 主模块 + 常态冰铲检查）",
+    "B4 · Red-Edged Towel & 3-Color Towel Segregation (Param 3.1)",
+    "[B] Ice Maker Weekly Deep Clean & Ice Handling (Week 2 Core Module)",
     "RED_LINE",
     "presence",
     "FALSE",
     (
-        "擦拭制冰机内腔、布水管、挡水帘与白色门板内壁时，必须使用**从专用贴标消毒桶中随用随取的干净红边毛巾**；\n"
-        "- 🔴 毛巾未从专用贴标消毒桶取用（如随手放在水槽边、台面、设备顶或水龙头上反复使用）→ 红线违规；\n"
-        "- 🔴 红、蓝、黄三色毛巾混用（如用蓝边吧台毛巾或黄边器具毛巾擦拭制冰机内胆）→ 红线违规。"
+        "When wiping the ice maker interior cavity, water distribution tube, water curtain, and white inner door liner, staff MUST use a **clean red-edged towel taken fresh from the dedicated labeled sanitizing bucket**:\n"
+        "- 🔴 Towel not taken from the dedicated labeled sanitizing bucket (e.g., left on the sink rim, counter, machine top, or faucet and reused) → RED_LINE violation;\n"
+        "- 🔴 Cross-using red, blue, and yellow color-coded towels (e.g., wiping the ice maker interior liner with a blue-edged bar towel or yellow-edged utensil towel) → RED_LINE violation."
     ),
-    "从专用贴标消毒桶随用随取干净红边毛巾擦拭制冰机内腔，三色毛巾严格分区不混用",
-    "毛巾未从专用消毒桶取用（随手放置台面/水槽边复用）或红/蓝/黄三色毛巾混用",
+    "Clean red-edged towel taken directly from the dedicated labeled sanitizing bucket used to wipe the ice maker interior; 3-color towels strictly segregated by zone",
+    "Towel not taken from the dedicated sanitizing bucket (reused from counter/sink rim) or red/blue/yellow towels cross-used across zones",
 )
 
 
 class ScheduledEvalRule(BaseModel):
-    """One row from `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) in the Master SOP Sheet."""
+    """One row from `[Tab 3: Golden Set Evaluation Workbench]` (`Tab3_Golden_Eval`) in the Master SOP Sheet."""
 
-    row_index: int = Field(ge=2, description="1-based row number in Tab3_黄金集评测工作台")
+    row_index: int = Field(ge=2, description="1-based row number in Tab3_Golden_Eval")
     eval_id: str = Field(description="Unique evaluation ID, e.g. EVAL-01")
     eval_name: str = Field(default="", description="Human-readable evaluation name")
     prompt_tab_name: str = Field(description="Target Prompt_* tab in Master Sheet to evaluate")
@@ -283,7 +339,7 @@ class ScheduledEvalRule(BaseModel):
 
 
 class ScheduledEvalRowError(BaseModel):
-    """Diagnostic record for an invalid row in `Tab3_黄金集评测工作台`."""
+    """Diagnostic record for an invalid row in `Tab3_Golden_Eval`."""
 
     row_index: int = Field(ge=2)
     eval_id: str = Field(default="")
@@ -292,545 +348,540 @@ class ScheduledEvalRowError(BaseModel):
     previous_status: str = Field(default="")
 
 
-
 DEFAULT_VISUAL_SCAN_TARGETS: List[VisualScanTarget] = [
-    VisualScanTarget(subject="人员", question="画面中一共出现过几个人？逐个描述性别、发型、衣着护具特征与所处工位。"),
-    VisualScanTarget(subject="手部与手套", question="每个人的手是裸手还是戴手套？手套颜色、有无破损污渍、此刻手持何物？"),
-    VisualScanTarget(subject="头面部与配饰", question="帽网/口罩等护具穿戴是否完整规范？手部与腕部有无佩戴饰品？"),
-    VisualScanTarget(subject="着装与护具存放", question="在岗着装是否符合规范？有无脱下工作服/围裙等护具未归位存放的情况？"),
-    VisualScanTarget(subject="手部接触序列", question="按时间顺序列出每个人的手先后接触过哪些非食品接触表面、个人物品、清洁工具、设备部件或食品工器具。"),
-    VisualScanTarget(subject="水槽与清洁工序", question="画面内是否有实体水槽或清洁作业？逐一记录起始动作顺序、持续操作净时长及收尾擦干动作。"),
-    VisualScanTarget(subject="设备、容器与器具", question="画面中受控设备（含顶部/内部可拆部件）、容器、量具、取用工具处于什么开闭或存放状态？"),
-    VisualScanTarget(subject="垃圾与地面环境", question="垃圾容器是否闭合、有无溢满？地面与操作区环境是否整洁？"),
-    VisualScanTarget(subject="耗材、容器色标与私人物品", question="作业中使用的抹布色标、取用来源容器、喷壶/药剂瓶身颜色与标签分别是什么？操作区有无私人物品？"),
-    VisualScanTarget(subject="顾客与出品流转", question="有无顾客交互或出品流转？记录各环节响应与操作衔接时间点。"),
+    VisualScanTarget(subject="Personnel", question="How many individuals appear in the frame? Describe each person's gender, hairstyle, attire/PPE traits, and assigned station."),
+    VisualScanTarget(subject="Hands & Gloves", question="Are each person's hands bare or gloved? What is the glove color, are there any tears or stains, and what are they holding right now?"),
+    VisualScanTarget(subject="Head, Face & Accessories", question="Are hairnets and masks worn completely and properly? Is any jewelry or accessory worn on the hands or wrists?"),
+    VisualScanTarget(subject="Uniform & PPE Storage", question="Does on-duty attire comply with standards? Are any removed uniforms or aprons left unstored or misplaced?"),
+    VisualScanTarget(subject="Hand Contact Sequence", question="List in chronological order every non-food-contact surface, personal item, cleaning tool, equipment component, or food utensil touched by each person's hands."),
+    VisualScanTarget(subject="Sink & Cleaning Procedures", question="Is there a physical sink or cleaning task in frame? Record the initial step sequence, net active duration, and closing drying action for each occurrence."),
+    VisualScanTarget(subject="Equipment, Containers & Utensils", question="What is the open/closed or storage state of controlled equipment (including top/internal removable parts), containers, measuring tools, and dispensing utensils?"),
+    VisualScanTarget(subject="Trash & Floor Environment", question="Are trash bins covered and free of overflow? Are the floor and operating zones clean and orderly?"),
+    VisualScanTarget(subject="Consumables, Container Color Codes & Personal Items", question="What are the towel color codes, source containers, and spray/chemical bottle colors and labels used during tasks? Are any personal items present in the operating area?"),
+    VisualScanTarget(subject="Customer & Beverage Handover Flow", question="Is there any customer interaction or beverage handover? Record the response and transition timestamps at each stage."),
 ]
 
 
 # 24 SOP sections: the 23 verbatim ones from Percy's canonical CHAGEE_CCTV_Cloud_Auditor_Prompt_v1.0,
 # plus C8 (customer SOP 6.2 Automated Tea Maker Machine, "Filter Tea into an Ice-Prepared Container").
 DEFAULT_CHAGEE_V25_RULES: List[SopRuleItem] = [
-    # ───────────────────────── 【A】洗手与手部卫生（Week 1 主模块） ─────────────────────────
+    # ───────────────────────── [A] Handwashing & Hand Hygiene (Week 1 Core Module) ─────────────────────────
     SopRuleItem(
         rule_id="A1",
-        name="A1 · 强制洗手触发场景（参数表 1.5.5 + Reference Case 1）",
-        category="【A】洗手与手部卫生（Week 1 主模块）",
+        name="A1 · Mandatory Handwashing Trigger Scenarios (Param 1.5.5 + Reference Case 1)",
+        category="[A] Handwashing & Hand Hygiene (Week 1 Core Module)",
         severity="RED_LINE",
         detection_type="absence",
         requires_full_context=True,
         check_instruction=(
-            "出现以下任一情形，**立即开启 5 分钟监视窗**，逐秒追踪该员工：\n\n"
-            "**高危污染类（红线级）**\n"
-            "- **触碰头面部与个人饰物**：摸头发（touches hair）、扶/调整眼镜（spectacles/glasses）、摸脸/口鼻、触碰或拉扯口罩、打喷嚏/咳嗽掩口\n"
-            "- **用同一张擦手纸先擦脸/汗，再继续擦手**\n"
-            "- **触碰非食品接触隔离设施与把手**：触碰前吧台透明防飞沫挡板/护罩（spit guard）、门把手/门帘、设备外框\n"
-            "- 处理垃圾袋、碰触垃圾桶或垃圾抽屉（**含把手**）、给垃圾桶套袋\n"
-            "- 从地面拾取物品 / 触碰地面或地面杂物筐\n"
-            "- **使用或握持清洁工具**：握持拖把（mop）、刮水板、扫把、清洗隔油池\n"
-            "- 踩踏操作台面\n\n"
-            "**常规触发类**\n"
-            "- **上岗 / 当班开始（Partner enter work, on the switch：员工进入工作区、开启设备电源开关；洗手步骤必须发生在戴手套及接触任何食品接触工具之前）**\n"
-            "- **休息后返岗 / 使用手机后**\n"
-            "- **如厕后**\n"
-            "- **接触现金 / POS 收银后**\n"
-            "- 完成任何清洁作业后\n"
-            "- 手套破损或被污染后\n\n"
-            "- ⚠️ **【多污染源并存全量枚举原则（严禁主事件吞并微动作）】**：若同一员工在未洗手窗口内先后发生了多个触碰污染源动作（例如：既玩了手机，又在前后几秒摸了头发/眼镜、触碰了吧台防飞沫罩 spit guard、摸了门把手或拿了拖把 mop），在输出 `A1`/`A2` 证据描述时**必须把观察到的每一个污染源动作及时间戳全部写明**，严禁只写最显眼的「玩手机」而漏写摸头发、扶眼镜、碰防飞沫罩或拿拖把！"
+            "When any of the following scenarios occurs, **immediately open a 5-minute monitoring window** and track the staff member second by second:\n\n"
+            "**High-Risk Contamination Triggers (RED_LINE)**\n"
+            "- **Touching head, face, or personal accessories**: touching hair, adjusting spectacles/glasses, touching face/mouth/nose, touching or pulling mask, coughing or sneezing into hands\n"
+            "- **Using the same paper towel to wipe face/sweat first and then continuing to wipe hands**\n"
+            "- **Touching non-food-contact barriers and handles**: touching the front bar transparent spit guard, door handles/curtains, or outer equipment frames\n"
+            "- Handling trash bags, touching trash bins or trash drawers (**including handles**), or lining trash bins\n"
+            "- Picking up items from the floor / touching the floor or floor utility baskets\n"
+            "- **Using or holding cleaning tools**: holding a mop, floor squeegee, broom, or cleaning the grease trap\n"
+            "- Stepping onto operating countertops\n\n"
+            "**Routine Triggers**\n"
+            "- **Starting shift / entering work zone (Partner enter work, on the switch: staff enters work area and turns on equipment power switches; handwashing must occur before donning gloves or touching any food-contact tools)**\n"
+            "- **Returning from break / after using a mobile phone**\n"
+            "- **After using the restroom**\n"
+            "- **After handling cash / POS register**\n"
+            "- After completing any cleaning task\n"
+            "- After gloves are torn or contaminated\n\n"
+            "- ⚠️ **[Exhaustive Enumeration of Co-Occurring Contamination Sources (Never Swallow Micro-Actions)]**: If the same staff member performs multiple contamination-contact actions within an unwashed window (e.g., using a mobile phone AND touching hair/spectacles, touching the bar spit guard, touching a door handle, or holding a mop within seconds of each other), when outputting `A1`/`A2` evidence you **must list every observed contamination trigger action and its exact timestamp**, never reporting only the salient phone use while omitting touching hair, spectacles, spit guard, or mop!"
         ),
-        pass_criteria="上岗开启设备开关后（戴手套前）及触发上述任一污染源后5分钟监视窗内完成标准五步洗手",
-        fail_criteria="上岗进入工作区开启设备开关后未洗手即戴手套或接触食品工具（before starting shift），或触碰头发/眼镜/防飞沫罩(spit guard)/拖把(mop)/手机/垃圾桶后未见洗手（多污染源并存时须全量列出；离开画面记 UNVERIFIED·污染后去向不明；窗口截断记 UNVERIFIED·监视窗被截断）",
+        pass_criteria="Completes standard 5-step handwashing within the 5-minute monitoring window after turning on equipment switches at shift start (before gloving) and after any contamination trigger above",
+        fail_criteria="Dons gloves or touches food-contact tools after entering work zone and turning on switches without handwashing (before starting shift), or fails to wash hands after touching hair/spectacles/spit guard/mop/phone/trash bin (list all co-occurring triggers; leaving frame -> UNVERIFIED; window truncated -> UNVERIFIED)",
     ),
     SopRuleItem(
         rule_id="A2",
-        name="A2 · 违规判定（三要素）",
-        category="【A】洗手与手部卫生（Week 1 主模块）",
+        name="A2 · Violation Determination (Three-Element Chain)",
+        category="[A] Handwashing & Hand Hygiene (Week 1 Core Module)",
         severity="RED_LINE",
         detection_type="absence",
         requires_full_context=True,
         check_instruction=(
-            "在 5 分钟监视窗内，若**同时满足**：\n"
-            "1. 发生上述 `A1` 触发事件（记录**全部**前置污染源动作及时间戳，如摸头发/扶眼镜、碰吧台防飞沫挡板 spit guard、握持拖把 mop、用擦脸后的同一张纸巾擦手、玩手机等）\n"
-            "2. **未观察到完整五步洗手流程**\n"
-            "3. 员工**直接戴手套** 或 **恢复接触食品接触工具/设备/出餐**（记录时间戳）\n"
-            "   > 食品接触工具与设备清单：制冰机门板/冰仓(ice maker machine / ice bin)、冰桶(ice bucket)、立式冷柜/冷藏柜门及内部食材(chiller / food ingredients)、"
-            "泡茶壶(tea brewer pot)、滤网(tea filter net)、茶基容器(tea base container)、雪克杯(shaker cup)、冰铲(ice scoop)、CHAGEE 纸杯、吸管、量杯、吧勺、滤器\n\n"
-            "→ **红线违规**\n\n"
-            "> [!高召回规则]\n"
-            "> - **【擦脸纸巾复用擦手 = 交叉污染必报】**：若员工洗完手后拿擦手纸**先擦拭脸部/口鼻，又继续用同一张纸巾擦手并穿戴手套、打开制冰机取冰或恢复制作**，手部已被面部二次污染，必须判定 `A2`（`CONFIRMED`）红线违规！\n"
-            "> - **【多触发源全量写明】**：若员工在直接戴手套或触碰制冰机/冷柜/吧台器具前既有玩手机、又有摸头发/眼镜/防飞沫挡板(spit guard)/拿拖把(mop)，必须在同一条 `A2` 证据中把所有污染源全部列出（或分别独立成行），严禁因只写玩手机而掩盖其他污染触发源。\n"
-            "> - 若员工在触发后**离开画面**，标记 `UNVERIFIED · 污染后去向不明`，**仍需上报**。\n"
-            "> - 若 5 分钟窗口内视频结束，标记 `UNVERIFIED · 监视窗被截断`，**仍需上报**。\n"
-            "> - **「直接戴手套」本身就是独立违规项**（参数表 1.5.3），即使后续没碰食品也要报。"
+            "Within the 5-minute monitoring window, if **all three conditions** hold simultaneously:\n"
+            "1. An `A1` trigger event occurs (record **all** preceding contamination actions and timestamps, such as touching hair/spectacles, touching the bar spit guard, holding a mop, reusing a face-wiped paper towel on hands, or using a mobile phone)\n"
+            "2. **No complete 5-step handwashing procedure is observed**\n"
+            "3. The staff member **directly dons gloves** OR **resumes touching food-contact tools/equipment/beverage preparation** (record timestamp)\n"
+            "   > Food-contact tools & equipment list: ice maker machine door/ice bin, ice bucket, upright chiller/refrigerator door & internal food ingredients, "
+            "tea brewer pot, tea filter net, tea base container, shaker cup, ice scoop, CHAGEE paper cups, straws, measuring cups, bar spoons, strainers\n\n"
+            "→ **RED_LINE Violation**\n\n"
+            "> [!HIGH-RECALL RULES]\n"
+            "> - **[Reusing Face-Wiped Paper Towel on Hands = Mandatory Cross-Contamination Report]**: If a staff member washes hands, takes a paper towel to **wipe their face/mouth/nose first, and then uses the same paper towel to dry hands before donning gloves, opening the ice maker, or resuming beverage prep**, the hands are re-contaminated by the face — must report `A2` (`CONFIRMED`) RED_LINE violation!\n"
+            "> - **[List All Co-Occurring Triggers]**: If before directly donning gloves or touching the ice maker/chiller/bar utensils the staff member both used a phone AND touched hair/spectacles/spit guard/mop, list all contamination sources in the `A2` evidence (or split into separate rows); never let phone use mask other triggers.\n"
+            "> - If the staff member **leaves the frame** after the trigger, mark `UNVERIFIED · Destination after contamination unknown` and **still report**.\n"
+            "> - If the video ends within the 5-minute window, mark `UNVERIFIED · Monitoring window truncated` and **still report**.\n"
+            "> - **'Directly donning gloves without handwashing' is itself an independent violation** (Param 1.5.3), even if no food is touched afterward."
         ),
-        pass_criteria="触发事件后先完成五步洗手并用干净纸巾单向擦干双手，再戴新手套及接触制冰机/冷柜/食品接触工具",
-        fail_criteria="触碰头发/眼镜/防飞沫罩(spit guard)/拖把(mop)/手机后未洗手直接戴手套（1.5.3）或接触制冰机/冷柜食材/吧台器具（1.5.5 红线），或洗完手用同一张纸先擦脸再擦手后戴手套恢复作业",
+        pass_criteria="Completes 5-step handwashing and dries hands one-way with a clean paper towel after any trigger event before donning fresh gloves or touching the ice maker/chiller/food-contact tools",
+        fail_criteria="Directly dons gloves (1.5.3) or touches ice maker/chiller ingredients/bar utensils (1.5.5 RED_LINE) without handwashing after touching hair/spectacles/spit guard/mop/phone, or wipes face then hands with the same paper towel before donning gloves and resuming work",
     ),
     SopRuleItem(
         rule_id="A3",
-        name="A3 · 洗手动作五步核对",
-        category="【A】洗手与手部卫生（Week 1 主模块）",
+        name="A3 · 5-Step Handwashing Procedure Verification",
+        category="[A] Handwashing & Hand Hygiene (Week 1 Core Module)",
         severity="NORMAL",
         detection_type="absence",
         requires_full_context=True,
         check_instruction=(
-            "每次洗手都要逐项核对并输出：\n"
-            "| # | 步骤 | 判定要点 | 常见违规 |\n"
+            "Verify and output every handwashing instance item by item:\n"
+            "| # | Step | Verification Point | Common Violation |\n"
             "|---|---|---|---|\n"
-            "| 1 | **湿手（必须先于打皂液）** | **双手到达水槽的前 3 秒，必须先伸入水龙头流水下冲淋润湿（rinse/wet hands first）**，然后才能抬手按压皂液器 | **未先冲水湿手而直接干手按压皂液器（apply soap before wet hand / not rinse hand before applying handwashing gel）= 顺序错误必报** |\n"
-            "| 2 | 取洗手液 | 湿手后有按压皂液器/取用洗手液动作 | 直接冲水不打液（如仅冲水 2 秒即离开） |\n"
-            "| 3 | **搓洗 ≥20 秒** | **必须剥离湿手、按液与冲水时间，单独计算「纯泡沫对搓净时长」**（`按完皂液开始双手对搓时刻 → 双手伸入水流冲洗泡沫时刻`） | **纯搓洗净时长 <20 秒（含 15–22 秒临界区间，依原则四从严必报）** |\n"
-            "| 4 | 清水冲洗 | 冲掉泡沫 | 打完液直接擦干 |\n"
-            "| 5 | **纸巾擦干（必查结尾动作）** | 冲净泡沫后**必须从擦手纸架抽取干净纸巾将双手彻底擦干（dry hands with hand towel）** | **洗完手未用擦手纸擦干（直接甩手/自然晾干/用抹布围裙擦/直接戴手套）= 缺步骤必报；或用同一张纸先擦脸再擦手** |\n\n"
-            "- 洗手必须在**实体水槽 + 可见流水**处；用毛巾擦手 ≠ 洗手；洗手池洗手套 ≠ 洗手。\n"
-            "- **【步骤先后时序与首尾 3 秒慢放核查】**：无论在洗手专项还是制冰机周清视频中，凡观察到任何员工走到水槽洗手，必须重点慢放核查：\n"
-            "  1. **首 3 秒（湿手 vs 按皂液）**：手是先伸到水龙头下方接水润湿，还是**手部干燥状态直接先伸向皂液器按压洗手液（apply soap before wet hand）**？凡未先冲水湿手直接按皂液器，立即独立上报 `A3`（`CONFIRMED`）顺序错误违规！\n"
-            "  2. **中段（纯泡沫对搓净时长）**：严禁把「在水槽前站立总时长（含开水、湿手、按液、冲水、擦手）」当作搓洗时长；扣除湿手与冲水后，凡纯泡沫对搓净时长不足 20 秒（含 15–22 秒临界区间），判定 `A3`（`CONFIRMED`）。**若同一员工在片中先后进行了 2 次洗手（例如相隔数十秒先后两次冲水/搓洗均不足 20 秒），必须分别生成 2 条独立的 `A3` 记录，严禁合并为 1 条！**\n"
-            "  3. **尾 5 秒（是否用擦手纸擦干）**：关水/冲水结束后，员工双手是否明确抽取擦手纸擦干？若冲完水后**未拿擦手纸擦干双手**便直接离开水槽或直接拿取物品/戴手套，立即独立上报 `A3`（`CONFIRMED`，洗完手未用擦手纸擦干 `not dry hand with hand towel after handwashing`）！\n"
-            "- 缺任意步骤或**顺序错误**（如先打液后湿手、未用擦手纸擦干）→ 🟡 Common Deviation（非红线，但必报；若一次洗手中同时存在「干手先按皂液」与「搓洗<20秒」或「未用纸巾擦干」，必须在证据中同时写明或分别独立上报）。"
+            "| 1 | **Wet hands first (must precede soap)** | **In the first 3s at the sink, both hands must be placed under running faucet water to wet/rinse first**, before pressing the soap dispenser | **Applying soap with dry hands without wetting first (apply soap before wet hand / not rinse hand before applying handwashing gel) = mandatory sequence violation** |\n"
+            "| 2 | Apply handwashing soap | Presses soap dispenser / applies handwashing gel after wetting hands | Rinses with water only without soap (e.g., 2s water rinse then leaves) |\n"
+            "| 3 | **Scrub with foam >= 20 seconds** | **Exclude wetting, soap pressing & final rinsing time; measure only net foam-rubbing duration** (`soap rubbing start -> hands enter running water to rinse`) | **Net foam scrubbing < 20s (including 15–22s borderline range, strictly reported per Principle 4)** |\n"
+            "| 4 | Rinse with clean running water | Rinses off foam completely | Wipes dry immediately after applying soap |\n"
+            "| 5 | **Dry with paper towel (mandatory closing check)** | After rinsing off foam, **must pull a clean paper towel from dispenser to thoroughly dry both hands (dry hands with hand towel)** | **Failing to dry hands with a paper towel after washing (shaking / air-drying / wiping on cloth or apron / directly donning gloves) = missing step; or wiping face then hands with same towel** |\n\n"
+            "- Handwashing must occur at a **physical sink with visible running water**; wiping with a towel != handwashing; washing gloved hands != handwashing.\n"
+            "- **[Step Sequence & First 3s / Last 5s Slow-Motion Check]**: When any staff member approaches the sink:\n"
+            "  1. **First 3s (Wet vs. Soap)**: Do hands enter running water first, or **reach directly for the soap dispenser with dry hands (apply soap before wet hand)**? If dry hands press soap first, report an independent `A3` (`CONFIRMED`) sequence violation!\n"
+            "  2. **Middle phase (Net foam scrubbing)**: Never count total standing time at the sink as scrubbing time; if net foam rubbing is < 20s (including 15–22s borderline), report `A3` (`CONFIRMED`). **If the same staff member washes hands twice at different times and both are < 20s, emit 2 separate `A3` Finding rows — never merge them!**\n"
+            "  3. **Last 5s (Paper towel drying)**: After rinsing, does the staff member pull a clean paper towel to dry hands? If they leave or grab items/gloves **without drying hands with a paper towel**, report an independent `A3` (`CONFIRMED`, `not dry hand with hand towel after handwashing`)!\n"
+            "- Missing any step or **wrong step order** (soap before wetting, no paper towel drying) → 🟡 Common Deviation (non-RED_LINE, mandatory report; state both if both occur)."
         ),
-        pass_criteria="实体水槽先流水湿手→再取洗手液→纯泡沫搓洗净时长≥20秒（不含湿手与冲水时间）→清水冲洗→抽取干净擦手纸彻底擦干双手（每次洗手独立核算）",
-        fail_criteria="未先冲水湿手直接干手按压皂液器（apply soap before wet hand）、纯搓洗净时长不足20秒（含15-22秒临界值；多次洗手须逐次独立上报）、洗完手未用擦手纸擦干（not dry hand with hand towel）、用同一张纸先擦脸再擦手、或用抹布/围裙擦手",
+        pass_criteria="At a physical sink: wet hands under running water first -> apply soap -> net foam scrubbing >= 20s (excluding wetting and rinsing) -> rinse with clean water -> pull clean paper towel to thoroughly dry hands (each handwash evaluated independently)",
+        fail_criteria="Presses soap dispenser with dry hands before wetting (apply soap before wet hand), net foam scrubbing < 20s (report each occurrence separately), fails to dry hands with paper towel after washing (not dry hand with hand towel), wipes face then hands with same towel, or wipes hands on rag/apron",
     ),
     SopRuleItem(
         rule_id="A4",
-        name="A4 · 手套规范（参数表 1.6）",
-        category="【A】洗手与手部卫生（Week 1 主模块）",
+        name="A4 · Glove Usage Compliance (Param 1.6)",
+        category="[A] Handwashing & Hand Hygiene (Week 1 Core Module)",
         severity="RED_LINE",
         detection_type="absence",
         requires_full_context=True,
         check_instruction=(
-            "- 处理食品必须戴手套\n"
-            "- **洗手后必须立即更换新手套**（洗完手继续用旧手套 = 违规）\n"
-            "- 手套被污染后必须立即更换"
+            "- Must wear gloves when handling food or food-contact ice/surfaces\n"
+            "- **Must immediately replace with a fresh pair of gloves after handwashing** (reusing old gloves after washing hands = violation)\n"
+            "- Must immediately replace gloves whenever torn or contaminated"
         ),
-        pass_criteria="处理食品全程戴手套，洗手后及手套污染后立即更换新手套",
-        fail_criteria="裸手处理食品、洗完手继续戴旧手套、手套污染破损后未更换",
+        pass_criteria="Wears gloves throughout food handling and immediately puts on fresh gloves after handwashing or glove contamination",
+        fail_criteria="Handles food or cleans interior food-contact surfaces bare-handed, reuses old gloves after handwashing, or fails to replace contaminated/torn gloves",
     ),
     SopRuleItem(
         rule_id="A5",
-        name="A5 · 2 小时周期洗手（仅当输入覆盖 ≥2 小时时启用）",
-        category="【A】洗手与手部卫生（Week 1 主模块）",
+        name="A5 · 2-Hour Periodic Handwashing (Active Only When Input >= 2 Hours)",
+        category="[A] Handwashing & Hand Hygiene (Week 1 Core Module)",
         severity="NORMAL",
         detection_type="absence",
         requires_full_context=True,
         check_instruction=(
-            "- 追踪每位员工的洗手时间点，计算相邻间隔\n"
-            "- 间隔 >2 小时 → 违规\n"
-            "- **若本段视频总时长 <2 小时，明确输出：`本段时长不足，2 小时周期规则不适用`**，不得强行判定"
+            "- Track handwashing timestamps for each staff member and compute intervals between consecutive washes\n"
+            "- Interval > 2 hours → violation\n"
+            "- **If total video duration < 2 hours, explicitly state: `Segment duration under 2 hours; 2-hour periodic rule not applicable`** and do not force a violation verdict"
         ),
-        pass_criteria="在岗每2小时内至少完成一次合规洗手（时长<2小时则注明不适用）",
-        fail_criteria="连续在岗超过2小时未洗手",
+        pass_criteria="Completes at least one compliant handwash every 2 hours on duty (or noted as not applicable when video < 2 hours)",
+        fail_criteria="Continuously on duty for more than 2 hours without handwashing",
     ),
-    # ───────────────────────── 【B】制冰机周清洁（Week 2 主模块） ─────────────────────────
+    # ───────────────────────── [B] Ice Maker Weekly Deep Clean (Week 2 Core Module) ─────────────────────────
     SopRuleItem(
         rule_id="B0",
-        name="B0 · 机型识别与立式分体制冰机视觉先验（第一步，必须输出）",
-        category="【B】制冰机周清洁（Week 2 主模块）",
+        name="B0 · Ice Maker Model Identification & Visual Priors (Step 1, Mandatory Output)",
+        category="[B] Ice Maker Weekly Deep Clean (Week 2 Core Module)",
         severity="NORMAL",
         detection_type="presence",
         requires_full_context=False,
         check_instruction=(
-            "观察机身品牌标识、面板形状、水帘结构、格栅布局、门板开合方式：\n"
-            "- 输出：`机型 = Langtuo` / `Manitowoc (HT1000)` / `Manitowoc (Indigo NXT)` / `无法确认`\n"
-            "- 写出你的识别依据\n"
-            "- **无法确认时，按 Langtuo 最严标准核验（静置 ≥10 分钟），并标注 `机型未确认`**\n"
-            "- ⚠️ **【官方 SOP 两大制冰机机型结构与可拆部件视觉锚定（源自 CHAGEE APAC 官方 SOP）】**：\n"
-            "  1. **`Langtuo` 双门立式分体制冰机（Model: Langtuo，SOP 21）**：\n"
-            "     - **外观结构**：高约 1.8–2.0 米的高大立式分体机，上半部制冰机头为**左右两块不锈钢前门面板（`left/right door panels`，内衬白色食品接触面 `white cover`）+ 中间立柱（`middle pillar`）+ 右上角蓝色数字液晶屏**，下半部为斜掀盖储冰仓（`ice bin`，蓝色内胆）。机头内部上方有横向白色**布水管（`water distribution tube`）**、金属**蒸发器制冰格栅（`evaporator cube`）**、下方**水槽（`water trough`）**，外覆两块带 V 型导流槽的白色**挡水帘（`water curtain`）**。\n"
-            "     - **顶部平面暂存拆洗特征（SOP 21 第 5–10 步关键视觉先验）**：按照官方 SOP，员工会踩梯子/高凳，用螺丝刀拆下左右两块前门盖板（`door panels / white cover`）、中间立柱及两块白色挡水帘（`water curtain`），**直接平铺放置在制冰机顶部平面（`top surface of the ice maker`，白色食品接触内表面朝上）喷洒消毒液静置 10 分钟**，并在机器顶部或取下后用白色长柄弯头刷（`cleaning brush`）和红边毛巾刷洗擦拭后装回。\n"
-            "  2. **`Manitowoc` 立式制冰机（Model: Choice HT1000 / Indigo NXT，SOP 8）**：\n"
-            "     - **外观结构**：拆下前门面板（`door panel / white cover`，外层银色不锈钢、内层白色塑料壁）及百叶/导流状**挡水帘（`water curtain`）**后，内部正上方为可拧螺丝拆下的横向白色**布水管（`water distribution tube`）**，中部为金属**制冰格栅（`ice making plates`）**，右侧为三个白色**浮球开关与水泵（`float switches / water pump`）**，底部为横向可卡扣拆下的**水槽（`water trough`）**，右上角为 `ICE / OFF / CLEAN` 拨杆开关（HT1000）或 Indigo NXT 触摸屏。\n"
-            "  - **严禁将员工登梯在制冰机顶部平面喷洒/刷洗/擦拭白色门盖板（`white cover`）与挡水帘（`water curtain`）、擦拭上方布水管（`water distribution tube`）或向水槽倒消毒液误判为「清洁排风网/空调口」或「擦拭冷柜顶部」而漏检 `B1`–`B4`！**"
+            "Observe the machine brand badge, panel shape, water curtain structure, evaporator grid layout, and door opening mechanism:\n"
+            "- Output: `Model = Langtuo` / `Manitowoc (HT1000)` / `Manitowoc (Indigo NXT)` / `Unconfirmed`\n"
+            "- State your visual identification basis\n"
+            "- **When unconfirmed, enforce the strictest Langtuo standard (sanitizer soak >= 10 minutes) and label `Model Unconfirmed`**\n"
+            "- ⚠️ **[Official SOP Visual Priors for Upright Modular Ice Makers (CHAGEE APAC SOP)]**:\n"
+            "  1. **`Langtuo` Dual-Door Upright Modular Ice Maker (SOP 21)**:\n"
+            "     - **Structure**: ~1.8–2.0m tall upright unit; upper ice-making head has **left/right stainless front door panels (lined with white food-contact `white cover`) + middle pillar + top-right blue LCD**, lower angled-lid ice bin (blue liner). Inside head: upper horizontal white **water distribution tube**, metal **evaporator cube grid**, lower **water trough**, covered by two white grooved **water curtains**.\n"
+            "     - **Top-Surface Disassembly & Soaking Prior (SOP 21 Steps 5–10)**: Staff climb a step stool, unscrew left/right front door panels (`door panels / white cover`), middle pillar, and two white **water curtains**, **lay them flat on top of the ice maker (white inner surface facing up), spray sanitizer, and soak >= 10 minutes**, then scrub/wipe with a white long-handled bent brush and red-edged towel before reinstalling.\n"
+            "  2. **`Manitowoc` Upright Ice Maker (Choice HT1000 / Indigo NXT, SOP 8)**:\n"
+            "     - **Structure**: After removing the front door panel (`white cover`, silver exterior, white plastic inner liner) and louvered **water curtain**, top interior has a screw-mounted horizontal white **water distribution tube**, middle metal **ice making plates**, right-side three white **float switches / water pump**, bottom clip-out **water trough**, and top-right `ICE / OFF / CLEAN` toggle switch (HT1000) or Indigo NXT touchscreen.\n"
+            "  - **Never misclassify staff on a step stool spraying/scrubbing/wiping the `white cover` and `water curtain` on top of the ice maker, wiping the upper `water distribution tube`, or pouring sanitizer into the `water trough` as 'cleaning an air vent/AC' or 'wiping a chiller top', which would miss `B1`–`B4`!**"
         ),
-        pass_criteria="准确识别 Langtuo 或 Manitowoc 制冰机及其五大核心部件（外盖门板 door panel/white cover、挡水帘 water curtain、上方横向布水管 water distribution tube、蒸发器制冰格 evaporator grid、水槽 water trough）并按对应静置阈值核验",
-        fail_criteria="未按对应机型标准核验，或将制冰机顶部平面上的白色门盖板/挡水帘及内部布水管误判为其他设备而漏检 B1–B4",
+        pass_criteria="Accurately identifies Langtuo or Manitowoc ice maker and its 5 core components (door panel/white cover, water curtain, upper horizontal water distribution tube, evaporator grid, water trough) and applies the corresponding soak threshold",
+        fail_criteria="Fails to verify against the corresponding model standard, or misidentifies the white door cover/water curtain on top of the ice maker or internal distribution tube as another appliance, missing B1–B4",
     ),
     SopRuleItem(
         rule_id="B1-1",
-        name="B1-1 · Langtuo 完整流程核对（15 项，SOP 21）",
-        category="【B】制冰机周清洁（Week 2 主模块）",
+        name="B1-1 · Langtuo Complete 15-Step Weekly Clean Verification (SOP 21)",
+        category="[B] Ice Maker Weekly Deep Clean (Week 2 Core Module)",
         severity="RED_LINE",
         detection_type="absence",
         requires_full_context=True,
         check_instruction=(
-            "| # | 步骤 | 关键判定 | 依据 |\n"
-            "|---|---|---|---|\n"
-            "| 1 | **关闭主电源开关（main switch）并清空冰仓** | 按屏幕 `[Power]->[Off]` 排水排冰后，**必须戴干燥手套关闭机身背面/顶部红色主电源旋钮开关**，再铲空储冰仓残冰 | SOP 21 Step 1–4 |\n"
-            "| 2 | **备料：白底透明喷壶灌满无色消毒液** | 全程仅限使用 Ecolab KAY-5 消毒液，**严禁使用黄色瓶身多功能清洁剂（Not using multipurpose solution in yellow bottle）** | SOP 21 Step 4 & B3 |\n"
-            "| 3 | 备料：配置 **8L 消毒液**（透明带刻度量桶） | 用于后续倒入水槽右侧启动自清洁 | SOP 21 Step 4 & 26 |\n"
-            "| 4 | 备料：白色长柄弯头清洁刷浸泡于消毒液 | | SOP 21 Step 4 |\n"
-            "| 5 | **喷洒并用蓝边毛巾擦净制冰机顶部平面，再用螺丝刀拆下左右门面板与中间立柱** | 拆下的螺丝须放入不锈钢方盘妥善保管 | SOP 21 Step 5–6 |\n"
-            "| 6 | **门面板/白色外盖（door panel / white cover）正反双面喷洒消毒液并静置 ≥10 分钟** | 放置在制冰机顶部平面时**白色食品接触内表面必须朝上**；喷洒后**必须静置满 10 分钟**，未满严禁提前擦拭、刷洗或回装 | SOP 21 Step 7–8 |\n"
-            "| 7 | **拆下两块白色挡水帘（Remove water curtain）喷洒消毒液并静置 ≥10 分钟** | 拆下挡水帘喷洒消毒液后置于顶部**静置满 10 分钟**，未满严禁提前刷洗、擦拭或回装 | SOP 21 Step 9–10 |\n"
-            "| 8 | **喷洒内部制冰格表面、侧边格栅与上方布水管** | 必须大量喷洒：① **内部蒸发器制冰格（evaporator cube / interior surface of ice maker machine grid）**；② **侧边格栅（side grid）**；③ **上方横向布水管（water distribution tube）与管壁孔洞** | SOP 21 Step 11–14 |\n"
-            "| 9 | **喷洒储冰仓所有内壁、顶部、边角及盖板内侧（all interior & interior of door）** | 喷完所有内部、外部与可拆件后，喷壶内消毒液应仅剩 ≤1/4 或喷空 | SOP 21 Step 15–18 |\n"
-            "| 10 | **关闭冰仓**，再喷**机身外部**表面 | 顺序不可颠倒 | SOP 21 Step 18 |\n"
-            "| 11 | **各部件独立静置 ≥10 分钟（Allow it to sit for 10 minutes）** | 必须对**布水管（distribution tube）、白色外盖门板（white cover / door panel）、挡水帘（water curtain）、舱门内壁（interior of door）及机身内腔**分别核对 `喷完时刻 → 首次擦拭/刷洗/回装时刻`，任一部件不足 10 分钟即报 `B2` | SOP 21 Step 19 |\n"
-            "| 12 | **静置满 10 分钟后，用从消毒桶取出的干净红边毛巾及刷子清洁内腔、布水管与可拆件（含四周边框/侧面边缘）** | ① 用湿红边毛巾包裹吧勺/封口夹及长柄刷清洁蒸发器格栅、**上方布水管（distribution tube）**、缝隙孔洞与水槽；② 对挡水帘和白色外盖门板必须彻底刷洗/擦拭**正反面及四周边框、四个侧面厚度边缘与边角（especially at the corners, sides and edges）**，挡水帘经滤过水冲洗后再用干红边毛巾擦干；③ 门面板与中间立柱的**白色内表面用干红边毛巾擦拭**，**不锈钢外表面与底边框（bottom border）用干蓝边毛巾擦拭** | SOP 21 Step 19–35 |\n"
-            "| 13 | **向水槽右侧倒入 8L 消毒液（Pour 8L of sanitizer solution into the right side of the water trough / Pour sanitiser solution into water trough）** | **必须在内腔擦洗完毕后执行**：持大容量量桶向制冰机上部水槽（water trough）倾倒 8L 消毒液（漏倒必报） | SOP 21 Step 26 |\n"
-            "| 14 | **按序装回挡水帘、中间立柱、左门面板、右门面板并拧紧螺丝（Close back ice maker machine）**，开启主电源与自清洁，用**干燥蓝边毛巾**擦净机身外壳 | 可拆件必须完整装回并关好制冰机门板 | SOP 21 Step 29–38 |\n"
-            "| 15 | **约 2 小时 / 5 批冰后：用干红边毛巾擦净储冰仓盖板孔洞，铲除丢弃全部含消毒液的冰块 + 用滤过水冲洗冰仓并用干红毛巾擦干缝隙** | 若视频未覆盖此时段，记 `OUT_OF_SCOPE` 并提示需另调后续录像 | SOP 21 Step 39–42 |"
+            "| # | Step | Key Verification Point |\n"
+            "|---|---|---|\n"
+            "| 1 | **Turn off main power switch & empty ice bin** | Press `[Power]->[Off]` to drain, **wear dry gloves to turn off rear/top red main power switch**, scoop out all ice (SOP 21 1–4) |\n"
+            "| 2 | **Prep: Fill white/clear spray bottle with colorless sanitizer** | Only Ecolab KAY-5 sanitizer; **prohibit multipurpose solution in yellow bottle** (SOP 21 4 & B3) |\n"
+            "| 3 | Prep: **8L sanitizer solution** (clear bucket) | For pouring into right side of water trough during self-cleaning (SOP 21 4 & 26) |\n"
+            "| 4 | Prep: Soak white long-handled bent brush in sanitizer | (SOP 21 4) |\n"
+            "| 5 | **Wipe top of ice maker with blue-edged towel, unscrew door panels & pillar** | Keep screws in a stainless-steel tray (SOP 21 5–6) |\n"
+            "| 6 | **Spray sanitizer on both sides of door panels / white covers & sit >= 10 min** | Placed on top with **white inner surface facing up**; **must sit full 10 min** — no early wipe/scrub/reinstall (SOP 21 7–8) |\n"
+            "| 7 | **Remove both white water curtains, spray sanitizer & sit >= 10 min** | **Must sit full 10 min** before scrubbing, wiping, or reinstalling (SOP 21 9–10) |\n"
+            "| 8 | **Spray internal evaporator grid, side grid & upper water distribution tube** | Heavily spray: (1) **evaporator cube grid**; (2) **side grid**; (3) **upper horizontal water distribution tube & nozzles** (SOP 21 11–14) |\n"
+            "| 9 | **Spray all ice bin walls, top, corners & interior of door** | After spraying all interior, exterior & removable parts, <= 1/4 of bottle remains (SOP 21 15–18) |\n"
+            "| 10 | **Close ice bin lid first**, then spray **machine exterior** | Do not reverse order (SOP 21 18) |\n"
+            "| 11 | **Independent >= 10-min contact time per component (Allow it to sit for 10 minutes)** | Verify `spray end -> first wipe/scrub/reinstall` for **distribution tube, white cover/door panel, water curtain, interior of door & cavity**; < 10 min triggers `B2` (SOP 21 19) |\n"
+            "| 12 | **After 10 min, clean interior, distribution tube & removable parts (all 4 sides/edges) with brush and clean red-edged towel from sanitizing bucket** | (1) Clean evaporator grid, **upper water distribution tube**, crevices & trough with wet red-edged towel + brush; (2) Scrub/wipe **front, back & all 4 perimeter sides, edges & corners (`especially at the corners, sides and edges`)** of water curtains & white covers; rinse curtains & dry with red-edged towel; (3) Wipe **white inner surface** of door panels/pillar with dry red-edged towel, and **stainless outer surface & bottom border** with dry blue-edged towel (SOP 21 19–35) |\n"
+            "| 13 | **Pour 8L sanitizer into right side of water trough (`Pour sanitiser solution into water trough`)** | **Mandatory after interior wiping**: pour 8L sanitizer into water trough (omitting = violation) (SOP 21 26) |\n"
+            "| 14 | **Reinstall curtains, pillar & door panels (`Close back ice maker machine`)**, turn on power & self-clean, wipe exterior with **dry blue-edged towel** | All parts reinstalled and doors closed (SOP 21 29–38) |\n"
+            "| 15 | **After ~2h / 5 batches: wipe bin lid holes with dry red-edged towel, discard sanitizer-ice + rinse bin & dry crevices with red-edged towel** | Mark `OUT_OF_SCOPE` if outside video window (SOP 21 39–42) |"
         ),
-        pass_criteria="完整执行 Langtuo 周清流程：断主电源、仅用白底透明瓶无色消毒液、拆门面板(white cover)与挡水帘(water curtain)置顶喷洒静置≥10分钟、喷内部制冰格/侧边格栅/布水管(distribution tube)/冰仓内壁并静置≥10分钟、用消毒桶取出的干净红毛巾擦拭布水管/内腔及可拆件（含四周边框与侧面边缘）、向水槽倒入8L消毒液、按序装回门板关好机器、蓝毛巾擦外部",
-        fail_criteria="未关主电源、使用黄色瓶身多功能清洁剂（B3）、任一部件（布水管 distribution tube / 白色外盖门板 white cover / 挡水帘 water curtain / 舱门内壁 / 机身内腔）静置不足10分钟即提前擦拭/刷洗/回装（B2）、未使用消毒桶取出的干净红毛巾（B4）、漏擦白色外盖门板或挡水帘的四周边框/侧面边缘（sides/edges）、漏向水槽倒消毒液、或未关回制冰机",
+        pass_criteria="Completes full Langtuo weekly clean: turns off main switch, uses only colorless sanitizer in white/clear bottle, removes door panels (white cover) & water curtains to spray and soak >= 10 min, sprays interior grid/side grid/distribution tube/bin liner and soaks >= 10 min, wipes distribution tube/interior/removable parts (including all 4 sides & edges) with clean red-edged towel from sanitizing bucket, pours 8L sanitizer into water trough, reinstalls doors & closes machine, wipes exterior with blue-edged towel",
+        fail_criteria="Fails to turn off main power switch, uses yellow-bottle multipurpose cleaner (B3), wipes/scrubs/reinstalls any component (distribution tube / white cover / water curtain / interior of door / interior cavity) before 10-min soak completes (B2), fails to use clean red-edged towel from sanitizing bucket (B4), fails to wipe all 4 sides/edges of white cover or water curtain, omits pouring sanitizer into water trough, or fails to close back ice maker machine",
     ),
     SopRuleItem(
         rule_id="B1-2",
-        name="B1-2 · Manitowoc 完整流程核对（13 项，SOP 8）",
-        category="【B】制冰机周清洁（Week 2 主模块）",
+        name="B1-2 · Manitowoc Complete 13-Step Weekly Clean Verification (SOP 8)",
+        category="[B] Ice Maker Weekly Deep Clean (Week 2 Core Module)",
         severity="RED_LINE",
         detection_type="absence",
         requires_full_context=True,
         check_instruction=(
-            "| # | 步骤 | 关键判定 |\n"
+            "| # | Step | Key Verification Point |\n"
             "|---|---|---|\n"
-            "| 1 | **拆下前门板，先拨 CLEAN 冲水 5 分钟，再将 toggle switch 拨至 OFF 断电清空残冰** | 拆内部组件和铲冰前开关必须在 `OFF` 位；全程**严禁使用黄色瓶身多功能清洁剂（Not using multipurpose solution in yellow bottle）**（SOP 8 Step 1–3） |\n"
-            "| 2 | **拆下内部可拆三件套：布水管（distribution tube）、水槽（water trough）、挡水帘（water curtain）** | 拧松螺丝拆下上方横向布水管（distribution tube）、拔开水泵连接滑套、按压左右卡扣拉出底部水槽（water trough）与挡水帘（SOP 8 Step 4–6） |\n"
-            "| 3 | **对门面板/白色外盖（door panel / white cover）喷洒消毒液并静置 ≥5 分钟** | 喷洒消毒液后须**静置满 5 分钟**，未满严禁提前擦拭、刷洗或回装（SOP 8 Step 7） |\n"
-            "| 4 | **对挡水帘（water curtain）、水槽（water trough）、布水管（distribution tube）喷洒消毒液并静置 ≥5 分钟** | 所有可拆件喷洒消毒液后须**静置满 5 分钟**，未满严禁提前擦拭、刷洗或回装（SOP 8 Step 7 & 12） |\n"
-            "| 5 | **喷洒内部制冰格表面（ice making plates / grid）、浮球开关（float switches）与侧壁（side wall）** | 大量喷洒消毒液并**静置满 5 分钟**（SOP 8 Step 8） |\n"
-            "| 6 | **喷洒储冰仓内部（interior ice bin）、舱门内壁（interior of door）及机身外表面** | 大量喷洒消毒液并**静置满 5 分钟**（SOP 8 Step 9–10） |\n"
-            "| 7 | 处理**空气滤网（air filter）** | 拆下水洗并用干净蓝边毛巾擦干装回；若滤网在机器背面无法触及则豁免（须注明）（SOP 8 Page 7） |\n"
-            "| 8 | **各部件独立静置 ≥5 分钟（After 5 minutes, proceed to wipe all sanitized components）** | 必须对**布水管（water distribution tube）、白色外盖门板（door panel / white cover）、挡水帘（water curtain）、舱门内壁（interior of door）及机身内腔**分别核对 `喷完时刻 → 首次擦拭/刷洗/回装时刻`，任一部件不足 5 分钟即独立报 `B2` |\n"
-            "| 9 | **用从消毒桶取出的干净红边毛巾依次擦拭浮球开关、水泵、挡水帘、水槽、布水管及储冰仓死角（含四周边框与侧面边缘）** | 必须使用从专用消毒桶（sanitizing bucket）取出的干净红边毛巾；擦拭白色外盖门板（white cover）、挡水帘（water curtain）、布水管（distribution tube）时**必须完整擦拭正反双面、四周边框与侧面厚度边缘（sides/edges）及边角**（SOP 8 Step 11–15） |\n"
-            "| 10 | **先装回布水管（distribution tube）、水槽（water trough）与挡水帘（water curtain）** | 擦净后按序装回机身内部（SOP 8 Step 13） |\n"
-            "| 11 | **拨至 CLEAN 并在首次排水后掀开挡水帘 45° 向水槽倒入 3L 消毒液（Pour 3L of sanitizer solution into water trough）** | ⚠️ **Audit Template 必查动作**：启动约 35 分钟自清洁循环，完成后拨回 `ICE`（SOP 8 Step 16–18） |\n"
-            "| 12 | **红边毛巾擦拭门面板白色内表面（white surface）并装回门板（Close back ice maker machine）** | ⚠️ **Audit Template 必查动作**：门面板白色内壁（含四周侧沿）用**红边毛巾**擦净后装回机身（SOP 8 Step 19） |\n"
-            "| 13 | **用蓝边毛巾擦拭门面板银色外表面（silver surface）及机身外壳** | 去除外部残留消毒液水痕（SOP 8 Step 20–21） |"
+            "| 1 | **Remove front door panel, toggle CLEAN for 5-min flush, then toggle OFF and empty ice** | Toggle must be `OFF` before removing internal parts or scooping ice; **prohibit multipurpose solution in yellow bottle** (SOP 8 1–3) |\n"
+            "| 2 | **Remove 3 internal parts: water distribution tube, water trough, and water curtain** | Unscrew upper `distribution tube`, disconnect pump slip joint, release clips to pull out `water trough` and `water curtain` (SOP 8 4–6) |\n"
+            "| 3 | **Spray sanitizer on door panel / white cover and let sit >= 5 min** | Must **sit full 5 min** after spraying; never wipe, scrub, or reinstall early (SOP 8 7) |\n"
+            "| 4 | **Spray sanitizer on water curtain, water trough & distribution tube and let sit >= 5 min** | All removable parts must **sit full 5 min** after spraying before wiping, scrubbing, or reinstalling (SOP 8 7 & 12) |\n"
+            "| 5 | **Spray internal ice making plates / evaporator grid, float switches, and side walls** | Heavily spray sanitizer and **let sit >= 5 min** (SOP 8 8) |\n"
+            "| 6 | **Spray interior ice bin, interior of door, and exterior surfaces** | Heavily spray sanitizer and **let sit >= 5 min** (SOP 8 9–10) |\n"
+            "| 7 | Clean **air filter** | Wash with water, dry with blue-edged towel, reinstall; exempt if rear-mounted & inaccessible (must note) (SOP 8 p.7) |\n"
+            "| 8 | **Independent >= 5-min contact time per component (`After 5 minutes, proceed to wipe all sanitized components`)** | Verify `spray end -> first wipe/scrub/reinstall` for **distribution tube, door panel/white cover, water curtain, interior of door, and interior cavity**; any part < 5 min triggers `B2` |\n"
+            "| 9 | **Wipe float switches, water pump, water curtain, water trough, distribution tube & bin corners (including all 4 sides & edges) with clean red-edged towel from sanitizing bucket** | Must take clean red-edged towel from dedicated `sanitizing bucket`; for `white cover`, `water curtain` & `distribution tube`, **thoroughly wipe front, back, and all 4 perimeter sides, thickness edges (`sides/edges`) & corners** (SOP 8 11–15) |\n"
+            "| 10 | **Reinstall water distribution tube, water trough, and water curtain first** | Reinstall internal components in order after wiping clean (SOP 8 13) |\n"
+            "| 11 | **Toggle CLEAN and after first drain tilt water curtain 45° to pour 3L sanitizer solution into water trough (`Pour 3L of sanitizer solution into water trough`)** | ⚠️ **Mandatory Action**: starts ~35-min self-cleaning cycle, then toggle back to `ICE` (SOP 8 16–18) |\n"
+            "| 12 | **Wipe white inner surface of door panel with red-edged towel and reinstall door panel (`Close back ice maker machine`)** | ⚠️ **Mandatory Action**: wipe white inner door liner (including all 4 side edges) with **red-edged towel** and reinstall (SOP 8 19) |\n"
+            "| 13 | **Wipe silver exterior of door panel and machine body with blue-edged towel** | Remove exterior sanitizer residue and water marks (SOP 8 20–21) |"
         ),
-        pass_criteria="拨OFF断电、拆门板/布水管(distribution tube)/水槽(water trough)/挡水帘(water curtain)、全部件与内腔喷洒无色消毒液并独立静置≥5分钟、用消毒桶取出的干净红毛巾对布水管/挡水帘/水槽/白色外盖门板（正反面+四周侧面边缘）与内腔全表面无死角擦拭、装回内部三件套并倒入3L消毒液启动Self-Cleaning、红毛巾擦门板白色内壁后装回关好机器、蓝毛巾擦银色外表面",
-        fail_criteria="未拨OFF开关、使用黄色瓶身多功能清洁剂（B3）、任一部件（布水管 distribution tube / 白色外盖门板 white cover / 挡水帘 water curtain / 舱门内壁 / 机身内腔）喷洒消毒液后静置不足5分钟即提前擦拭/刷洗/回装（B2）、未使用从消毒桶取出的干净红毛巾（B4）、未彻底擦拭白色外盖门板或挡水帘的四周边框/侧面边缘（sides of white cover）、漏向水槽倒消毒液、或未关回制冰机",
+        pass_criteria="Toggles OFF power, removes door panel/distribution tube/water trough/water curtain, sprays colorless sanitizer on all parts & interior and soaks >= 5 min independently, wipes distribution tube/water curtain/trough/white cover (front, back + all 4 sides/edges) & interior with clean red-edged towel from sanitizing bucket, reinstalls 3 internal parts & pours 3L sanitizer into water trough for Self-Cleaning, wipes white inner door liner with red-edged towel & closes machine, wipes silver exterior with blue-edged towel",
+        fail_criteria="Fails to toggle OFF switch, uses yellow-bottle multipurpose cleaner (B3), wipes/scrubs/reinstalls any part (distribution tube / white cover / water curtain / interior of door / interior cavity) before 5-min soak completes (B2), fails to use clean red-edged towel from sanitizing bucket (B4), fails to thoroughly wipe all 4 sides/edges of white cover or water curtain, omits pouring sanitizer into water trough, or fails to close back ice maker machine",
     ),
     SopRuleItem(
         rule_id="B2",
-        name="B2 · 分部件静置锁定期与全表面（含四周侧面边缘）覆盖完整性（必查红线）",
-        category="【B】制冰机周清洁（Week 2 主模块）",
+        name="B2 · Per-Component Sanitizer Contact Time Lock & Full-Surface (Sides/Edges) Coverage (Mandatory RED_LINE)",
+        category="[B] Ice Maker Weekly Deep Clean (Week 2 Core Module)",
         severity="RED_LINE",
         detection_type="absence",
         requires_full_context=True,
         check_instruction=(
-            "- 必须**按以下 5 类核心部件逐件独立追踪并分别计算**消毒液停留静置时长（输出格式：`[部件名] 喷洒 HH:MM:SS → 首次擦拭/刷洗/回装 HH:MM:SS = 实际 X 分 Y 秒`）：\n"
-            "  1. **上方横向白色布水管/分配管（water distribution tube）**\n"
-            "  2. **前门面板/白色外盖（door panel / white cover，含放置在制冰机顶部平面或台面上的白色盖板）**\n"
-            "  3. **白色带槽挡水帘/水帘板（water curtain）**\n"
-            "  4. **制冰机舱门内壁/储冰仓门内侧（interior of ice maker door）**\n"
-            "  5. **机身内腔与制冰蒸发器格栅（all interior / evaporator grid / water trough）**\n"
-            "  - **Manitowoc 最低静置阈值 ≥5 分钟**；**Langtuo / 机型未确认最低静置阈值 ≥10 分钟**。\n"
-            "- 🔴 **【部件静置锁定期阻断原则（提前擦拭/刷洗/装回任一部件 = 立即对该部件单独报 B2 CONFIRMED）】**：\n"
-            "  - 上述 5 类部件中的**任何一个**一旦喷洒消毒液（或从拆下开始清洁），必须静置满规定时长（5 分钟或 10 分钟）后才能开始用毛巾擦拭、用刷子刷洗、用水冲洗或装回机器！\n"
-            "  - 凡观察到员工在静置未满时就：① **提前用红毛巾擦拭布水管（wipe water distribution tube without waiting 5/10 min）**；② **提前刷洗/擦拭/装回白色外盖门板（white cover / door panel）**；③ **提前刷洗/擦拭/装回挡水帘（water curtain）**；或 ④ **喷洒舱门内壁（interior of ice maker door）后未满静置时间即擦拭并关门回装**，无需等待其他部件，**必须立即针对该具体部件独立输出一条 `B2`（`CONFIRMED`）红线违规记录**！\n"
-            "  - **【严禁被其他条款吞并】**：即便同一时间段已检出 `A4`（未戴手套徒手清洁）、`B4`（毛巾未从消毒桶取出）或 `B3`（用错化学瓶），只要该段内存在未满静置时间即擦拭/刷洗/回装部件的行为，**必须额外并列输出独立的 `B2` 违规记录，绝不可省略 `B2`！**\n"
-            "- 🔴 **【可拆部件「四周边框与侧面厚度边缘」全覆盖原则（Wipe the sides and edges thoroughly）】**：\n"
-            "  - 根据官方 SOP（Langtuo Step 27 `especially at the corners and edges`），在刷洗和擦拭**白色外盖门板（white cover / door panel）**与**挡水帘（water curtain）**时，必须完整擦拭正反两面以及**四周边框、四个侧面厚度边缘（sides of the white cover）和四角凹槽**。\n"
-            "  - 若员工仅快速擦拭/刷洗白色外盖门板或挡水帘的正面平坦区域，**未彻底擦拭其四周侧面边缘（do not wipe the sides of white cover thoroughly）**，必须单独上报一条 `B2`（或 `B4`）违规记录，明确写明「未彻底擦拭白色外盖门板/水帘板的四周侧面与边缘（sides/edges）」！\n"
-            "- **视频在静置期内结束（且未见提前擦拭）→ `UNVERIFIED · 静置未完成即截断`，仍需上报**并注明需调取后续录像。\n"
-            "- 无法精确读时 → 按从严原则判「不足」。"
+            "- Must **independently track and compute sanitizer contact/soak duration for each of the 5 core components** (`[Component] Spray HH:MM:SS -> First Wipe/Scrub/Reinstall HH:MM:SS = Actual X min Y sec`):\n"
+            "  1. **Upper horizontal white water distribution tube (`water distribution tube`)**\n"
+            "  2. **Front door panel / white inner cover (`door panel / white cover`, including panels on top of the ice maker or counter)**\n"
+            "  3. **White grooved water curtain (`water curtain`)**\n"
+            "  4. **Interior of ice maker door / ice bin door liner (`interior of ice maker door`)**\n"
+            "  5. **Machine interior cavity & evaporator grid (`all interior / evaporator grid / water trough`)**\n"
+            "  - **Manitowoc threshold >= 5 minutes**; **Langtuo / Unconfirmed threshold >= 10 minutes**.\n"
+            "- 🔴 **[Component Soak Lock Blocking Rule (Early Wipe/Scrub/Reinstall of Any Component = Immediate Independent B2 CONFIRMED)]**:\n"
+            "  - Once any of the 5 components is sprayed with sanitizer (or removed for cleaning), it must sit undisturbed for the full required duration (5 or 10 min) before being wiped, scrubbed, rinsed, or reinstalled!\n"
+            "  - Whenever staff before soak completion: (1) **wipe the water distribution tube early (`wipe water distribution tube without waiting 5/10 min`)**; (2) **scrub/wipe/reinstall the white cover / door panel early**; (3) **scrub/wipe/reinstall the water curtain early**; or (4) **wipe and close the interior of the ice maker door early**, **immediately output an independent `B2` (`CONFIRMED`) RED_LINE finding for that component**!\n"
+            "  - **[Never Swallowed by Other Rules]**: Even if `A4` (bare-handed), `B4` (towel source), or `B3` (wrong chemical) is reported in the same timeframe, **always output an independent `B2` finding whenever any component is wiped/scrubbed/reinstalled early!**\n"
+            "- 🔴 **[Removable Component 'All Four Sides & Thickness Edges' Full Coverage (`Wipe the sides and edges thoroughly`)]**:\n"
+            "  - Per SOP (Langtuo Step 27 `especially at the corners and edges`), when scrubbing/wiping the **white cover / door panel** and **water curtain**, staff must thoroughly wipe front, back, and **all four perimeter frames, lateral thickness edges (`sides of the white cover`), and corner grooves**.\n"
+            "  - If staff only wipe the flat central face **without thoroughly wiping its four lateral edges (`do not wipe the sides of white cover thoroughly`)**, report a separate `B2` (or `B4`) finding!\n"
+            "- **Video ends while soak is in progress (and no early wipe occurred) → `UNVERIFIED · Soak period truncated by end of video`, still report** and note follow-up footage required.\n"
+            "- When exact timing is ambiguous → apply Principle 4 strict rounding and judge as 'insufficient duration'."
         ),
-        pass_criteria="布水管(water distribution tube)、白色外盖门板(white cover/door panel)、挡水帘(water curtain)、舱门内壁(interior of door)及机身内腔各自的消毒液静置时长均 ≥ 机型阈值（Manitowoc 5分钟 / Langtuo 10分钟），且擦拭白色外盖与挡水帘时完整覆盖正反面与四周侧面边缘(sides/edges)",
-        fail_criteria="任一部件（布水管 water distribution tube、白色外盖门板 white cover、挡水帘 water curtain、舱门内壁 interior of ice maker door、机身内腔）喷洒消毒液后静置未满5/10分钟即提前擦拭/刷洗/回装（红线，须按部件独立上报 B2），或擦拭白色外盖门板/挡水帘时未彻底擦拭四周侧面边缘（do not wipe the sides of white cover thoroughly）",
+        pass_criteria="Sanitizer contact duration for each of water distribution tube, white cover/door panel, water curtain, interior of door, and interior cavity meets the model threshold (Manitowoc >= 5 min / Langtuo >= 10 min), and wiping of white cover & water curtain thoroughly covers front, back, and all 4 lateral sides/edges",
+        fail_criteria="Any component (water distribution tube, white cover, water curtain, interior of ice maker door, interior cavity) is wiped/scrubbed/reinstalled before completing the 5/10-min sanitizer soak (RED_LINE, report B2 per component), or fails to thoroughly wipe the four lateral sides/edges of the white cover or water curtain (do not wipe the sides of white cover thoroughly)",
     ),
     SopRuleItem(
         rule_id="B3",
-        name="B3 · 化学品容器视觉鉴别（参数表 '0'Tolerance + 官方 SOP 喷壶规范）",
-        category="【B】制冰机周清洁（Week 2 主模块）",
+        name="B3 · Chemical Container Visual Verification ('0' Tolerance + Official SOP Spray Bottle Standard)",
+        category="[B] Ice Maker Weekly Deep Clean (Week 2 Core Module)",
         severity="RED_LINE",
         detection_type="presence",
         requires_full_context=False,
         check_instruction=(
-            "- ✅ **唯一允许的周清洁化学品（Sanitiser）视觉特征**：根据 Manitowoc 与 Langtuo 官方 SOP 图示，仅允许使用 **Ecolab KAY-5 Sanitizer** 配制的**无色透明溶液**，盛装在**白底透明/半透明喷壶（贴有粉红色/红色 Sanitizer 标签）**或**透明带刻度量桶（3L/8L）**中（月度除垢允许使用透明量桶配制的 Delimer）。\n"
-            "- 🔴 **严禁使用黄色瓶身多功能清洁剂（Multipurpose chemical in yellow bottle = 零容忍红线）**：\n"
-            "  - 门店的**鲜黄色瓶身喷壶（yellow bottle / yellow spray bottle）**或**黄色液体**为**多功能清洁剂（Multipurpose detergent / cleaner）**，严禁用于制冰机任何部件！\n"
-            "  - **【必报硬性规则】**：凡在画面中观察到员工手持**黄色喷壶/黄色瓶子（yellow bottle）**或非标化学品容器，向制冰机**白色外盖门板（white cover / door panel）、上方布水管（water distribution tube）、挡水帘（water curtain）或内腔**喷洒/涂抹并擦拭刷洗，**必须立即独立生成一条 `B3`（`CONFIRMED` 红线）违规记录**（明确写明：使用黄色瓶装多功能清洁剂 `multipurpose chemical` 清洁制冰机白色外盖/布水管等部件）！\n"
-            "  - **【严禁漏报】**：即使同一时间段已上报了 `B2`（静置时间不足）或 `A1`（触碰地面杂物未洗手），**也必须同时独立输出这条 `B3` 化学品违规记录，绝不可被 `B2`/`A1` 吞并！**\n"
-            "- 🔴 **禁止：混用多种化学品**（Mixed use of chemicals = 红线）\n"
-            "- 追踪画面中出现的**每一个化学瓶/喷壶**，逐一描述其瓶身颜色（白底透明 vs **黄色瓶身**）、液体颜色与标签；若颜色可疑或无法辨识则记 `SUSPECTED · 化学品身份不明`。"
+            "- ✅ **Only Permitted Weekly Cleaning Chemical (Sanitiser) Visual Signature**: Per Manitowoc and Langtuo official SOP diagrams, only a **colorless, clear solution** prepared from **Ecolab KAY-5 Sanitizer** is permitted, held in a **white-bodied clear/translucent spray bottle (with pink/red Sanitizer label)** or **clear graduated measuring bucket (3L/8L)** (monthly descaling permits Delimer in a clear bucket).\n"
+            "- 🔴 **Strictly Prohibit Multipurpose Cleaner in Yellow Bottle (`Multipurpose chemical in yellow bottle` = Zero-Tolerance RED_LINE)**:\n"
+            "  - A **bright yellow spray bottle (`yellow bottle / yellow spray bottle`)** or **yellow liquid** in the store is **multipurpose detergent / cleaner (`Multipurpose solution`)** and is strictly prohibited on any ice maker component!\n"
+            "  - **[Mandatory Hard Rule]**: Whenever staff are observed holding a **yellow spray bottle / yellow bottle** or non-standard chemical container to spray/apply and wipe/scrub the ice maker **white cover / door panel, upper water distribution tube, water curtain, or interior cavity**, **immediately emit an independent `B3` (`CONFIRMED` RED_LINE) finding** (explicitly stating: used multipurpose chemical in yellow bottle to clean ice maker white cover / distribution tube / components)!\n"
+            "  - **[Never Omit]**: Even if `B2` (insufficient soak time) or `A1` (touching floor items without handwashing) is already reported in the same timeframe, **you must also independently output this `B3` chemical violation — never let `B2`/`A1` swallow it!**\n"
+            "- 🔴 **Prohibited: Mixed use of multiple chemicals** (`Mixed use of chemicals` = RED_LINE)\n"
+            "- Track **every chemical bottle / spray bottle** appearing in frame, describing its bottle color (white/clear vs. **yellow bottle**), liquid color, and label; if suspicious or unreadable, report `SUSPECTED · Unidentified chemical container`."
         ),
-        pass_criteria="全程仅使用白底透明瓶身（粉红标签）盛装的无色 Ecolab KAY-5 Sanitiser 消毒液（及月度除垢剂 Delimer），绝未使用黄色瓶身多功能清洁剂",
-        fail_criteria="使用黄色瓶身多功能清洁剂（multipurpose chemical in yellow bottle）清洁制冰机白色外盖(white cover)、布水管(water distribution tube)或内腔（红线，必须独立上报 B3）、混用多种化学品、或化学品身份不明（SUSPECTED）",
+        pass_criteria="Uses only colorless Ecolab KAY-5 Sanitiser in a white/translucent spray bottle (pink label) or clear graduated bucket throughout (plus Delimer for monthly descaling); never uses a yellow-bottle multipurpose cleaner",
+        fail_criteria="Uses multipurpose chemical in a yellow bottle to clean the ice maker white cover, water distribution tube, or interior (RED_LINE, must report B3 independently), mixes multiple chemicals, or uses an unidentified chemical container (SUSPECTED)",
     ),
     SopRuleItem(
         rule_id="B4",
-        name="B4 · 三色毛巾、消毒桶取用起点溯源与四周边框擦拭（参数表 3.1 + 官方 SOP）",
-        category="【B】制冰机周清洁（Week 2 主模块）",
+        name="B4 · 3-Color Towel Segregation, Sanitizing Bucket Source Traceback & Perimeter Edge Wiping (Param 3.1 + Official SOP)",
+        category="[B] Ice Maker Weekly Deep Clean (Week 2 Core Module)",
         severity="RED_LINE",
         detection_type="presence",
         requires_full_context=False,
         check_instruction=(
-            "| 颜色 | 官方 SOP 指定用途 | 存放与取用要求 |\n"
+            "| Towel Color | Official SOP Designated Use | Storage & Retrieval Requirement |\n"
             "| :---: | :--- | :--- |\n"
-            "| 🔴 **红边毛巾 (Red-Edged Towel)** | **直接食品接触面**：制冰机内腔、蒸发器格栅、**上方布水管 (distribution tube)**、水槽 (water trough)、浮球开关、**挡水帘 (water curtain)**、**门面板白色内表面 (white interior surface of door panel)**、中间立柱内侧面 | **必须存放在盛有消毒液的专用贴标消毒桶（sanitizing bucket）内，使用时必须从消毒桶中随用随取干净红边毛巾**，**严禁直接从操作台面、机器顶部、梯子旁或围裙上拿取未浸泡于消毒桶的毛巾** |\n"
-            "| 🔵 **蓝边毛巾 (Blue-Edged Towel)** | **间接/非食品接触外表面**：制冰机不锈钢外壳、制冰机顶部平面、**门面板银色不锈钢外表面 (silver exterior surface of door panel)**、中间立柱外侧面及底边框 (bottom border)、空气滤网 | 从蓝色消毒桶取用，可放操作区台面 |\n"
-            "| 🟢 **绿边毛巾** | 户外与顾客区 | **严禁进入操作区台面**，须悬挂或独立容器存放 |\n\n"
-            "- 🔴 **【毛巾取用起点逆向溯源原则】**：凡观察到员工持毛巾擦拭制冰机内腔、布水管、舱门内壁、白色外盖门板（white cover）或挡水帘（water curtain），必须**向前逆推 5 秒核查该毛巾的取用起点**——合规操作必须是从**专用消毒桶（sanitizing bucket）**中取出的干净红边毛巾；若员工直接从操作台面、水槽边缘、制冰机顶部、梯子旁或身上随手拿起未从消毒桶取出的毛巾（或用错颜色毛巾）去擦拭制冰机，立即独立上报 `B4`（`CONFIRMED`）红线违规！\n"
-            "- 🔴 **【白色外盖门板与挡水帘「四周侧面边缘」擦拭核查】**：用红边毛巾或刷子清洁白色外盖门板（white cover / door panel）和挡水帘（water curtain）时，必须完整擦拭正反面及**四周边框、四个侧面厚度边缘（sides of white cover）与边角凹槽（corners and edges）**；若仅擦拭正面中间区域而漏擦四周侧面边缘，必须在报告中明确指出该违规！\n"
-            "- 容器须贴专用标签（贴在外盖上的定位标签视为无效标签）\n"
-            "- 用错颜色 / 未从消毒桶取用干净红边毛巾 / 漏擦可拆件四周侧面边缘 / 存放不当 → 违规"
+            "| 🔴 **Red-Edged Towel** | **Direct food-contact surfaces**: ice maker interior cavity, evaporator grid, **upper water distribution tube**, water trough, float switches, **water curtain**, **white interior surface of door panel**, middle pillar inner face | **Must be stored inside a dedicated labeled sanitizing bucket filled with sanitizer solution and taken fresh from the sanitizing bucket when needed**; **strictly prohibit picking up an unsoaked towel from the countertop, machine top, step stool, or apron** |\n"
+            "| 🔵 **Blue-Edged Towel** | **Indirect / non-food-contact exterior surfaces**: stainless-steel exterior body, ice maker top surface, **silver exterior surface of door panel**, middle pillar outer face & bottom border, air filter | Taken from blue sanitizing bucket; may rest on operating counter |\n"
+            "| 🟢 **Green-Edged Towel** | Outdoor & customer seating area | **Strictly prohibited on operating counters**; must be hung or kept in a separate container |\n\n"
+            "- 🔴 **[5-Second Reverse Traceback of Towel Retrieval Source]**: Whenever staff wipe the ice maker interior cavity, distribution tube, door liner, white cover, or water curtain with a towel, **trace back 5 seconds to verify where the towel was picked up** — compliant operation requires pulling a clean red-edged towel from the **dedicated sanitizing bucket**; if staff pick up a towel lying loose on the counter, sink rim, ice maker top, step stool, or on their person without taking it from a sanitizing bucket (or use the wrong towel color), immediately report an independent `B4` (`CONFIRMED`) RED_LINE violation!\n"
+            "- 🔴 **[White Cover & Water Curtain 'Four Lateral Sides & Edges' Wiping Check]**: When cleaning the `white cover / door panel` and `water curtain` with a red-edged towel or brush, staff must wipe both faces and **all four perimeter frames, lateral thickness edges (`sides of white cover`), and corners (`corners and edges`)**; if only the flat center is wiped while omitting the sides/edges, explicitly report this violation!\n"
+            "- Sanitizing buckets must carry dedicated labels (positioning tape on an outer lid is invalid)\n"
+            "- Wrong towel color / towel not taken from sanitizing bucket / omitting removable part sides & edges / improper storage → violation"
         ),
-        pass_criteria="擦拭制冰机内腔、布水管、挡水帘及门面板白色内表面时全程使用从专用贴标消毒桶（sanitizing bucket）中取出的干净红边毛巾并完整擦拭四周侧面边缘，蓝边毛巾擦门面板银色外表面与机身外壳，绿边绝不进操作区",
-        fail_criteria="未使用从专用消毒桶（sanitizing bucket）中取出的干净红边毛巾擦拭制冰机（not used a clean red edge towel from sanitising bucket）、擦拭白色外盖门板/挡水帘时漏擦四周侧面边缘（sides of white cover）、三色毛巾混用、红边毛巾直接放操作台面、绿边毛巾出现在操作区",
+        pass_criteria="Uses a clean red-edged towel taken directly from a dedicated labeled sanitizing bucket to wipe the ice maker interior, distribution tube, water curtain, and white inner door liner (including all 4 lateral sides/edges), uses blue-edged towel for silver exterior surfaces, and never brings green-edged towels into the operating zone",
+        fail_criteria="Does not use a clean red-edged towel taken from a dedicated sanitizing bucket (not used a clean red edge towel from sanitising bucket), omits wiping the four lateral sides/edges of the white cover or water curtain (sides of white cover), cross-uses 3-color towels, leaves red-edged towel loose on the counter, or brings green-edged towel into the operating area",
     ),
     SopRuleItem(
         rule_id="B5",
-        name="B5 · 冰铲与冰处理（参数表 4.1 / 4.5）",
-        category="【B】制冰机周清洁（Week 2 主模块）",
+        name="B5 · Ice Scoop & Ice Handling (Param 4.1 / 4.5)",
+        category="[B] Ice Maker Weekly Deep Clean (Week 2 Core Module)",
         severity="RED_LINE",
         detection_type="presence",
         requires_full_context=False,
         check_instruction=(
-            "- 🔴 **冰铲存放于冰仓内（stored in ice bins）= 红线**\n"
-            "- 冰铲使用前后都必须放回**专用收纳盒**，用后立即盖好盒盖\n"
-            "- 只能用冰铲取冰，**严禁徒手抓冰**\n"
-            "- 搬运冰块时必须盖上冰桶/制冰机盖\n"
-            "- 🔴 **多余的冰倒回制冰机或冰仓 = 违规**\n"
-            "- 冰仓、制冰机盖用后须及时盖回"
+            "- 🔴 **Ice scoop stored inside ice bin (`stored in ice bins`) = RED_LINE**\n"
+            "- Before and after use, the ice scoop must be returned to its **dedicated storage caddy** with the lid closed immediately\n"
+            "- Ice may only be dispensed using an ice scoop; **scooping ice bare-handed or with a cup is strictly prohibited**\n"
+            "- Ice buckets and ice maker lids must be covered when transporting ice\n"
+            "- 🔴 **Pouring excess ice back into the ice maker or ice bin = violation**\n"
+            "- Ice bin and ice maker lids must be closed promptly after use"
         ),
-        pass_criteria="仅用冰铲取冰，用后立即放回专用收纳盒并盖好盒盖，冰仓盖及时关闭",
-        fail_criteria="冰铲存放在冰仓内（红线）、徒手抓冰、多余冰块倒回制冰机/冰仓、冰仓盖未及时盖回",
+        pass_criteria="Dispenses ice only with an ice scoop, returns scoop immediately to its covered dedicated caddy after use, and closes ice bin lid promptly",
+        fail_criteria="Stores ice scoop inside the ice bin (RED_LINE), grabs ice by hand, pours excess ice back into the ice maker/ice bin, or leaves ice bin lid open",
     ),
-    # ───────────────────────── 【C】常态红线扫描（所有周次都跑） ─────────────────────────
+    # ───────────────────────── [C] Continuous Red-Line Scan (Active Every Week) ─────────────────────────
     SopRuleItem(
         rule_id="C1",
-        name="C1 · 交叉污染（'0' Tolerance）",
-        category="【C】常态红线扫描（所有周次都跑）",
+        name="C1 · Cross-Contamination ('0' Tolerance)",
+        category="[C] Continuous Red-Line Scan (Active Every Week)",
         severity="RED_LINE",
         detection_type="presence",
         requires_full_context=False,
         check_instruction=(
-            "- 工具/餐具掉地后未彻底清洗消毒即复用\n"
-            "- 员工**踩踏操作台面**后未消毒即恢复作业\n"
-            "- 🔴 **在食品水槽清洗拖把、刮水板、隔油池**\n"
-            "- 用食品包装材料盛装化学品\n"
-            "- 高危行为后未洗手（→ 见【A】）\n"
-            "- 多余食材倒回原包装\n"
-            "- 🔴 **手指碰触客用杯内壁**\n"
-            "- 🔴 **徒手抓取即食半成品**（冰块、切片水果）\n"
-            "- 掉在操作台上的即食食品未丢弃仍继续使用\n"
-            "- 掉地/掉污水区的食材包装未消毒即复用\n"
-            "- 自动化设备软管直接放入物料盒"
+            "- Reusing dropped tools or utensils from the floor without thorough washing and sanitizing\n"
+            "- Staff **stepping onto operating countertops** and resuming work without sanitizing the surface\n"
+            "- 🔴 **Washing a mop, floor squeegee, or grease trap in a food-prep sink**\n"
+            "- Using food packaging materials to hold chemicals\n"
+            "- Failing to wash hands after high-risk contamination actions (→ see [A])\n"
+            "- Pouring excess ingredients back into original packaging\n"
+            "- 🔴 **Fingers touching the interior wall of a customer beverage cup**\n"
+            "- 🔴 **Grabbing ready-to-eat ingredients bare-handed** (ice cubes, sliced fruit)\n"
+            "- Continuing to use ready-to-eat food dropped onto the operating counter instead of discarding\n"
+            "- Reusing ingredient packaging dropped on the floor or dirty sink area without sanitizing\n"
+            "- Placing automated dispenser hoses directly inside ingredient containers"
         ),
-        pass_criteria="无任何交叉污染行为，食品水槽专槽专用，手不触碰客用杯内壁，掉地器具彻底消毒",
-        fail_criteria="食品水槽洗拖把/刮水板/隔油池、手指碰触客用杯内壁、徒手抓冰块/水果、掉地器具未消毒复用",
+        pass_criteria="Zero cross-contamination actions; food sinks used strictly for food prep, fingers never touch inner walls of customer cups, dropped utensils thoroughly sanitized",
+        fail_criteria="Washes mop/squeegee/grease trap in food sink, touches inner wall of customer cup with fingers, grabs ice/fruit bare-handed, or reuses dropped utensils without sanitizing",
     ),
     SopRuleItem(
         rule_id="C2",
-        name="C2 · 杯具使用（'0' Tolerance）",
-        category="【C】常态红线扫描（所有周次都跑）",
+        name="C2 · Cup Usage Compliance ('0' Tolerance)",
+        category="[C] Continuous Red-Line Scan (Active Every Week)",
         severity="RED_LINE",
         detection_type="presence",
         requires_full_context=False,
         check_instruction=(
-            "- 🔴 重复使用饮品杯\n"
-            "- 🔴 顾客未取/取消的饮品未丢弃、杯子被复用\n"
-            "- 🔴 杯身贴多重标签（未撕旧标签就复用）\n"
-            "- 🔴 收银小票、笔、文具放入饮品杯或食品容器"
+            "- 🔴 Reusing disposable beverage cups\n"
+            "- 🔴 Failing to discard uncollected/cancelled customer drinks or reusing their cups\n"
+            "- 🔴 Applying multiple stacked order labels on a cup body (reusing a cup without removing old label)\n"
+            "- 🔴 Placing POS receipts, pens, or stationery inside beverage cups or food containers"
         ),
-        pass_criteria="饮品杯一次性使用、单张当次标签、无小票或笔放入杯具/食品容器",
-        fail_criteria="重复使用饮品杯、杯身贴多层标签、收银小票/笔/文具放入饮品杯或食品容器",
+        pass_criteria="Single-use beverage cups only, single current order label per cup, no receipts or pens placed inside cups or food containers",
+        fail_criteria="Reuses beverage cups, applies multiple labels on a cup, or places receipts/pens/stationery inside beverage cups or food containers",
     ),
     SopRuleItem(
         rule_id="C3",
-        name="C3 · 不当行为（'0' Tolerance）",
-        category="【C】常态红线扫描（所有周次都跑）",
+        name="C3 · Workplace Misconduct ('0' Tolerance)",
+        category="[C] Continuous Red-Line Scan (Active Every Week)",
         severity="RED_LINE",
         detection_type="presence",
         requires_full_context=False,
         check_instruction=(
-            "- 🔴 店内吸烟 / vape\n"
-            "- 🔴 **玩扑克牌**\n"
-            "- 🔴 营业时间内睡觉\n"
-            "- 🔴 在备餐时或顾客面前进食/饮水\n"
-            "- 🔴 **拍摄视频**（顾客面前拍摄或拍摄非工作内容）\n"
-            "- 🔴 对顾客表现敌意、讽刺、轻慢\n"
-            "- 🔴 **无视顾客在场或需求**"
+            "- 🔴 Smoking / vaping inside the store\n"
+            "- 🔴 **Playing cards**\n"
+            "- 🔴 Sleeping during operating hours\n"
+            "- 🔴 Eating or drinking during food preparation or in front of customers\n"
+            "- 🔴 **Recording videos** (filming in front of customers or filming non-work content)\n"
+            "- 🔴 Displaying hostility, sarcasm, or disrespect toward customers\n"
+            "- 🔴 **Ignoring customer presence or requests**"
         ),
-        pass_criteria="在岗期间无吸烟/vape、玩牌、睡觉、备餐区进食饮水、拍摄非工作视频或冷落顾客行为",
-        fail_criteria="店内吸烟/vape、玩牌、睡觉、备餐或顾客面前进食饮水、拍摄非工作视频、无视顾客",
+        pass_criteria="No smoking/vaping, card playing, sleeping, eating/drinking in prep zones, filming non-work videos, or ignoring customers while on duty",
+        fail_criteria="Smokes/vapes in store, plays cards, sleeps, eats/drinks during prep or in front of customers, films non-work videos, or ignores customers",
     ),
     SopRuleItem(
         rule_id="C4",
-        name="C4 · 仪容、围裙/私人物品存放与在岗行为（1.1–1.4）",
-        category="【C】常态红线扫描（所有周次都跑）",
+        name="C4 · Grooming, Apron/Personal Item Storage & On-Duty Conduct (1.1–1.4)",
+        category="[C] Continuous Red-Line Scan (Active Every Week)",
         severity="RED_LINE",
         detection_type="presence",
         requires_full_context=False,
         check_instruction=(
-            "- 配饰：耳环、手表、戒指、手链、项链、假指甲、耳钉、**装饰发夹** —— 一律禁止\n"
-            "- 着装：制服 + 发网 + 帽子 + 口罩 + 手套；制服围裙须洁净无污渍；制服上不得有线头、头发、有效期标签\n"
-            "- 发网外不得露出散发\n"
-            "- 不得穿亮色裤/短裤、露趾鞋\n"
-            "- 🔴 **在顾客面吧台或厨房使用手机处理非工作事务**\n"
-            "- 🔴 **等客时倚靠台面（Leaning on the counter）**\n"
-            "- 🟡 **【围裙与个人物品指定区域存放规范（Partner apron not kept at designated storage area）】**：\n"
-            "  - 员工在后厨或吧台**脱下工作围裙（apron）后，必须挂放在指定的围裙/员工物品存放区（designated storage area）**；**严禁将脱下的围裙随手放置在操作台面、设备台面、货架、矮凳/圆凳或角落里**！\n"
-            "  - **【禁止被「玩手机」吞并硬性规则】**：若同一名员工先后发生了「**脱下围裙未挂入指定存放区（随手放在台面/圆凳/角落）**」与「**坐下或站在后厨/吧台看手机**」两个违规行为，**必须拆分为两条独立的 `C4` 违规记录分别输出**——第 1 条专门报告「员工脱下围裙后未放回指定存放区（apron not kept at designated storage area）」，第 2 条专门报告「在工作区使用私人手机（`RED_LINE`）」，严禁把脱围裙乱放吞并进玩手机的单条记录里！\n"
-            "- 个人物品未放指定区域；个人食品饮料放在生产区"
+            "- Accessories: earrings, watches, rings, bracelets, necklaces, false fingernails, ear studs, **decorative hair clips** — strictly prohibited\n"
+            "- Attire: uniform + hairnet + hat + mask + gloves; uniform and apron must be clean and stain-free; no loose threads, hair, or expiry stickers on uniform\n"
+            "- No loose hair exposed outside the hairnet\n"
+            "- Brightly colored pants, shorts, and open-toed shoes are prohibited\n"
+            "- 🔴 **Using a personal mobile phone for non-work matters at the customer-facing bar or back kitchen**\n"
+            "- 🔴 **Leaning on the counter while waiting for customers (`Leaning on the counter`)**\n"
+            "- 🟡 **[Designated Storage Area for Aprons & Personal Items (`Partner apron not kept at designated storage area`)]**:\n"
+            "  - After **removing a work apron in the back kitchen or bar, staff must hang/store it in the designated apron/staff storage area (`designated storage area`)**; **never leave a removed apron loose on operating counters, equipment tops, shelves, low stools, or corners**!\n"
+            "  - **[Hard Rule Against Swallowing by 'Phone Use']**: If the same staff member both '**removes an apron and leaves it outside the designated storage area (on a counter/stool/corner)**' AND '**sits or stands using a mobile phone in the kitchen/bar**', **you must split them into two separate `C4` Finding rows** — Row 1 reporting `Partner apron not kept at designated storage area` (`NORMAL`) and Row 2 reporting personal mobile phone use in the work zone (`RED_LINE`). Never merge apron misplacement into a single phone-use record!\n"
+            "- Personal belongings not kept in designated storage; personal food or drinks placed in the production zone"
         ),
-        pass_criteria="无任何禁戴配饰，制服/发网/帽子/口罩/手套规范齐全，脱下的围裙与个人物品均存放在指定存放区（不乱丢在台面或凳子上），不在吧台或厨房玩手机，不倚靠台面",
-        fail_criteria="佩戴手表/戒指/耳钉/装饰发夹、未戴帽或口罩下滑露散发、脱下围裙未放在指定存放区（Partner apron not kept at designated storage area，须独立成行上报）、吧台或后厨使用私人手机（红线）、等客时倚靠台面（红线）、个人饮料放生产区",
+        pass_criteria="Zero prohibited accessories, complete uniform/hairnet/hat/mask/gloves, removed aprons and personal items stored in designated storage area (never left on counters or stools), no personal phone use at bar or kitchen, no leaning on counters",
+        fail_criteria="Wears watch/ring/studs/decorative hair clip, missing hat or pulled-down mask/exposed hair, removed apron not kept at designated storage area (Partner apron not kept at designated storage area — must report as separate row), uses personal mobile phone at bar or kitchen (RED_LINE), leans on counter (RED_LINE), or keeps personal drinks in production zone",
     ),
     SopRuleItem(
         rule_id="C5",
-        name="C5 · 垃圾与地面（4.3 / 4.4）",
-        category="【C】常态红线扫描（所有周次都跑）",
+        name="C5 · Trash & Floor Hygiene (4.3 / 4.4)",
+        category="[C] Continuous Red-Line Scan (Active Every Week)",
         severity="RED_LINE",
         detection_type="presence",
         requires_full_context=True,
         check_instruction=(
-            "- 垃圾桶盖用后未盖 / 桶盖缺失或损坏\n"
-            "- 🔴 **垃圾溢满超过 15 分钟**\n"
-            "- 未使用脚踏式垃圾桶 / 踏板失灵 / 未套垃圾袋\n"
-            "- 用水槽、纸箱、无标签食品容器当垃圾容器\n"
-            "- **临时垃圾袋未扎口**\n"
-            "- 备餐区 / 吧台地面积水或垃圾**超过 15 分钟**未清理"
+            "- Trash bin lid left open after use / lid missing or damaged\n"
+            "- 🔴 **Trash overflowing for more than 15 minutes**\n"
+            "- Non-foot-pedal trash bin used / broken pedal / bin not lined with a trash bag\n"
+            "- Using sinks, cardboard boxes, or unlabeled food containers as trash receptacles\n"
+            "- **Temporary trash bags left untied**\n"
+            "- Standing water or trash on prep / bar floor left uncleaned for **more than 15 minutes**"
         ),
-        pass_criteria="脚踏垃圾桶带盖闭合、套袋规范、临时垃圾袋扎口、无垃圾溢满或地面积水超时",
-        fail_criteria="垃圾桶未盖盖、垃圾溢满超15分钟（红线）、地面垃圾或积水超15分钟未清理、临时垃圾袋未扎口",
+        pass_criteria="Foot-pedal trash bins kept covered and properly lined, temporary trash bags tied closed, no trash overflow or floor standing water exceeding 15 minutes",
+        fail_criteria="Trash bin left uncovered, trash overflowing > 15 minutes (RED_LINE), floor trash or standing water uncleaned > 15 minutes, or temporary trash bag untied",
     ),
     SopRuleItem(
         rule_id="C6",
-        name="C6 · 设备与器具（6.x / 7.x / 8.x）",
-        category="【C】常态红线扫描（所有周次都跑）",
+        name="C6 · Equipment & Utensils (6.x / 7.x / 8.x)",
+        category="[C] Continuous Red-Line Scan (Active Every Week)",
         severity="NORMAL",
         detection_type="presence",
         requires_full_context=False,
         check_instruction=(
-            "- 自动泡茶机：茶桶底部有可见余水 / 茶网未沥干 / **热水口与卡扣冲泡前后未擦拭** / 冲泡流程不符 SOP"
-            "（出茶入冰、30 秒内搅拌单独按 C8 核查，不在 C6 重复报）\n"
-            "- 冷藏门：安装不规范（错轨、未随手关闭）、有缝隙漏冷\n"
-            "- 搅拌机存放时不得密封\n"
-            "- 蒸汽机：蒸汽棒**使用前后都要放气**；用后擦净无堵塞\n"
-            "- 混合机（Mixer）：搅拌杆**使用前后都要清洁**\n"
-            "- 茶具（茶桶、茶网、吧勺、滤器）冲泡前须洁净；茶桶与滤袋须**拆开分别清洗**\n"
-            "- 开封茶叶袋须挤出空气并密封\n"
-            "- 冷藏物料在常温放置**超过 15 分钟**\n"
-            "- 未使用电子秤称量食材\n"
-            "- 未做温度计晨间校准 / 手冲未测温 / 泡茶机温度水量未核对或造假"
+            "- Automated tea maker: visible residual water at bottom of tea barrel / tea net not drained / **hot water nozzle and latch not wiped before and after brewing** / brewing sequence violates SOP "
+            "(filtering tea into ice container and stirring within 30s are checked separately under C8; do not double-report under C6)\n"
+            "- Chiller doors: improper installation (off-track, not closed promptly), air gaps leaking cold air\n"
+            "- Blenders must not be stored sealed\n"
+            "- Steam machine: steam wand **must be purged before and after use** and wiped clean without blockage\n"
+            "- Mixer: mixing spindle **must be cleaned before and after use**\n"
+            "- Tea utensils (tea barrel, tea filter net, bar spoon, strainer) must be clean before brewing; tea barrel and filter bag must be **disassembled and washed separately**\n"
+            "- Opened tea leaf bags must have air squeezed out and be sealed tightly\n"
+            "- Chilled ingredients left at ambient temperature for **more than 15 minutes**\n"
+            "- Failing to weigh ingredients with a digital scale\n"
+            "- Omitting morning thermometer calibration / omitting manual brew temperature check / failing to verify or falsifying tea maker temperature and water volume"
         ),
-        pass_criteria="泡茶机/蒸汽机/混合机使用前后按SOP擦拭放气清洁，茶桶无余水，冷藏门随手关严，食材上电子秤称量",
-        fail_criteria="热水口与卡扣未擦拭、茶桶有余水、茶桶与滤袋未拆开洗、冷藏门未随手关闭、冷藏物料常温超15分钟、未用电子秤",
+        pass_criteria="Tea maker/steam wand/mixer wiped, purged, and cleaned before and after use per SOP, no residual water in tea barrel, chiller doors closed tightly, ingredients weighed on digital scale",
+        fail_criteria="Hot water nozzle/latch not wiped, residual water in tea barrel, barrel and filter bag not washed separately, chiller door left open, chilled ingredients at room temp > 15 min, or digital scale not used",
     ),
     SopRuleItem(
         rule_id="C7",
-        name="C7 · 顾客服务（9.x）",
-        category="【C】常态红线扫描（所有周次都跑）",
+        name="C7 · Customer Service Standards (9.x)",
+        category="[C] Continuous Red-Line Scan (Active Every Week)",
         severity="RED_LINE",
         detection_type="absence",
         requires_full_context=True,
         check_instruction=(
-            "- 🔴 顾客在区域内停留**超过 10 秒**未获主动招呼\n"
-            "- 付款后未**双手**递交小票/找零；未引导顾客至等候区或座位区\n"
-            "- 取餐时未核对小票或手机订单\n"
-            "- 出品未密封加盖、方向不正、未配齐吸管/纸巾/汤匙"
+            "- 🔴 Customer waiting in the counter area for **more than 10 seconds** without proactive greeting\n"
+            "- Failing to hand over receipt/change with **both hands** after payment; failing to guide customer to waiting or seating area\n"
+            "- Failing to verify receipt or mobile order at beverage pickup\n"
+            "- Beverage handed over unsealed/uncapped, improperly oriented, or missing straws/napkins/spoons"
         ),
-        pass_criteria="顾客到店10秒内主动招呼，双手递交小票/找零，取餐核对订单，出品密封端正配齐吸管纸巾",
-        fail_criteria="顾客停留超过10秒未获主动招呼（红线）、单手递交、取餐未核对订单、出品未密封或漏配吸管纸巾",
+        pass_criteria="Proactively greets arriving customers within 10s, hands over receipts/change with both hands, verifies order at pickup, and serves sealed beverages with complete straws/napkins",
+        fail_criteria="Customer waits > 10s without greeting (RED_LINE), one-handed handover, order not verified at pickup, or drink unsealed/missing straws or napkins",
     ),
     SopRuleItem(
         rule_id="C8",
-        name="C8 · 泡茶机出茶入冰与 30 秒内搅拌（6.2 Automated Tea Maker Machine）",
-        category="【C】常态红线扫描（所有周次都跑）",
+        name="C8 · Automated Tea Maker Filtering into Ice & 30s Stirring (6.2 Automated Tea Maker Machine)",
+        category="[C] Continuous Red-Line Scan (Active Every Week)",
         severity="NORMAL",
         detection_type="absence",
         requires_full_context=True,
         check_instruction=(
-            "客户 SOP 原文（6.2 Automated Tea Maker Machine · Filter Tea into an Ice-Prepared Container）：\n"
+            "Customer SOP verbatim text (`6.2 Automated Tea Maker Machine · Filter Tea into an Ice-Prepared Container`):\n"
             "- Pour the filtered tea into a container with ice, prepared 2-3 minutes beforehand "
             "(but not more than 3 minutes in advance).\n"
             "- Stir the tea within 30 seconds of pouring to ensure even cooling. "
             "(30s from the machine prompt: “Tea is ready” / dripping stage)\n"
             "\n"
-            "泡茶机每出一次茶都要单独核查、单独记录（同一段视频里出茶多次就逐次核查）：\n"
-            "1. **先放冰、后倒茶**：过滤好的茶汤必须倒进（或滴入）**事先已经装好冰**的容器；先倒茶、后补冰 → 违规。\n"
-            "2. **备冰 2–3 分钟**：从往该容器里加冰，到茶汤开始倒入（或开始滴入），间隔应为 2–3 分钟。"
-            "**超过 3 分钟**（冰放太久）→ 违规；不足 2 分钟也不符合 SOP 的 2–3 分钟要求，同样上报并写明实际间隔。"
-            "加冰发生在本段开始之前：接力摘要里有加冰时刻就接着算；没有 → 无法计时，"
-            "这一项记 `OUT_OF_SCOPE`（不进违规表），不要猜时间。\n"
-            "3. **30 秒内搅拌**：\n"
-            "   - 计时起点 = 泡茶机提示「Tea is ready」/ 进入滴滤（dripping）阶段的那一刻。视频没有声音，听不到提示音，"
-            "改用画面上**最早能看到**的信号：机器屏幕或指示灯显示完成、出茶口的茶汤从连续流出变成滴落、"
-            "或员工开始把茶汤倒进装冰容器。\n"
-            "   - 计时终点 = 员工第一次把长勺 / 搅拌棒 / 搅拌桨伸进容器里搅动茶汤。\n"
-            "   - 容器一直在画面里、起点后超过 30 秒还没开始搅拌 → `CONFIRMED`（临界值从严）；"
-            "30 秒内容器被端出画面或被挡住、看不到有没有搅拌 → `UNVERIFIED · 应做未见`。\n"
-            "   - 起点在本段开始之前：接力摘要里有起点（且写明还没搅拌）就接着计时；没有 → 看不到起点，"
-            "也看不到开头之前是否已经搅过，这一项记 `OUT_OF_SCOPE`（不进违规表），不要猜。\n"
-            "4. 证据里写清：起点时刻（OSD）和依据（看到的是哪个信号）、开始搅拌时刻（或「未见搅拌」）、实际间隔秒数、操作员工。\n"
-            "5. 本段结尾还没闭环的计时（已加冰还没倒茶、已出茶还没搅拌）写进接力摘要，注明 OSD 时刻和是哪个容器。"
+            "Verify and record every tea dispensing cycle independently (if multiple cycles occur in one clip, check each one):\n"
+            "1. **Ice First, Tea Second**: Filtered tea must be poured (or dripped) into a container **already pre-loaded with ice**; pouring hot tea first and adding ice afterward → violation.\n"
+            "2. **Ice Prepared 2–3 Minutes Beforehand**: The interval from adding ice into the container until filtered tea starts pouring/dripping into it should be 2–3 minutes. "
+            "**More than 3 minutes** (ice sitting too long) → violation; less than 2 minutes also deviates from the 2–3 minute SOP window and must be reported with the actual interval. "
+            "If ice was added before this clip started: continue timing if the carryover summary provides the ice-prep timestamp; otherwise mark `OUT_OF_SCOPE` (do not guess).\n"
+            "3. **Stir Within 30 Seconds**:\n"
+            "   - Timer start = the moment the tea maker prompts 'Tea is ready' / enters the dripping stage. Since video has no audio, use the **earliest visible cue**: machine screen/indicator showing completion, tea stream at the spout transitioning from continuous flow to dripping, or staff beginning to pour filtered tea into the ice container.\n"
+            "   - Timer end = the moment staff first insert a long bar spoon / stirring rod / paddle into the container to stir the tea.\n"
+            "   - If the container remains visible and stirring has not started > 30 seconds after the start cue → `CONFIRMED` (strict boundary rounding); "
+            "if the container is carried out of frame or occluded within 30 seconds so stirring cannot be verified → `UNVERIFIED · Required action not observed`.\n"
+            "   - If the start cue occurred before this clip: continue timing from the carryover summary if present and unstirred; otherwise mark `OUT_OF_SCOPE`.\n"
+            "4. In `evidence`, clearly state: start cue timestamp (OSD) and visual signal observed, stirring start timestamp (or 'not observed'), actual elapsed seconds, and staff ID.\n"
+            "5. Record any unclosed timers at the end of the clip (ice added awaiting tea, or tea ready awaiting stir) in `carryover_state_summary` with OSD timestamp and container description."
         ),
         pass_criteria=(
-            "过滤茶汤倒进提前 2–3 分钟（不超过 3 分钟）装好冰的容器；"
-            "从泡茶机提示「Tea is ready」/ 滴滤阶段起 30 秒内开始搅拌"
+            "Filtered tea is poured into a container pre-loaded with ice 2–3 minutes beforehand (<= 3 minutes), "
+            "and stirred within 30 seconds from the tea maker 'Tea is ready' / dripping stage"
         ),
         fail_criteria=(
-            "先倒茶后加冰；备冰到倒茶超过 3 分钟或不足 2 分钟；"
-            "泡茶机提示「Tea is ready」/ 滴滤阶段起超过 30 秒才搅拌或未见搅拌"
+            "Pours tea before adding ice; ice prepared > 3 minutes or < 2 minutes before pouring tea; "
+            "or stirs > 30 seconds after 'Tea is ready' / dripping stage (or stirring not observed)"
         ),
     ),
-    # ───────────────────────── 【D】运营与人效（Week 3 主模块） ─────────────────────────
+    # ───────────────────────── [D] Operations & Labor Productivity (Week 3 Core Module) ─────────────────────────
     SopRuleItem(
         rule_id="D1",
-        name="D1 · 有效出杯计数",
-        category="【D】运营与人效（Week 3 主模块）",
+        name="D1 · Valid Cup Output Counting",
+        category="[D] Operations & Labor Productivity (Week 3 Core Module)",
         severity="NORMAL",
         detection_type="presence",
         requires_full_context=True,
         check_instruction=(
-            "一杯有效产出必须在画面中完整跨越四工位：\n"
-            "`Station 1 贴标 + AI 机扫码` → `Station 2 加冰 + 摇混机混制` → "
-            "`Station 3 倒入客用杯（热饮含加热步骤）` → `Station 4 封口 + 出餐`\n"
-            "- 只完成部分工位 → 单独记「未闭环 N 杯」，不计入总数\n"
-            "- 单一注水或单一封口 **不计为一杯**"
+            "A valid completed cup output must traverse all four stations in frame:\n"
+            "`Station 1 Label application + AI scanner` → `Station 2 Ice dosing + shaker blending` → "
+            "`Station 3 Pouring into customer cup (including heating step for hot drinks)` → `Station 4 Cup sealing + handover at pick-up`\n"
+            "- Traversing only partial stations → record separately as 'Unclosed N cups' and exclude from total valid count\n"
+            "- Single water dispense or single cup sealing **does not count as a completed cup**"
         ),
-        pass_criteria="完整跨越 Station 1→2→3→4 四工位计为有效出杯",
-        fail_criteria="未跨越完整四工位（记入未闭环杯数，不计入有效出杯总数）",
+        pass_criteria="Beverage traverses all four stations (Station 1->2->3->4) to count as a valid completed cup",
+        fail_criteria="Fails to traverse all four stations (recorded as unclosed cup count and excluded from total valid cups)",
     ),
     SopRuleItem(
         rule_id="D2",
-        name="D2 · IPLH 计算（Week 3 必交）",
-        category="【D】运营与人效（Week 3 主模块）",
+        name="D2 · IPLH Calculation (Week 3 Deliverable)",
+        category="[D] Operations & Labor Productivity (Week 3 Core Module)",
         severity="NORMAL",
         detection_type="presence",
         requires_full_context=True,
         check_instruction=(
             "```\n"
-            "IPLH (Items Per Labour Hour) = 有效出杯总数 ÷ 实际在岗人时\n"
-            "实际在岗人时 = Σ(每位员工在画面内的在岗时长，换算为小时)\n"
+            "IPLH (Items Per Labour Hour) = Total Valid Completed Cups ÷ Actual On-Duty Labour Hours\n"
+            "Actual On-Duty Labour Hours = Σ(Each staff member's visible on-duty duration in frame, converted to hours)\n"
             "```\n"
-            "输出：**总 IPLH** + **各员工个人小时出杯率**。样本不足 1 小时按线性折算并注明。"
+            "Output: **Total Store IPLH** + **Individual Per-Staff Hourly Cup Rate**. For samples < 1 hour, extrapolate linearly and state the note."
         ),
-        pass_criteria="准确输出总 IPLH 与各员工个人小时出杯率",
-        fail_criteria="未按公式折算实际在岗人时与有效出杯数",
+        pass_criteria="Accurately outputs total store IPLH and individual per-staff hourly cup rates",
+        fail_criteria="Fails to compute actual on-duty labor hours and valid cup output according to the IPLH formula",
     ),
     SopRuleItem(
         rule_id="D3",
-        name="D3 · 人力投放",
-        category="【D】运营与人效（Week 3 主模块）",
+        name="D3 · Labor Deployment & Staffing Alignment",
+        category="[D] Operations & Labor Productivity (Week 3 Core Module)",
         severity="NORMAL",
         detection_type="presence",
         requires_full_context=True,
         check_instruction=(
-            "1. 判定时段（开店 / 高峰 13:00–13:30 / 平峰 / 闭店）\n"
-            "2. 输出在岗人数随时间的变化\n"
-            "3. 判断异常：高峰期人手不足导致积压 / 平峰闭店期人力冗余闲置"
+            "1. Identify operating period (Opening / Peak 13:00–13:30 / Off-Peak / Closing)\n"
+            "2. Output active headcount changes over time\n"
+            "3. Identify anomalies: understaffing during peak hours causing order backlog / overstaffed idle labor during off-peak or closing periods"
         ),
-        pass_criteria="人力排班与时段客流匹配",
-        fail_criteria="高峰期人手不足导致订单积压，或平峰/闭店期人力冗余闲置",
+        pass_criteria="Staffing deployment matches customer flow across operating periods",
+        fail_criteria="Understaffing during peak hours causes order backlog, or excess idle staffing during off-peak/closing hours",
     ),
     SopRuleItem(
         rule_id="D4",
-        name="D4 · 出品规范抽查（参数表 8.4，至少 3 杯）",
-        category="【D】运营与人效（Week 3 主模块）",
+        name="D4 · Beverage Preparation Quality Spot-Check (Param 8.4, Minimum 3 Cups)",
+        category="[D] Operations & Labor Productivity (Week 3 Core Module)",
         severity="NORMAL",
         detection_type="presence",
         requires_full_context=True,
         check_instruction=(
-            "- 是否按配方 SOP 制作\n"
-            "- 量杯与雪克杯使用是否规范\n"
-            "- **加冰与配料顺序是否正确**\n"
-            "- 是否完全倒净（刮除多余泡沫后，雪克杯内液体与果肉须全部倒入成品杯）"
+            "- Whether beverages are prepared strictly following recipe SOP\n"
+            "- Proper use of measuring cups (jiggers) and shaker cups\n"
+            "- **Whether ice-adding and ingredient-dosing sequence is correct**\n"
+            "- Whether contents are poured out completely (after skimming excess foam, all liquid and fruit pulp in the shaker cup must be poured into the serving cup)"
         ),
-        pass_criteria="抽查≥3杯均按配方SOP制作、量杯雪克杯规范、加冰配料顺序正确、刮泡并完全倒净",
-        fail_criteria="加冰与配料顺序错误、未使用量杯、未刮除多余泡沫或雪克杯内液体果肉未完全倒净",
+        pass_criteria="Spot-checks >= 3 cups: all follow recipe SOP, proper measuring/shaker cup use, correct ice and ingredient sequence, excess foam skimmed and contents completely poured out",
+        fail_criteria="Incorrect ice and ingredient sequence, measuring cup omitted, excess foam not skimmed, or liquid/pulp not completely poured out from shaker cup",
     ),
 ]
 
@@ -855,140 +906,143 @@ def load_rules_from_yaml(yaml_path: Optional[Path] = None) -> tuple[List[VisualS
     return scan_targets, list(DEFAULT_CHAGEE_V25_RULES)
 
 
-DEFAULT_LAYER1_TEMPLATE: str = """# 角色
-你是 CHAGEE 门店 CCTV 云端质检员（Cloud Auditor），依据《APAC Cloud Audit Parameters 2026 v1.0》与各设备 SOP 执行合规稽核。
-（当前生效规则库版本：`{prompt_version}`）
+DEFAULT_LAYER1_TEMPLATE: str = """# Role
+You are the CHAGEE Store CCTV Cloud Auditor, executing SOP compliance audits in accordance with the *APAC Cloud Audit Parameters 2026 v1.0* and equipment SOPs.
+(Active SOP Rule Library Version: `{prompt_version}`)
 
-# 核心判定原则（优先级最高）
+# Core Adjudication Principles (Highest Priority)
 
-## 原则一：宁可误报，绝不漏报
-本次稽核结果会 100% 经过人工复核。因此：
-- **你的首要目标是「不遗漏任何可能的违规」，而不是「保证每条上报都正确」。**
-- 遇到模棱两可的情况 → **一律上报**并标注处置标签，由人工判定。
-- **严禁**因为「不太确定」「可能是正常操作」而选择不报。
+## Principle 1: Prefer False Positives Over False Negatives
+Every finding from this audit undergoes 100% human supervisor review. Therefore:
+- **Your primary objective is 'zero missed potential violations', not 'guaranteeing every reported item is 100% certain'.**
+- Whenever an observation is ambiguous or borderline → **always report it** with the appropriate disposition label for human verification.
+- **Never** omit a report simply because you are 'not completely sure' or 'it might be normal operation'.
 
-## 原则二：举证责任反转
-SOP 要求必须发生的动作（如洗手、静置、擦拭、断电），如果你**没有在画面中明确看到它发生**：
-- 不得默认「应该做了吧」；
-- 一律记为 `UNVERIFIED · 应做未见`，进入违规表。
+## Principle 2: Burden-of-Proof Reversal
+For any mandatory SOP action (such as handwashing, sanitizer soaking, surface wiping, or power-off disconnection), if you **do not clearly observe it happening in the video**:
+- Never assume 'they probably did it off-camera';
+- Always record it as `UNVERIFIED · Required action not observed` and include it in the `findings` array.
 
-## 原则三：四级处置标签
-每条记录必须标注其一：
-| 标签 | 含义 | 是否进违规表 |
+## Principle 3: Four-Tier Disposition Labels
+Every evaluated rule record must carry one of the following labels:
+| Label | Meaning | Include in Findings? |
 | :--- | :--- | :---: |
-| `CONFIRMED` | 违规动作完整可见，证据充分 | ✅ 是 |
-| `SUSPECTED` | 行为高度吻合但有遮挡/模糊，无法 100% 确认 | ✅ 是 |
-| `UNVERIFIED` | SOP 要求的合规动作未观察到（可能做了但没拍到，也可能真没做） | ✅ 是 |
-| `OUT_OF_SCOPE` | 相关人员/设备完全不在本段画面内，无从判断 | ❌ 否，另列说明 |
+| `CONFIRMED` | Violation action is clearly visible with complete visual evidence | ✅ Yes |
+| `SUSPECTED` | Behavior closely matches a violation but has partial occlusion/blur preventing 100% certainty | ✅ Yes |
+| `UNVERIFIED` | Mandatory SOP action was not observed (may have occurred out of frame or was omitted) | ✅ Yes |
+| `OUT_OF_SCOPE` | Relevant staff/equipment is completely outside this camera view or time window | ❌ No (note separately) |
 
-## 原则四：临界值从严
-所有时长判定，在无法精确读数时，**按不利于门店的方向取整**：
-- 搓手 19–21 秒不确定 → 判「不足 20 秒」
-- 静置 9–11 分钟不确定 → 判「不足 10 分钟」
-- 顾客等待 9–11 秒不确定 → 判「超过 10 秒」
-- 垃圾溢满 14–16 分钟不确定 → 判「超过 15 分钟」
+## Principle 4: Strict Boundary Rounding
+For all duration thresholds, whenever exact reading is uncertain, **round in the direction stricter toward store compliance**:
+- Hand scrubbing 19–21 seconds uncertain → judge as 'under 20 seconds'
+- Sanitizer soaking 9–11 minutes uncertain → judge as 'under 10 minutes'
+- Customer waiting 9–11 seconds uncertain → judge as 'over 10 seconds'
+- Trash overflow 14–16 minutes uncertain → judge as 'over 15 minutes'
 
-## 原则五：输出规范
-- 语言：**简体中文**（SOP 专有名词保留英文原词）
-- 时间戳：`HH:MM:SS`
-- **禁止编造**：没发生的事不能写；但「没看到」必须写。
-- **播放器相对进度时间 (`timestamp_in_clip`) 与监控画面 OSD 时钟 (`on_screen_clock`) 严格分离防切片漂移**：`timestamp_in_clip` 必须填写当前视频切片播放器的实际经过秒数 (`MM:SS`，以本切片第 0 秒为 `00:00`)，并锚定在违规动作触发起始时刻（系统将自动按 `[T-2s, T+18s]` 截取 20 秒完整闭环证据视频），严禁直接用画面 OSD 时钟心算减法替代播放器进度时间！
+## Principle 5: Output Specification
+- Language: **English**
+- Timestamps: `HH:MM:SS`
+- **No fabrication**: Never invent actions that did not occur; however, 'not observed' must be explicitly stated.
+- **Strict Separation Between Player Relative Timestamp (`timestamp_in_clip`) and CCTV On-Screen Clock (`on_screen_clock`) to Prevent Slice Drift**: `timestamp_in_clip` must be the elapsed player time within the current video slice (`MM:SS`, where the start of this slice is `00:00`), anchored at the onset of the violation action (the system automatically cuts a 20-second `[T-2s, T+18s]` evidence clip around it). Never substitute mental subtraction of the OSD wall clock for `timestamp_in_clip`!
 
-## 原则六：一行为一记录与复合违规正交拆解（严禁高显著性事件吞并伴随违规）
-1. **同一因果链的多前置触发动作全量枚举（防高显著性动作掩蔽瞬时微动作）**：当某条「前置触发 → 缺失必做动作 → 后续操作」类型的 SOP 规则在同一监视时间窗内先后发生多个前置触发动作时，必须在 `evidence` 中**按时间顺序把观察到的全部前置触发动作及各自时间戳逐一列明**，严禁只写持续时间最长、视觉最显眼的单一动作而漏写前后 1–2 秒内的瞬时微动作。
-2. **同人并发/连续多项独立违规的逐条拆行（一行为一记录）**：当同一人员在同一时段先后或同时做出两个不同性质的违规动作，或先后多次重复触犯同一条计次规则时，**每一次独立违规行为必须单独生成一条 `Finding` 记录分别输出**，严禁合并成单条记录导致伴随违规被吞没。
-3. **同一作业过程的多维度正交核查**：当一段连续作业过程同时涉及 `# 步骤 3：SOP 检查清单` 中的多个不同条款维度（如操作时序、时间阈值、工具/耗材合规性、空间表面覆盖完整性、必做工序缺失等）时，必须**按各条款编号逐维度正交核对并分别独立生成 `Finding`**，严禁因已上报某一维度的违规就省略同一时间段内另一维度的违规。
-
----
-
-# 步骤 0：时间轴校准
-1. 在视频前 5 秒找一帧画面角落（**通常位于左上角**，部分机位在右上角或底部）OSD 水印时间戳最清晰的画面，逐字读出 `DD-MM-YYYY HH:MM:SS`（或 `YYYY-MM-DD HH:MM:SS`）。
-2. 点阵字体易混位（1/4、1/7、3/8、5/6、0/8、6/8）必须二次确认后写出。
-3. 以该锚点 + 相对播放时长推算全片时间，**禁止分钟级以上非线性跳变**。
-4. 无时间戳时用 `T+00:00:00` 相对计时并注明。
-5. 判定本段所属时段：`开店 / 营业中 / 高峰(约13:00–13:30) / 平峰 / 闭店`，以及区域：`前吧台(Front Bar/POS/Pick-Up)` 或 `后厨(Back Kitchen)`。
-6. **跨切片/跨视频状态接力校准**：若收到【前序分段未闭环状态接力摘要】，必须先核对本段首帧 OSD 时间及机位场景是否与前序摘要紧邻连续（同一机位且时间间隔 ≤5 分钟）；若连续则无缝接续跨段计时（如消毒液 5 分钟/10 分钟静置或 5 分钟洗手监视窗），若 OSD 时间发生跨时段跳变或机位不同，则忽略前序残留状态，防止跨时段误判。
-
-# 步骤 1：人员建档与多人独立追踪（必须穷尽，防显著性掩蔽）
-为画面中**每一位**人员分配稳定 ID，基于不随时间变化的特征：
-`员工A-男-短发-戴帽-出杯位`
-- **必须主动扫描画面边缘、背景纵深、镜面反射、门口进出**，不得只盯主操作区。
-- 若某人只出现几秒也必须建档，标注 `短暂出现`。
-- **状态持续原则**：手套/围裙/帽子一旦确认穿戴，在未看到明确「脱除动作」前，默认仍在穿戴。
-- **多人同屏注意力解耦（Anti-Attention-Masking）**：当画面中同时存在 ≥2 名人员时，**严禁被单一高显著性动作（如某人的大幅度肢体动作、长时间停留或正在发生的明显违规）吸走全部注意力**。必须按空间工位（前吧台、水槽区、设备区、通道区）拆分，为每位在场人员（`员工A`、`员工B`、`员工C`…）维护**彼此独立的动作时间线**，逐人独立核查其手部接触与操作流程闭环。
-- 建档完成后自查一次：`我是否遗漏了任何在画面中出现过的人？`
+## Principle 6: One-Action-One-Record & Orthogonal Decomposition of Compound Violations (Never Let High-Salience Events Swallow Companion Violations)
+1. **Exhaustive Enumeration of Preceding Trigger Actions in the Same Causal Chain (Preventing High-Salience Actions from Masking Micro-Actions)**: When a 'Preceding Trigger → Missing Mandatory Action → Subsequent Operation' SOP rule fires within a monitoring window where multiple preceding triggers occurred, list **every observed preceding trigger action and its timestamp in chronological order** in `evidence`; never report only the longest or most visually salient action while omitting 1–2 second micro-actions before or after it.
+2. **Row-by-Row Splitting of Concurrent or Sequential Independent Violations by the Same Person (One-Action-One-Record)**: When the same staff member commits two distinct types of violations concurrently or sequentially, or repeatedly violates a per-occurrence rule multiple times, **each independent violation must be emitted as its own separate `Finding` row** — never merge them into a single record.
+3. **Multi-Dimensional Orthogonal Verification of a Continuous Task**: When a continuous operation spans multiple dimensions in `# Step 3: SOP Checklist` (such as step sequence, duration threshold, tool/consumable compliance, full spatial surface/edge coverage, and mandatory closing steps), **verify each dimension orthogonally by its `rule_id` and emit separate `Finding` rows**. Never omit one dimension because another was already reported in the same timeframe.
 
 ---
 
-# 步骤 2：视觉判定规则（高召回版）
+# Step 0: Timeline Calibration
+1. Within the first 5 seconds of the video, locate a frame where the corner OSD watermark timestamp (**usually top-left**, or top-right/bottom on some cameras) is clearest, and read out `DD-MM-YYYY HH:MM:SS` (or `YYYY-MM-DD HH:MM:SS`) character by character.
+2. Double-check easily confused dot-matrix digits (`1/4`, `1/7`, `3/8`, `5/6`, `0/8`, `6/8`) before writing.
+3. Derive timestamps across the clip from this anchor + elapsed player time; **nonlinear jumps of a minute or more are prohibited**.
+4. When no OSD watermark exists, use relative timing `T+00:00:00` and state this explicitly.
+5. Identify the operating period: `Opening / Operating / Peak (~13:00–13:30) / Off-Peak / Closing`, and zone: `Front Bar (POS/Pick-Up)` or `Back Kitchen`.
+6. **Cross-Slice / Cross-Video State Carryover Calibration**: When a `[Prior Segment Unclosed State Carryover Summary]` is provided, first verify whether the first-frame OSD clock and camera scene are continuous with the prior summary (same camera angle and time gap <= 5 minutes); if continuous, seamlessly resume cross-slice timers (such as 5-min / 10-min soaking timers or 5-min handwashing monitoring windows); if the OSD clock jumps across periods or the camera angle differs, ignore prior carryover state to prevent false positives.
 
-## 2.1 接触判定
-- **明确接触**（手指抓握/按压/承重形变）→ `CONFIRMED`
-- **疑似接触**（手与物体像素重叠，但无法确认是否触碰）→ **`SUSPECTED`，仍需上报**
-- **明确未接触**（隔空倾倒，可清楚看到手与物体有间隙）→ 不报，但在轨迹中记录该动作
+# Step 1: Personnel Cataloging & Independent Multi-Person Tracking (Exhaustive, Anti-Attention-Masking)
+Assign a stable ID to **every** person appearing in the frame based on time-invariant traits:
+`Staff_A-Male-ShortHair-Capped-CupStation`
+- **Actively scan frame edges, background depth, mirror reflections, and doorway entries** — do not fixate only on the main prep zone.
+- Even if someone appears for only a few seconds, catalog them and tag `Brief appearance`.
+- **PPE State Persistence Principle**: Once gloves/apron/hat are confirmed worn, assume they remain worn until a clear removal action is observed.
+- **Multi-Person Attention Decoupling (Anti-Attention-Masking)**: Whenever >= 2 people are on screen simultaneously, **never let a single high-salience action (such as large body movements, prolonged stationary posture, or an obvious violation) capture all your attention**. Partition by spatial station (front bar, sink zone, equipment zone, aisle) and maintain **independent action timelines** for each person present (`Staff_A`, `Staff_B`, `Staff_C`…), verifying each person's hand contacts and procedural closures independently.
+- After cataloging, ask yourself: `Did I miss anyone who appeared in the frame?`
 
-> 注意：与旧版不同，**疑似接触不再豁免**，一律上报交人工。
+## Pre-Verdict Visual Grounding Scan Targets
+{visual_scan_targets}
 
-## 2.2 状态变化溯源
-发现某物状态已变（抽屉开了、面板拆了、垃圾袋换了）却没看到过程：
-1. 向前回溯查找致因动作；
-2. 找到 → 归因到具体人员，`CONFIRMED`；
-3. 找不到 → 记 `UNVERIFIED`，列出该时段在场的所有人员 ID 作为候选，**不得跳过不报**。
+---
 
-## 2.3 姿态与遮挡
-- 能看到独立关节结构 → 正常判定
-- 逆光/低分辨率/主体与背景融合 → **不下定论但必须上报为 `SUSPECTED`**，描述你看到的像素级现象
+# Step 2: Visual Adjudication Rules (High-Recall Edition)
 
-## 2.4 手到口部动作（吸烟/进食/vape）
-| 场景 | 处置 |
+## 2.1 Contact Determination
+- **Definite Contact** (finger grasping / pressing / load-bearing deformation) → `CONFIRMED`
+- **Suspected Contact** (hand and object pixels overlap, but physical touch cannot be 100% confirmed) → **`SUSPECTED`, must still be reported**
+- **Definite Non-Contact** (air-gap pouring with visible clearance between hand and object) → Do not report as a violation, but log the action in the trajectory
+
+> Note: Unlike legacy rules, **suspected contact is never exempted** — always report for human review.
+
+## 2.2 State-Change Traceback
+When an object's state has changed (drawer opened, panel removed, trash bag replaced) without initially noticing the transition:
+1. Trace backward to find the causal action;
+2. If found → attribute to the specific staff member, `CONFIRMED`;
+3. If not found → record `UNVERIFIED`, listing all staff IDs present during that window as candidates; **never skip reporting**.
+
+## 2.3 Posture & Occlusion
+- Independent joint structure visible → standard adjudication
+- Backlighting / low resolution / subject blending into background → **do not make a hard claim, but must report as `SUSPECTED`**, describing the pixel-level visual observation
+
+## 2.4 Hand-to-Mouth Actions (Smoking / Eating / Vaping)
+| Scenario | Disposition |
 | :--- | :--- |
-| 明确看到烟/电子烟/食物 | `CONFIRMED` 红线 |
-| 闲置区（后门、走廊、仓库口）重复手→口往返 | `SUSPECTED` 红线，**必须上报** |
-| 生产区手→口往返但被遮挡 | `SUSPECTED`，**必须上报** |
+| Cigarette / vape / food clearly visible | `CONFIRMED` RED_LINE |
+| Repeated hand-to-mouth motion in idle zones (back door, corridor, storeroom entrance) | `SUSPECTED` RED_LINE, **must report** |
+| Hand-to-mouth motion in production zone with partial occlusion | `SUSPECTED`, **must report** |
 
 ---
 
-# 步骤 3：SOP 检查清单
+# Step 3: SOP Checklist
 
-{step3_checklist_md}
-
----
-
-# 步骤 4：漏检自查（强制执行，不可跳过）
-
-主报告完成后，重新回扫全片一遍，专门查找第一遍容易忽略的内容，并输出自查结论：
-
-1. **边缘人员与远景目标**：画面边角、背景纵深、设备顶部/高处、进出门口是否有未建档人员或被忽略的远景操作？
-2. **瞬时微动作与工序首尾节点回扫**：
-   - 画面中是否有 1–2 秒内完成的瞬时手部接触、物品/护具随手放置等微动作被略过或被长耗时主事件吞并？
-   - 对每一项多步骤标准工序，逐次回看其**起始前 3 秒（首步先后顺序是否正确）**、**中间核心动作净时长（扣除准备与收尾动作后是否达标）**以及**结束尾 5 秒（收尾动作是否完整执行）**。若同一人员先后多次执行同一工序且均不达标，是否已拆分为多条独立记录？
-3. **遮挡时段**：是否有员工被设备/立柱遮挡超过 10 秒？该时段标记为盲区并上报。
-4. **多人并发与同秒掩蔽回扫（关键）**：凡是在某个时间段 `[T1, T2]` 检出了某名人员的违规事件，必须强制回到同一时间段 `[T1, T2]`，**故意移开视线忽略该名已报错人员，专门逐一检查画面内其他所有在场人员在同一时间段内的手部动作与操作步骤**，严禁因紧盯一人而漏掉同秒另一人的违规！
-5. **单事件吸干与多维正交漏报回扫（关键）**：逐一审视已检出的每条违规记录，对照 `# 步骤 3：SOP 检查清单` 核查：① 同一人员在该时间窗前后是否还伴随发生了其他独立规则的违规？② 同一连续作业过程（如设备拆洗消毒）是否同时触犯了清单中的多个正交维度（如各独立部件的时间阈值、容器/耗材颜色与取用来源、部件正反面与四周侧沿的空间覆盖完整性、必做收尾工序等）？凡触犯多个条款维度的，必须按各自 `rule_id` 分别独立输出 `Finding`，严禁一条记录吸干！
-6. **设备与容器状态**：受控设备门盖、容器盖、防护设施在全片是否始终处于 SOP 要求的应有状态？
-7. **时间跳跃**：时间轴是否有非线性跳变？若有，说明对应片段。
-
-对自查中发现的任何新线索，追加到违规表中。
+{step3_checklist_md}{dynamic_sop_Evaluation_matrix}
 
 ---
 
-# 输出结构与生成顺序（严格遵循 JSON 字段顺序，先记人、再记事、后自查、最后定性）
+# Step 4: Missed-Detection Self-Audit (Mandatory, Cannot Skip)
 
-你必须严格按照以下 JSON 字段的先后顺序生成内容，**严禁跳过前置轨迹记录与自查步骤直接跳写违规表**：
+After completing the primary scan, re-scan the entire clip once to specifically catch items easily missed on the first pass, and output your self-audit findings:
 
-1. **`calibrated_wall_clock_start`（步骤 0 校准信息）**：写出首帧锚定帧的 OSD 绝对时间（`DD-MM-YYYY HH:MM:SS`）、易混数字复核结果、时段与区域判定。
-2. **`people`（步骤 1 人员档案）**：穷尽列出本段内出现过的每一位人员 ID、体貌/穿戴特征及首次—最后出现时间（含短暂路过人员）。
-3. **`person_trajectories`（逐人独立事件轨迹：事件驱动 + 合并心跳）**：
-   - **必须与 `people` 列表一一对应（每人独立一条轨迹字符串）**，严禁把所有人的动作混成一条时间线导致次要工位人员被遗漏！
-   - 每位人员的轨迹按时间顺序记录：`员工ID [所在工位]: HH:MM:SS (播放器 MM:SS) 具体动作、手部接触物体表面与工具状态 -> ...`。
-   - 凡触发高危污染接触、多步骤连续工序（含起始前 3 秒、持续净时长、结束尾 5 秒）或容器/工具药剂调配施用，必须在对应人员轨迹中完整记下起止时间戳与耗时。
-   - 对于连续几分钟无异常的常规合规操作时段，可合并输出心跳（例如 `10:00:00-10:05:00 [HEARTBEAT] 正常在岗`），不必机械化强制每 60 秒写一条以节约输出长度。
-4. **`self_check_notes`（步骤 4 漏检自查结论）**：
-   - 在输出最终违规表之前，必须对照上方每位人员的 `person_trajectories` 逐条回答 `# 步骤 4：漏检自查` 的核对问题（在此记录中请统一用中文「违规表」，严禁书写英文键名）。
-   - 重点核查：当某名人员在 `[T1, T2]` 发生显眼事件时，其他在场人员在同一时段 `[T1, T2]` 的轨迹中是否存在未洗手接触、工序时长不足、少做收尾步骤或工具混用等漏检线索。
-5. **违规汇总数组（主扫描 + 漏检自查全量合集）**：
-   - 将主扫描与 `self_check_notes` 自查中发现的全部 `CONFIRMED`、`SUSPECTED`、`UNVERIFIED` 记录逐条输出为独立的违规记录对象。
-6. **`carryover_state_summary`（跨段状态接力摘要）**：记录本段结尾 OSD 时间及所有尚未闭环的跨段监视窗、静置计时起点与工具药剂属性。
+1. **Edge Personnel & Far-Field Targets**: Are there uncataloged personnel or overlooked far-field actions at frame corners, background depth, elevated equipment tops, or doorways?
+2. **Transient Micro-Actions & Procedure Start/End Node Rescan**:
+   - Were any 1–2 second transient hand contacts or casual placement of items/PPE skipped or swallowed by a long-duration main event?
+   - For every multi-step standard procedure, re-verify its **first 3 seconds (was the initial step sequence correct?)**, **net active duration of the core middle step (excluding prep and closing steps, did it meet the threshold?)**, and **last 5 seconds (was the mandatory closing action fully executed?)**. If the same staff member performed the procedure multiple times and failed each time, were they split into separate Finding rows?
+3. **Occlusion Intervals**: Was any staff member occluded by equipment or pillars for more than 10 seconds? Flag that interval as a blind spot and report it.
+4. **Concurrent Multi-Person & Same-Second Masking Rescan (Critical)**: Whenever a violation is detected for one staff member during `[T1, T2]`, you must return to `[T1, T2]`, **deliberately look away from that already-flagged person, and inspect every other person present in the frame during `[T1, T2]` for their hand contacts and procedural steps**, ensuring a second person's violation at the exact same second is never missed!
+5. **Single-Event Absorption & Multi-Dimensional Orthogonal Rescan (Critical)**: Review each detected violation against `# Step 3: SOP Checklist`: (1) Did the same person commit another independent rule violation shortly before or after? (2) Did the same continuous task (such as equipment disassembly, cleaning, and sanitizing) simultaneously violate multiple orthogonal dimensions in the checklist (per-component duration thresholds, container/consumable color and source, full spatial coverage of front/back and all four lateral sides/edges, mandatory closing steps)? Every violated dimension must be emitted as its own independent `Finding` by `rule_id`!
+6. **Equipment & Container States**: Were controlled equipment doors/lids, container covers, and protective barriers kept in their SOP-mandated states throughout the clip?
+7. **Timeline Jumps**: Were there any nonlinear jumps in the OSD timeline? If so, note the affected intervals.
+
+Append any new violations uncovered during the self-audit to the `findings` array.
+
+---
+
+# Output Structure & Generation Order (Strictly Follow JSON Field Order: Catalog People -> Log Trajectories -> Self-Audit -> Final Findings)
+
+You must generate content strictly in the following JSON field order, **never skipping trajectory logging or self-audit to jump straight to `findings`**:
+
+1. **`calibrated_wall_clock_start` (Step 0 Calibration Info)**: Write the first-frame anchor OSD wall-clock timestamp (`DD-MM-YYYY HH:MM:SS`), ambiguous digit verification notes, operating period, and zone classification.
+2. **`people` (Step 1 Personnel Roster)**: Exhaustively list every staff ID, appearance/PPE traits, and first-to-last seen timestamps (including brief passersby).
+3. **`person_trajectories` (Per-Person Independent Event Trajectories: Event-Driven + Merged Heartbeats)**:
+   - **Must correspond 1-to-1 with the `people` list (one independent trajectory string per person)**; never mix everyone's actions into a single timeline!
+   - Format each person's trajectory chronologically: `Staff_ID [Station]: HH:MM:SS (Player MM:SS) specific action, hand-contacted surface, and tool state -> ...`.
+   - Whenever a high-risk contamination contact, multi-step procedure (including first 3s, net duration, and last 5s), or container/tool chemical preparation & application occurs, record the exact start/end timestamps and duration in that person's trajectory.
+   - For routine anomaly-free spans lasting several minutes, merge into a heartbeat entry (e.g., `10:00:00-10:05:00 [HEARTBEAT] routine compliant work at station`).
+4. **`self_check_notes` (Step 4 Missed-Detection Self-Audit Notes)**:
+   - Before emitting the final `findings` array, answer each check in `# Step 4: Missed-Detection Self-Audit` against `person_trajectories`.
+   - Specifically verify whether other on-screen staff during `[T1, T2]` had unwashed hand contacts, insufficient step durations, missing closing steps, or improper tool usage while a salient event occurred.
+5. **`findings` (Combined Primary Scan + Self-Audit Violation Array)**:
+   - Output every `CONFIRMED`, `SUSPECTED`, and `UNVERIFIED` finding from both the primary scan and `self_check_notes` as an independent `Finding` object.
+6. **`carryover_state_summary` (Cross-Slice State Carryover Summary)**: Record the end-of-slice OSD clock timestamp and all unclosed cross-slice monitoring windows, soak timer start points, and tool/container chemical states.
 """
 
 SHEET_RULE_HEADER: List[str] = [
@@ -1025,14 +1079,26 @@ def rules_to_sheet_rows(rules: List[SopRuleItem]) -> List[List[str]]:
 
 
 def parse_rules_from_sheet_rows(rows: List[List[str]]) -> List[SopRuleItem]:
-    """Parses 9-column Google Sheet rows (`A1:I100`, skipping header row) into `SopRuleItem` list."""
-    if len(rows) <= 1:
+    """Parses 9-column Google Sheet rows (`A1:I100`, skipping header row) into `SopRuleItem` list.
+    Accepts both English headers (`rule_id`, `Rule_ID`, ...) and legacy Chinese headers (`规则编号`, ...).
+    """
+    if not rows:
+        return []
+    first_cell = str(rows[0][0]).strip().lower() if rows[0] else ""
+    start_idx = (
+        1
+        if first_cell in {"rule_id", "规则编号", "规则id", "id"}
+        or len(rows) > 1
+        and first_cell.startswith("rule")
+        else 1
+    )
+    if len(rows) <= start_idx:
         return []
     rules: List[SopRuleItem] = []
-    for row in rows[1:]:
-        if not row or not row[0].strip():
+    for row in rows[start_idx:]:
+        if not row or not str(row[0]).strip():
             continue
-        padded = row + [""] * max(0, 9 - len(row))
+        padded = [str(c) if c is not None else "" for c in row] + [""] * max(0, 9 - len(row))
         rules.append(
             SopRuleItem(
                 rule_id=padded[0].strip(),
@@ -1040,13 +1106,23 @@ def parse_rules_from_sheet_rows(rows: List[List[str]]) -> List[SopRuleItem]:
                 category=padded[2].strip() or "SOP",
                 severity=padded[3].strip() or "RED_LINE",
                 detection_type=padded[4].strip() or "presence",
-                requires_full_context=padded[5].strip().upper() in {"TRUE", "1", "YES"},
+                requires_full_context=padded[5].strip().upper() in {"TRUE", "1", "YES", "是"},
                 check_instruction=padded[6].strip(),
                 pass_criteria=padded[7].strip(),
                 fail_criteria=padded[8].strip(),
             )
         )
     return rules
+
+
+parse_sop_rules_from_rows = parse_rules_from_sheet_rows
+
+
+def _render_visual_scan_targets_md(
+    visual_scan_targets: Optional[List[VisualScanTarget]] = None,
+) -> str:
+    targets = visual_scan_targets if visual_scan_targets is not None else DEFAULT_VISUAL_SCAN_TARGETS
+    return "\n".join(f"- **{t.subject}**: {t.question}" for t in targets)
 
 
 def render_v25_system_instruction(
@@ -1056,41 +1132,56 @@ def render_v25_system_instruction(
     layer1_template: Optional[str] = None,
     is_spot_check: bool = False,
 ) -> str:
-    """Renders 100% verbatim the canonical `CHAGEE_CCTV_Cloud_Auditor_Prompt_v1.0` with dynamic Sheet rules."""
-    # Group rules by category (`【A】...`, `【B】...`, `【C】...`, `【D】...`) to preserve exact markdown hierarchy
+    """Renders the canonical `CHAGEE_CCTV_Cloud_Auditor_Prompt_v1.0` with dynamic Sheet rules."""
     grouped_blocks: List[str] = []
     current_category = None
     for r in rules:
         if r.category != current_category:
             current_category = r.category
             grouped_blocks.append(f"\n## {current_category}\n")
-            if "【C】" in current_category:
+            if "[C]" in current_category or "【C】" in current_category:
                 grouped_blocks.append(
-                    "> 以下每一项都必须在报告中显式给出「已核查·未发现」或具体违规，**不得省略**。\n"
+                    "> Every item below must be explicitly evaluated as compliant or reported as a specific violation; **never omit any item**.\n"
                 )
         grouped_blocks.append(f"### {r.name}\n{r.check_instruction}\n")
 
-    if is_spot_check or (prompt_version or "").strip() == TAB4_SPOT_CHECK_TITLE:
-        allowed_ids = "、".join(f"`{r.rule_id}`" for r in rules if r.rule_id) or "`无`"
-        grouped_blocks.insert(
-            0,
-            (
-                "> ⚠️ **【专项抽检 / 新 SOP 测试范围锁定（Scope Lock）】**\n"
-                f"> 本次运行在 `{TAB4_SPOT_CHECK_TITLE}` 专项测试模式下，**仅核查下方列出的 {len(rules)} 条指定规则（{allowed_ids}）**。\n"
-                "> - 请100%严格执行「步骤 0 时间轴校准」、「步骤 1 人员建档与多人独立追踪」、「步骤 2 视觉判定规则」与「步骤 4 漏检自查」，确保不漏检、不产生时间漂移；\n"
-                f"> - **严禁上报不在本次专项清单（{allowed_ids}）内的其他任何 SOP 条款**；输出 JSON 的 `findings` 数组中所有记录的 `rule_id` 必须严格属于 `{allowed_ids}`。\n"
-            ),
+    spot_check_scope_lock_md = ""
+    if is_spot_check or (prompt_version or "").strip() in TAB4_ALIASES:
+        allowed_ids = ", ".join(f"`{r.rule_id}`" for r in rules if r.rule_id) or "`NONE`"
+        spot_check_scope_lock_md = (
+            "> ⚠️ **[Targeted Spot-Check / New SOP Test Scope Lock]**\n"
+            f"> This run is executing in `{TAB4_SPOT_CHECK_TITLE}` targeted spot-check mode and **evaluates ONLY the {len(rules)} specified rule(s) listed below ({allowed_ids})**.\n"
+            "> - Strictly execute 'Step 0: Timeline Calibration', 'Step 1: Personnel Cataloging & Independent Multi-Person Tracking (Anti-Attention-Masking)', 'Step 2: Visual Adjudication Rules', and 'Step 4: Missed-Detection Self-Audit' to prevent missed detections or timestamp drift;\n"
+            f"> - **Strictly DO NOT report any other SOP rules outside this targeted list ({allowed_ids})**; every record in the output JSON `findings` array must have a `rule_id` belonging strictly to `{allowed_ids}`.\n"
         )
+        grouped_blocks.insert(0, spot_check_scope_lock_md)
 
     step3_checklist_md = "\n".join(grouped_blocks).strip()
+    visual_scan_md = _render_visual_scan_targets_md(visual_scan_targets)
     tpl = layer1_template if layer1_template is not None else DEFAULT_LAYER1_TEMPLATE
-    if "{prompt_version}" not in tpl or "{step3_checklist_md}" not in tpl:
+    has_step3_ph = "{step3_checklist_md}" in tpl
+    has_matrix_ph = "{dynamic_sop_Evaluation_matrix}" in tpl
+    if "{prompt_version}" not in tpl and not has_matrix_ph:
         raise ValueError(
-            "layer1_template must contain both {prompt_version} and {step3_checklist_md} placeholders"
+            "layer1_template must contain {prompt_version} placeholder"
         )
-    return tpl.replace("{prompt_version}", prompt_version).replace(
-        "{step3_checklist_md}", step3_checklist_md
-    )
+    if not has_step3_ph and not has_matrix_ph:
+        raise ValueError(
+            "layer1_template must contain {step3_checklist_md} or {dynamic_sop_Evaluation_matrix} placeholder"
+        )
+
+    rendered = tpl.replace("{prompt_version}", prompt_version).replace(
+        "{visual_scan_targets}", visual_scan_md
+    ).replace("{spot_check_scope_lock_md}", spot_check_scope_lock_md)
+    if has_step3_ph and has_matrix_ph:
+        rendered = rendered.replace("{step3_checklist_md}", step3_checklist_md).replace(
+            "{dynamic_sop_Evaluation_matrix}", ""
+        )
+    elif has_step3_ph:
+        rendered = rendered.replace("{step3_checklist_md}", step3_checklist_md)
+    else:
+        rendered = rendered.replace("{dynamic_sop_Evaluation_matrix}", step3_checklist_md)
+    return rendered
 
 
 _TRIGGER_TIME_RE = re.compile(r"^\s*([01]?\d|2[0-3]):([0-5]\d)\s*$")
@@ -1128,13 +1219,13 @@ def _is_legacy_tab2_header(header_row: List[str]) -> bool:
         return False
     col3 = str(header_row[3]).strip().lower() if len(header_row) > 3 else ""
     col5 = str(header_row[5]).strip().lower() if len(header_row) > 5 else ""
-    return col3 == "trigger_time" or col5 == "lookback_hours"
+    return col3 in ("trigger_time", "触发时间") or col5 in ("lookback_hours", "回溯小时数")
 
 
 def parse_scheduled_rules_with_diagnostics(
     rows: List[List[str]],
 ) -> tuple[List[ScheduledAuditRule], List[ScheduledRuleRowError]]:
-    """Parses `[Tab 2: 定时巡检配置表]` rows into `(valid_rules, row_errors)`.
+    """Parses `[Tab 2: Scheduled Jobs]` (`Tab2_Scheduled_Jobs` or legacy `Tab2_定时巡检配置表`) rows into `(valid_rules, row_errors)`.
 
     Supports both:
     - The simplified UTC schema (`Trigger_Hour_UTC`, `Trigger_Minute_UTC`, `Lookback_Days`,
@@ -1180,41 +1271,41 @@ def parse_scheduled_rules_with_diagnostics(
             )
 
         if not rule_id:
-            _fail("❌ 配置错误：Rule_ID（A列）不能为空")
+            _fail("❌ Config Error: Rule_ID (Column A) cannot be empty")
             continue
 
         if rule_id in seen_rule_ids:
             _fail(
-                f"❌ 配置错误：Rule_ID '{rule_id}' 与第 {seen_rule_ids[rule_id]} 行重复，每行 Rule_ID 必须唯一"
+                f"❌ Config Error: Rule_ID '{rule_id}' duplicates row {seen_rule_ids[rule_id]}; every Rule_ID must be unique"
             )
             continue
         seen_rule_ids[rule_id] = idx
 
         if "/file/d/" in root_url:
             _fail(
-                "❌ 配置错误：Root_Folder_URL（C列）不能填写单个视频文件链接（/file/d/），"
-                "请填写 Google Drive 文件夹链接（/folders/...）或 gs:// 路径"
+                "❌ Config Error: Root_Folder_URL (Column C) cannot be a single video file link (/file/d/); "
+                "please provide a Google Drive folder link (/folders/...) or gs:// prefix"
             )
             continue
 
         folder_id = _extract_scheduled_folder_id(root_url)
         if not folder_id:
             _fail(
-                f"❌ 配置错误：Root_Folder_URL（C列）'{root_url}' 不是合法的 Google Drive 文件夹链接或 gs:// 路径"
+                f"❌ Config Error: Root_Folder_URL (Column C) '{root_url}' is not a valid Google Drive folder link or gs:// prefix"
             )
             continue
 
         if is_legacy:
             t_match = _TRIGGER_TIME_RE.match(col_d or "02:00")
             if not t_match:
-                _fail(f"❌ 配置错误：Trigger_Time '{col_d}' 格式无效，请填写 HH:MM（00:00–23:59）")
+                _fail(f"❌ Config Error: Trigger_Time '{col_d}' is invalid; expected HH:MM (00:00–23:59)")
                 continue
             normalized_time = f"{int(t_match.group(1)):02d}:{int(t_match.group(2)):02d}"
             tz_clean = col_e or "Asia/Singapore"
             try:
                 ZoneInfo(tz_clean)
             except Exception:
-                _fail(f"❌ 配置错误：Timezone '{tz_clean}' 不是合法的 IANA 时区")
+                _fail(f"❌ Config Error: Timezone '{tz_clean}' is not a valid IANA timezone")
                 continue
             try:
                 lookback_hours = float(col_f or 24.0)
@@ -1222,7 +1313,7 @@ def parse_scheduled_rules_with_diagnostics(
                     raise ValueError("lookback_hours must be > 0")
                 lookback_hours = max(1.0, min(720.0, lookback_hours))
             except (TypeError, ValueError):
-                _fail(f"❌ 配置错误：Lookback_Hours '{col_f}' 不是有效的小时数")
+                _fail(f"❌ Config Error: Lookback_Hours '{col_f}' is not a valid number of hours")
                 continue
             lookback_days = round(lookback_hours / 24.0, 4)
         else:
@@ -1234,7 +1325,7 @@ def parse_scheduled_rules_with_diagnostics(
                     raise ValueError("hour out of range")
             except (TypeError, ValueError):
                 _fail(
-                    f"❌ 配置错误：Trigger_Hour_UTC（D列）'{col_d}' 无效，请从下拉框选择 00–23（UTC 小时）"
+                    f"❌ Config Error: Trigger_Hour_UTC (Column D) '{col_d}' is invalid; select 00–23 (UTC hour) from dropdown"
                 )
                 continue
             try:
@@ -1243,7 +1334,7 @@ def parse_scheduled_rules_with_diagnostics(
                     raise ValueError("minute not in {00, 15, 30, 45}")
             except (TypeError, ValueError):
                 _fail(
-                    f"❌ 配置错误：Trigger_Minute_UTC（E列）'{col_e}' 无效，仅支持从下拉框选择 00、15、30、45 四档分钟"
+                    f"❌ Config Error: Trigger_Minute_UTC (Column E) '{col_e}' is invalid; select 00, 15, 30, or 45 from dropdown"
                 )
                 continue
             normalized_time = f"{hh:02d}:{mm:02d}"
@@ -1256,20 +1347,20 @@ def parse_scheduled_rules_with_diagnostics(
                     raise ValueError("lookback_days not in allowed options")
             except (TypeError, ValueError):
                 _fail(
-                    f"❌ 配置错误：Lookback_Days（F列）'{col_f}' 无效，请从下拉框选择 0.5（12小时）或 1–7 天"
+                    f"❌ Config Error: Lookback_Days (Column F) '{col_f}' is invalid; select 0.5 (12h) or 1–7 days from dropdown"
                 )
                 continue
             lookback_days = lb_days
             lookback_hours = round(lb_days * 24.0, 2)
 
         if sup_email and not _EMAIL_RE.match(sup_email):
-            _fail(f"❌ 配置错误：Supervisor_Email（G列）'{sup_email}' 不是合法的邮箱地址")
+            _fail(f"❌ Config Error: Supervisor_Email (Column G) '{sup_email}' is not a valid email address")
             continue
 
         enabled_upper = enabled_raw.upper()
         if enabled_upper not in _TRUTHY_ENABLED_TOKENS and enabled_upper not in _FALSY_ENABLED_TOKENS:
             _fail(
-                f"❌ 配置错误：Enabled（H列）'{enabled_raw}' 无效，请从下拉框选择 ENABLED 或 PAUSED"
+                f"❌ Config Error: Enabled (Column H) '{enabled_raw}' is invalid; select ENABLED or PAUSED from dropdown"
             )
             continue
         enabled_flag = enabled_upper in _TRUTHY_ENABLED_TOKENS
@@ -1294,7 +1385,7 @@ def parse_scheduled_rules_with_diagnostics(
 
 
 def parse_scheduled_rules_from_rows(rows: List[List[str]]) -> List[ScheduledAuditRule]:
-    """Parses `[Tab 2: 定时巡检配置表]` rows into validated `ScheduledAuditRule` items."""
+    """Parses `[Tab 2: Scheduled Jobs]` rows into validated `ScheduledAuditRule` items."""
     valid_rules, _ = parse_scheduled_rules_with_diagnostics(rows)
     return valid_rules
 
@@ -1320,15 +1411,15 @@ def _extract_eval_golden_source_id(raw_url: str) -> str:
 
 
 def _is_legacy_tab3_header(header_row: Sequence[str]) -> bool:
-    """Returns True if `Tab3_黄金集评测工作台` row 1 is the legacy 9-column header (`Golden_Sheet_URL` in E1)."""
+    """Returns True if `Tab3_Golden_Eval` row 1 is the legacy 9-column header (`Golden_Sheet_URL` in E1)."""
     if not header_row:
         return False
     col_e = str(header_row[4]).strip() if len(header_row) > 4 else ""
-    return col_e == "Golden_Sheet_URL"
+    return col_e in ("Golden_Sheet_URL", "黄金集表格链接")
 
 
 def migrate_tab3_rows_to_3path_schema(rows: List[List[str]]) -> tuple[bool, List[List[str]]]:
-    """Converts legacy 9-column `Tab3_黄金集评测工作台` rows (`Golden_Sheet_URL`, `Results_Folder_URL`, ...)
+    """Converts legacy 9-column `Tab3_Golden_Eval` rows (`Golden_Sheet_URL`, `Results_Folder_URL`, ...)
     into the 10-column 3-path schema (`Golden_Videos_Folder_URL`, `Human_Labels_Sheet_URL`, `Results_Folder_URL`, ...).
 
     Returns `(changed, migrated_rows)`.
@@ -1363,7 +1454,7 @@ def migrate_tab3_rows_to_3path_schema(rows: List[List[str]]) -> tuple[bool, List
                 if eval_id == "EVAL-EXAMPLE-01"
                 else ""
             )
-            if eval_id == "EVAL-EXAMPLE-01" and "填入黄金集 Sheet 链接" in eval_name:
+            if eval_id == "EVAL-EXAMPLE-01" and ("填入黄金集 Sheet 链接" in eval_name or "Golden Dataset" in eval_name):
                 eval_name = DEFAULT_TAB3_SAMPLE_ROW[1]
             out_rows.append(
                 [
@@ -1393,7 +1484,7 @@ def parse_scheduled_eval_rules_with_diagnostics(
     *,
     available_prompt_tabs: Optional[Sequence[str]] = None,
 ) -> tuple[List[ScheduledEvalRule], List[ScheduledEvalRowError]]:
-    """Parses `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) rows into `(valid_rules, row_errors)`.
+    """Parses `[Tab 3: Golden Set Evaluation Workbench]` (`Tab3_Golden_Eval` or legacy `Tab3_黄金集评测工作台`) rows into `(valid_rules, row_errors)`.
 
     Supports both the canonical 10-column 3-path layout (`Golden_Videos_Folder_URL`, `Human_Labels_Sheet_URL`,
     `Results_Folder_URL`) and the legacy 9-column layout (`Golden_Sheet_URL`, `Results_Folder_URL`).
@@ -1459,53 +1550,54 @@ def parse_scheduled_eval_rules_with_diagnostics(
             )
 
         if not eval_id:
-            _fail("❌ 评测配置错误：Eval_ID（A列）不能为空")
+            _fail("❌ Config Error: Eval_ID (Column A) cannot be empty")
             continue
 
         if eval_id in seen_eval_ids:
             _fail(
-                f"❌ 评测配置错误：Eval_ID '{eval_id}' 与第 {seen_eval_ids[eval_id]} 行重复，每行 Eval_ID 必须唯一"
+                f"❌ Config Error: Eval_ID '{eval_id}' duplicates row {seen_eval_ids[eval_id]}; every Eval_ID must be unique"
             )
             continue
         seen_eval_ids[eval_id] = idx
 
-        trigger_col_label = "H列" if is_legacy else "I列"
+        trigger_col_label = "Column H" if is_legacy else "Column I"
         if norm_trigger not in VALID_EVAL_TRIGGER_ACTIONS:
             _fail(
-                f"❌ 评测配置错误：Trigger_Action（{trigger_col_label}）'{trigger_raw}' 无效，请从下拉框选择 IDLE 或 START_EVAL"
+                f"❌ Config Error: Trigger_Action ({trigger_col_label}) '{trigger_raw}' is invalid; select IDLE or START_EVAL from dropdown"
             )
             continue
 
         if not prompt_tab or not prompt_tab.startswith("Prompt_"):
             _fail(
-                f"❌ 评测配置错误：Prompt_Tab_Name（C列）'{prompt_tab}' 必须选择以 Prompt_ 开头的 SOP 规则分表名称"
+                f"❌ Config Error: Prompt_Tab_Name (Column C) '{prompt_tab}' must select a SOP rules tab starting with Prompt_"
             )
             continue
 
-        if prompt_tab_set and prompt_tab not in prompt_tab_set:
+        alias_tab = PROMPT_TAB_ALIASES.get(prompt_tab, "")
+        if prompt_tab_set and prompt_tab not in prompt_tab_set and alias_tab not in prompt_tab_set:
             _fail(
-                f"❌ 评测配置错误：Prompt_Tab_Name（C列）'{prompt_tab}' 在总控表中不存在，"
-                f"可选分表：{', '.join(sorted(prompt_tab_set))}"
+                f"❌ Config Error: Prompt_Tab_Name (Column C) '{prompt_tab}' does not exist in Master Sheet; "
+                f"available tabs: {', '.join(sorted(prompt_tab_set))}"
             )
             continue
 
         if not model_ver or model_ver.upper() == "AUTO_LATEST_FLASH":
             _fail(
-                f"❌ 评测配置错误：Model_Version（D列）'{model_ver}' 无效，请选择明确的 Gemini 模型版本（严禁 AUTO_LATEST_FLASH）"
+                f"❌ Config Error: Model_Version (Column D) '{model_ver}' is invalid; select an explicit Gemini model version (AUTO_LATEST_FLASH is prohibited)"
             )
             continue
 
-        labels_col_name = "Golden_Sheet_URL（E列）" if is_legacy else "Human_Labels_Sheet_URL（F列）"
+        labels_col_name = "Golden_Sheet_URL (Column E)" if is_legacy else "Human_Labels_Sheet_URL (Column F)"
         if "/folders/" in human_labels_url or "/file/d/" in human_labels_url:
             _fail(
-                f"❌ 评测配置错误：{labels_col_name}请填写人工标注 Google Sheet 链接（/spreadsheets/d/...）或 gs://.../*.jsonl 路径，不能填写文件夹或单个视频链接"
+                f"❌ Config Error: {labels_col_name} must be a human-labeled Google Sheet link (/spreadsheets/d/...) or gs://.../*.jsonl path, not a folder or video file link"
             )
             continue
 
         golden_source_id = _extract_eval_golden_source_id(human_labels_url)
         if not golden_source_id:
             _fail(
-                f"❌ 评测配置错误：{labels_col_name}'{human_labels_url}' 不是合法的 Google Sheet 链接或 gs:// 路径"
+                f"❌ Config Error: {labels_col_name} '{human_labels_url}' is not a valid Google Sheet link or gs:// path"
             )
             continue
 
@@ -1514,39 +1606,39 @@ def parse_scheduled_eval_rules_with_diagnostics(
             if golden_videos_url:
                 if "/file/d/" in golden_videos_url or "/spreadsheets/d/" in golden_videos_url:
                     _fail(
-                        "❌ 评测配置错误：Golden_Videos_Folder_URL（E列）请填写黄金集 CCTV 视频所在的 Google Drive 文件夹链接（/folders/...），不能填写表格或单个视频链接"
+                        "❌ Config Error: Golden_Videos_Folder_URL (Column E) must be a Google Drive folder link (/folders/...) containing golden CCTV videos, not a spreadsheet or single video link"
                     )
                     continue
                 golden_videos_folder_id = _extract_scheduled_folder_id(golden_videos_url)
                 if not golden_videos_folder_id or golden_videos_folder_id.startswith("gs://"):
                     _fail(
-                        f"❌ 评测配置错误：Golden_Videos_Folder_URL（E列）'{golden_videos_url}' 不是合法的 Google Drive 文件夹链接"
+                        f"❌ Config Error: Golden_Videos_Folder_URL (Column E) '{golden_videos_url}' is not a valid Google Drive folder link"
                     )
                     continue
             elif not golden_source_id.startswith("gs://"):
                 _fail(
-                    "❌ 评测配置错误：Golden_Videos_Folder_URL（E列）不能为空，请填写独立的黄金集 CCTV 视频 Google Drive 文件夹链接（/folders/...）"
+                    "❌ Config Error: Golden_Videos_Folder_URL (Column E) cannot be empty; please provide the dedicated Google Drive folder link (/folders/...) containing golden CCTV videos"
                 )
                 continue
 
-        results_col_name = "Results_Folder_URL（F列）" if is_legacy else "Results_Folder_URL（G列）"
+        results_col_name = "Results_Folder_URL (Column F)" if is_legacy else "Results_Folder_URL (Column G)"
         results_folder_id = ""
         if results_folder_url:
             if "/file/d/" in results_folder_url or "/spreadsheets/d/" in results_folder_url:
                 _fail(
-                    f"❌ 评测配置错误：{results_col_name}请填写用于存放测评报告的 Google Drive 文件夹链接（/folders/...），或留空使用默认评测目录"
+                    f"❌ Config Error: {results_col_name} must be a Google Drive folder link (/folders/...) for evaluation reports, or left empty to use the default directory"
                 )
                 continue
             results_folder_id = _extract_scheduled_folder_id(results_folder_url)
             if not results_folder_id or results_folder_id.startswith("gs://"):
                 _fail(
-                    f"❌ 评测配置错误：{results_col_name}'{results_folder_url}' 不是合法的 Google Drive 文件夹链接"
+                    f"❌ Config Error: {results_col_name} '{results_folder_url}' is not a valid Google Drive folder link"
                 )
                 continue
 
-        sup_col_name = "Supervisor_Email（G列）" if is_legacy else "Supervisor_Email（H列）"
+        sup_col_name = "Supervisor_Email (Column G)" if is_legacy else "Supervisor_Email (Column H)"
         if sup_email and not _EMAIL_RE.match(sup_email):
-            _fail(f"❌ 评测配置错误：{sup_col_name}'{sup_email}' 不是合法的邮箱地址")
+            _fail(f"❌ Config Error: {sup_col_name} '{sup_email}' is not a valid email address")
             continue
 
         parsed.append(
@@ -1576,7 +1668,7 @@ def parse_scheduled_eval_rules_from_rows(
     *,
     available_prompt_tabs: Optional[Sequence[str]] = None,
 ) -> List[ScheduledEvalRule]:
-    """Parses `[Tab 3: 黄金集评测工作台]` rows into validated `ScheduledEvalRule` items."""
+    """Parses `[Tab 3: Golden Set Evaluation Workbench]` rows into validated `ScheduledEvalRule` items."""
     valid_rules, _ = parse_scheduled_eval_rules_with_diagnostics(
         rows, available_prompt_tabs=available_prompt_tabs
     )
@@ -1702,7 +1794,7 @@ def build_master_sheet_validation_requests(
                 discovered_prompt_tabs.append(title)
 
     effective_prompt_versions = list(prompt_versions or discovered_prompt_tabs or [config.default_prompt_version])
-    # `model_versions` is normally `model_dropdown_options(tab0_rows)` (baseline + Tab0 候选列表);
+    # `model_versions` is normally `model_dropdown_options(tab0_rows)` (baseline + Tab0 candidate list);
     # the baseline alone is the fallback when the caller has no Tab0 rows.
     effective_models = list(dict.fromkeys(list(model_versions or default_model_dropdown_options())))
 
@@ -1720,7 +1812,7 @@ def build_master_sheet_validation_requests(
     requests: list[dict] = []
 
     # 1. Tab 0: Active_Prompt_Version (B2), Active_Model_Version (B3), Fallback_Model_Version (B4)
-    tab0_id = title_to_id.get(GoogleSheetsConfigClient.TAB0_TITLE)
+    tab0_id = next((title_to_id[t] for t in TAB0_ALIASES if t in title_to_id), None)
     if tab0_id is not None:
         if effective_prompt_versions:
             requests.append(
@@ -1735,7 +1827,7 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": _one_of_list_rule(
                             effective_prompt_versions,
-                            "请选择已存在的 Prompt_* 规则分表名称",
+                            "Select an existing Prompt_* rule tab name",
                         ),
                     }
                 }
@@ -1753,16 +1845,17 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": _one_of_list_rule(
                             effective_models,
-                            "请选择受控 Gemini Flash 模型版本（严禁填写 AUTO_LATEST_FLASH）",
+                            "Select a governed Gemini Flash model version (AUTO_LATEST_FLASH is prohibited)",
                         ),
                     }
                 }
             )
 
-    # 2. Prompt_* tabs + Tab4_专项测试表: severity (D), detection_type (E), requires_full_context (F)
+    # 2. Prompt_* tabs + Tab4_Spot_Check: severity (D), detection_type (E), requires_full_context (F)
     rule_table_tabs = list(discovered_prompt_tabs)
-    if TAB4_SPOT_CHECK_TITLE in title_to_id and TAB4_SPOT_CHECK_TITLE not in rule_table_tabs:
-        rule_table_tabs.append(TAB4_SPOT_CHECK_TITLE)
+    for t4 in TAB4_ALIASES:
+        if t4 in title_to_id and t4 not in rule_table_tabs:
+            rule_table_tabs.append(t4)
     for p_title in rule_table_tabs:
         p_sid = title_to_id[p_title]
         requests.extend(
@@ -1778,7 +1871,7 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": _one_of_list_rule(
                             ("RED_LINE", "NORMAL"),
-                            "请选择 RED_LINE（红线违规）或 NORMAL（一般偏差）",
+                            "Select RED_LINE (critical red-line violation) or NORMAL (standard deviation)",
                         ),
                     }
                 },
@@ -1793,7 +1886,7 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": _one_of_list_rule(
                             ("presence", "absence"),
-                            "请选择 presence（出现即触发）或 absence（缺失即触发）",
+                            "Select presence (triggered when present) or absence (triggered when absent)",
                         ),
                     }
                 },
@@ -1808,14 +1901,14 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": _one_of_list_rule(
                             ("TRUE", "FALSE"),
-                            "请选择 TRUE 或 FALSE",
+                            "Select TRUE or FALSE",
                         ),
                     }
                 },
             ]
         )
 
-    # 3. Tab 2 (`Tab2_定时巡检配置表`):
+    # 3. Tab 2 (`Tab2_Scheduled_Jobs`):
     #    - Col C (index 2): Root_Folder_URL custom formula validation (rejects /file/d/)
     #    - Col D..E (index 3..5): Plain text `@` format so "00"-"09" keep leading zeros
     #    - Col D (index 3): Trigger_Hour_UTC dropdown (00..23)
@@ -1823,7 +1916,7 @@ def build_master_sheet_validation_requests(
     #    - Col F (index 5): Lookback_Days dropdown (0.5, 1..7)
     #    - Col G (index 6): Supervisor_Email TEXT_IS_EMAIL
     #    - Col H (index 7): Enabled dropdown (ENABLED, PAUSED)
-    tab2_id = title_to_id.get(TAB2_SCHEDULED_TITLE)
+    tab2_id = next((title_to_id[t] for t in TAB2_ALIASES if t in title_to_id), None)
     if tab2_id is not None:
         requests.extend(
             [
@@ -1865,7 +1958,7 @@ def build_master_sheet_validation_requests(
                                     }
                                 ],
                             },
-                            "inputMessage": "请填写 Google Drive 根文件夹链接（含 /folders/...）或 gs:// 存储桶路径，严禁填写单个视频文件链接（/file/d/）",
+                            "inputMessage": "Enter a Google Drive root folder link (containing /folders/...) or gs:// bucket path; single video file links (/file/d/) are not allowed",
                             "strict": True,
                             "showCustomUi": False,
                         },
@@ -1882,7 +1975,7 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": _one_of_list_rule(
                             VALID_TRIGGER_HOURS_UTC,
-                            "请选择每日触发小时（UTC 时区，00–23）",
+                            "Select daily trigger hour (UTC, 00-23)",
                         ),
                     }
                 },
@@ -1897,7 +1990,7 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": _one_of_list_rule(
                             VALID_TRIGGER_MINUTES_UTC,
-                            "请选择触发分钟（UTC 时区，仅支持 00、15、30、45 四档）",
+                            "Select trigger minute (UTC, only 00, 15, 30, 45 supported)",
                         ),
                     }
                 },
@@ -1912,7 +2005,7 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": _one_of_list_rule(
                             VALID_LOOKBACK_DAYS_OPTIONS,
-                            "请选择回溯天数（0.5 天=12小时，或 1–7 天）",
+                            "Select lookback days (0.5 days = 12 hours, or 1-7 days)",
                         ),
                     }
                 },
@@ -1927,7 +2020,7 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": {
                             "condition": {"type": "TEXT_IS_EMAIL"},
-                            "inputMessage": "请填写合法的督导邮箱地址（如 user@domain.com）",
+                            "inputMessage": "Enter a valid supervisor email address (e.g. user@domain.com)",
                             "strict": True,
                             "showCustomUi": False,
                         },
@@ -1944,20 +2037,20 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": _one_of_list_rule(
                             VALID_ENABLED_DROPDOWN_OPTIONS,
-                            "请选择 ENABLED（启用）或 PAUSED（暂停）",
+                            "Select ENABLED or PAUSED",
                         ),
                     }
                 },
             ]
         )
 
-    # 4. Tab 3 (`Tab3_黄金集评测工作台`, 10 columns A:J):
+    # 4. Tab 3 (`Tab3_Golden_Eval`, 10 columns A:J):
     #    - Col C (index 2): Prompt_Tab_Name dropdown (all Prompt_* tabs)
     #    - Col D (index 3): Model_Version dropdown
     #    - Col E..G (index 4..7): Clear any stale validation on URL columns
     #    - Col H (index 7): Supervisor_Email TEXT_IS_EMAIL
     #    - Col I (index 8): Trigger_Action dropdown (IDLE, START_EVAL, RUNNING, DONE, FAILED)
-    tab3_id = title_to_id.get(TAB3_EVAL_TITLE)
+    tab3_id = next((title_to_id[t] for t in TAB3_ALIASES if t in title_to_id), None)
     if tab3_id is not None:
         requests.append(
             {
@@ -1985,7 +2078,7 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": _one_of_list_rule(
                             effective_prompt_versions,
-                            "请选择要评测的 Prompt_* 规则分表名称",
+                            "Select the Prompt_* rule tab name to evaluate",
                         ),
                     }
                 }
@@ -2003,7 +2096,7 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": _one_of_list_rule(
                             effective_models,
-                            "请选择要评测的受控 Gemini 模型版本（严禁填写 AUTO_LATEST_FLASH）",
+                            "Select the governed Gemini model version to evaluate (AUTO_LATEST_FLASH is prohibited)",
                         ),
                     }
                 }
@@ -2021,7 +2114,7 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": {
                             "condition": {"type": "TEXT_IS_EMAIL"},
-                            "inputMessage": "请填写合法的督导邮箱地址（如 user@domain.com）",
+                            "inputMessage": "Enter a valid supervisor email address (e.g. user@domain.com)",
                             "strict": True,
                             "showCustomUi": False,
                         },
@@ -2038,7 +2131,7 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": _one_of_list_rule(
                             VALID_EVAL_TRIGGER_ACTIONS,
-                            "选择 START_EVAL 将在下一次定时巡检（15分钟内）自动启动黄金集评测；评测启动后系统会自动改为 RUNNING -> DONE/FAILED",
+                            "Select START_EVAL to automatically start golden evaluation on the next scheduled tick (within 15 minutes); status transitions automatically to RUNNING -> DONE/FAILED",
                         ),
                     }
                 },
@@ -2064,7 +2157,7 @@ class GoogleSheetsConfigClient:
     binary, no stored token -- identical behaviour on Cloud Run, ReasoningEngine and a laptop.
     """
 
-    TAB0_TITLE = "Tab0_版本总控与回滚开关"
+    TAB0_TITLE = TAB0_TITLE
     TAB2_SCHEDULED_TITLE = TAB2_SCHEDULED_TITLE
     TAB3_EVAL_TITLE = TAB3_EVAL_TITLE
     TAB4_SPOT_CHECK_TITLE = TAB4_SPOT_CHECK_TITLE
@@ -2088,7 +2181,7 @@ class GoogleSheetsConfigClient:
         from .gcs_gateway import load_gcs_sop_tabs
 
         raw = await asyncio.to_thread(self._gcs().download_object_bytes, sheet_id)
-        tabs = load_gcs_sop_tabs(raw, sheet_id)
+        tabs = _populate_workbook_tab_aliases(load_gcs_sop_tabs(raw, sheet_id))
         _GCS_WORKBOOK_CACHE[sheet_id] = (time.monotonic(), tabs)
         return tabs
 
@@ -2108,15 +2201,36 @@ class GoogleSheetsConfigClient:
                 logger.debug("Hit local TTL cache for %s", cache_key)
                 return [row[:] for row in val]
 
+        candidate_ranges = [a1_range]
+        if "!" in a1_range:
+            raw_tab, cell_part = a1_range.split("!", 1)
+            stripped_tab = raw_tab.strip("'")
+            for alt_tab in _alias_candidates_for_tab(stripped_tab):
+                if alt_tab != stripped_tab:
+                    alt_a1 = f"'{alt_tab}'!{cell_part}" if raw_tab.startswith("'") else f"{alt_tab}!{cell_part}"
+                    if alt_a1 not in candidate_ranges:
+                        candidate_ranges.append(alt_a1)
+
         def _fetch_via_api() -> List[List[str]]:
-            resp = (
-                self._sheets_service()
-                .spreadsheets()
-                .values()
-                .get(spreadsheetId=sheet_id, range=a1_range)
-                .execute(num_retries=3)
-            )
-            return [[str(c) for c in r] for r in resp.get("values", [])]
+            svc = self._sheets_service()
+            last_exc: Optional[BaseException] = None
+            for idx, cand_range in enumerate(candidate_ranges):
+                try:
+                    resp = (
+                        svc.spreadsheets()
+                        .values()
+                        .get(spreadsheetId=sheet_id, range=cand_range)
+                        .execute(num_retries=3)
+                    )
+                    return [[str(c) for c in r] for r in resp.get("values", [])]
+                except Exception as exc:
+                    last_exc = exc
+                    if idx + 1 < len(candidate_ranges) and self._http_status_of(exc) == 400:
+                        continue
+                    raise
+            if last_exc is not None:
+                raise last_exc
+            return []
 
         rows = await asyncio.to_thread(_fetch_via_api)
         _SHEET_RANGE_CACHE[cache_key] = (time.monotonic(), rows)
@@ -2132,9 +2246,10 @@ class GoogleSheetsConfigClient:
         """
         if sheet_id.startswith("gs://"):
             tabs = await self._read_gcs_workbook_tabs(sheet_id)
-            if self.TAB0_TITLE not in tabs:
+            tab0_key = next((t for t in _alias_candidates_for_tab(self.TAB0_TITLE) if t in tabs), None)
+            if tab0_key is None:
                 raise ValueError(f"SOP workbook {sheet_id} has no tab {self.TAB0_TITLE!r}")
-            rows = tabs[self.TAB0_TITLE]
+            rows = tabs[tab0_key]
         else:
             rows = await self._read_range(sheet_id, f"{self.TAB0_TITLE}!A1:D15")
         pointers: dict[str, str] = {}
@@ -2145,7 +2260,12 @@ class GoogleSheetsConfigClient:
 
     async def read_prompt_tab_rules(self, sheet_id: str, tab_name: str) -> List[SopRuleItem]:
         if sheet_id.startswith("gs://"):
-            rows = (await self._read_gcs_workbook_tabs(sheet_id)).get(tab_name, [])
+            tabs = await self._read_gcs_workbook_tabs(sheet_id)
+            rows: list[list[str]] = []
+            for cand in _alias_candidates_for_tab(tab_name):
+                if cand in tabs:
+                    rows = tabs[cand]
+                    break
         else:
             rows = await self._read_range(sheet_id, f"{tab_name}!A1:I100")
         return parse_rules_from_sheet_rows(rows)
@@ -2154,24 +2274,33 @@ class GoogleSheetsConfigClient:
         """Appends newly discovered models to Tab 0's candidate row; never switches the active model."""
         if not new_models or sheet_id.startswith("gs://"):
             return  # a GCS workbook is customer-owned and read-only for the runtime
-        catalog_note = " | ".join(f"{m} (🆕 新模型可用待测试)" for m in new_models)
+        catalog_note = " | ".join(f"{m} (🆕 New model available for testing)" for m in new_models)
 
         def _append() -> None:
-            self._sheets_service().spreadsheets().values().append(
-                spreadsheetId=sheet_id,
-                range=f"'{self.TAB0_TITLE}'!A1",
-                valueInputOption="RAW",
-                insertDataOption="INSERT_ROWS",
-                body={
-                    "values": [
-                        [
-                            "Candidate_Models_Discovered",
-                            catalog_note,
-                            "仅追加至候选列表（未自动切换 Active_Model_Version）",
-                        ]
-                    ]
-                },
-            ).execute(num_retries=3)
+            svc = self._sheets_service()
+            candidates = _alias_candidates_for_tab(self.TAB0_TITLE)
+            for idx, tab0_name in enumerate(candidates):
+                try:
+                    svc.spreadsheets().values().append(
+                        spreadsheetId=sheet_id,
+                        range=f"'{tab0_name}'!A1",
+                        valueInputOption="RAW",
+                        insertDataOption="INSERT_ROWS",
+                        body={
+                            "values": [
+                                [
+                                    "Candidate_Models_Discovered",
+                                    catalog_note,
+                                    "Appended to candidate list only (Active_Model_Version not switched automatically)",
+                                ]
+                            ]
+                        },
+                    ).execute(num_retries=3)
+                    return
+                except Exception as exc:
+                    if idx + 1 < len(candidates) and self._http_status_of(exc) == 400:
+                        continue
+                    raise
 
         try:
             await asyncio.to_thread(_append)
@@ -2181,7 +2310,7 @@ class GoogleSheetsConfigClient:
     async def read_scheduled_rules_with_diagnostics(
         self, sheet_id: str
     ) -> tuple[List[ScheduledAuditRule], List[ScheduledRuleRowError]]:
-        """Reads `[Tab 2: 定时巡检配置表]` (`Tab2_定时巡检配置表`) rows and returns `(valid_rules, row_errors)`."""
+        """Reads `[Tab 2: Scheduled Inspection Jobs]` (`Tab2_Scheduled_Jobs`) rows and returns `(valid_rules, row_errors)`."""
         if not sheet_id:
             return [], []
         if sheet_id.startswith("gs://"):
@@ -2203,14 +2332,14 @@ class GoogleSheetsConfigClient:
             return [], []
 
     async def read_scheduled_rules(self, sheet_id: str) -> List[ScheduledAuditRule]:
-        """Reads `[Tab 2: 定时巡检配置表]` (`Tab2_定时巡检配置表`) rows; returns `[]` if the tab does not exist yet."""
+        """Reads `[Tab 2: Scheduled Inspection Jobs]` (`Tab2_Scheduled_Jobs`) rows; returns `[]` if the tab does not exist yet."""
         valid_rules, _ = await self.read_scheduled_rules_with_diagnostics(sheet_id)
         return valid_rules
 
     async def read_scheduled_eval_rules_with_diagnostics(
         self, sheet_id: str
     ) -> tuple[List[ScheduledEvalRule], List[ScheduledEvalRowError]]:
-        """Reads `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) rows and returns `(valid_rules, row_errors)`."""
+        """Reads `[Tab 3: Golden Set Evaluation Workbench]` (`Tab3_Golden_Eval`) rows and returns `(valid_rules, row_errors)`."""
         if not sheet_id:
             return [], []
         if sheet_id.startswith("gs://"):
@@ -2235,7 +2364,7 @@ class GoogleSheetsConfigClient:
             return [], []
 
     async def read_scheduled_eval_rules(self, sheet_id: str) -> List[ScheduledEvalRule]:
-        """Reads `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) rows; returns `[]` if the tab does not exist yet."""
+        """Reads `[Tab 3: Golden Set Evaluation Workbench]` (`Tab3_Golden_Eval`) rows; returns `[]` if the tab does not exist yet."""
         valid_rules, _ = await self.read_scheduled_eval_rules_with_diagnostics(sheet_id)
         return valid_rules
 
@@ -2247,7 +2376,7 @@ class GoogleSheetsConfigClient:
         trigger_action: Optional[str] = None,
         last_eval_report: Optional[str] = None,
     ) -> None:
-        """Writes `trigger_action` (Col I) and/or `last_eval_report` (Col J) back to `Tab3_黄金集评测工作台` at `row_index`."""
+        """Writes `trigger_action` (Col I) and/or `last_eval_report` (Col J) back to `Tab3_Golden_Eval` at `row_index`."""
         if not sheet_id or sheet_id.startswith("gs://") or row_index < 2:
             return
         if trigger_action is None and last_eval_report is None:
@@ -2255,27 +2384,35 @@ class GoogleSheetsConfigClient:
 
         def _update() -> None:
             svc = self._sheets_service().spreadsheets().values()
-            if trigger_action is not None and last_eval_report is not None:
-                svc.update(
-                    spreadsheetId=sheet_id,
-                    range=f"'{self.TAB3_EVAL_TITLE}'!I{row_index}:J{row_index}",
-                    valueInputOption="USER_ENTERED",
-                    body={"values": [[trigger_action, last_eval_report]]},
-                ).execute(num_retries=3)
-            elif trigger_action is not None:
-                svc.update(
-                    spreadsheetId=sheet_id,
-                    range=f"'{self.TAB3_EVAL_TITLE}'!I{row_index}",
-                    valueInputOption="USER_ENTERED",
-                    body={"values": [[trigger_action]]},
-                ).execute(num_retries=3)
-            else:
-                svc.update(
-                    spreadsheetId=sheet_id,
-                    range=f"'{self.TAB3_EVAL_TITLE}'!J{row_index}",
-                    valueInputOption="USER_ENTERED",
-                    body={"values": [[last_eval_report]]},
-                ).execute(num_retries=3)
+            candidates = _alias_candidates_for_tab(self.TAB3_EVAL_TITLE)
+            for idx, tab3_name in enumerate(candidates):
+                try:
+                    if trigger_action is not None and last_eval_report is not None:
+                        svc.update(
+                            spreadsheetId=sheet_id,
+                            range=f"'{tab3_name}'!I{row_index}:J{row_index}",
+                            valueInputOption="USER_ENTERED",
+                            body={"values": [[trigger_action, last_eval_report]]},
+                        ).execute(num_retries=3)
+                    elif trigger_action is not None:
+                        svc.update(
+                            spreadsheetId=sheet_id,
+                            range=f"'{tab3_name}'!I{row_index}",
+                            valueInputOption="USER_ENTERED",
+                            body={"values": [[trigger_action]]},
+                        ).execute(num_retries=3)
+                    else:
+                        svc.update(
+                            spreadsheetId=sheet_id,
+                            range=f"'{tab3_name}'!J{row_index}",
+                            valueInputOption="USER_ENTERED",
+                            body={"values": [[last_eval_report]]},
+                        ).execute(num_retries=3)
+                    return
+                except Exception as exc:
+                    if idx + 1 < len(candidates) and self._http_status_of(exc) == 400:
+                        continue
+                    raise
 
         try:
             await asyncio.to_thread(_update)
@@ -2307,34 +2444,40 @@ class GoogleSheetsConfigClient:
         untouched this tick, instead of shrinking the strict dropdowns to the baseline and
         flagging every Tab3 row that already names a Tab0 candidate.
         """
-        try:
-            resp = (
-                svc.spreadsheets()
-                .values()
-                .get(
-                    spreadsheetId=sheet_id,
-                    range=f"'{self.TAB0_TITLE}'!{TAB0_MODEL_CANDIDATES_RANGE}",
+        candidates = _alias_candidates_for_tab(self.TAB0_TITLE)
+        resp = None
+        for idx, tab0_name in enumerate(candidates):
+            try:
+                resp = (
+                    svc.spreadsheets()
+                    .values()
+                    .get(
+                        spreadsheetId=sheet_id,
+                        range=f"'{tab0_name}'!{TAB0_MODEL_CANDIDATES_RANGE}",
+                    )
+                    .execute(num_retries=3)
                 )
-                .execute(num_retries=3)
-            )
-        except Exception as exc:
-            if self._http_status_of(exc) == 400:
-                logger.warning(
-                    "Tab %r of %s is not readable (%s); model dropdowns keep the baseline list only",
-                    self.TAB0_TITLE,
-                    sheet_id,
-                    exc,
-                )
-                return tuple(default_model_dropdown_options())
-            raise
-        rows = [[str(c) for c in r] for r in (resp.get("values") or [])]
+                break
+            except Exception as exc:
+                if self._http_status_of(exc) == 400:
+                    if idx + 1 < len(candidates):
+                        continue
+                    logger.warning(
+                        "Tab %r of %s is not readable (%s); model dropdowns keep the baseline list only",
+                        self.TAB0_TITLE,
+                        sheet_id,
+                        exc,
+                    )
+                    return tuple(default_model_dropdown_options())
+                raise
+        rows = [[str(c) for c in r] for r in ((resp or {}).get("values") or [])]
         return tuple(model_dropdown_options(rows))
 
     async def ensure_master_sheet_validations(
         self, sheet_id: str, *, force: bool = False
     ) -> bool:
-        """Idempotently migrates legacy `Tab2_定时巡检配置表` rows to the UTC dropdown schema,
-        migrates or auto-creates `Tab3_黄金集评测工作台` (10-column 3-path schema), and applies native
+        """Idempotently migrates legacy `Tab2_Scheduled_Jobs` rows to the UTC dropdown schema,
+        migrates or auto-creates `Tab3_Golden_Eval` (10-column 3-path schema), and applies native
         Google Sheets `setDataValidation` rules across Tab 0, Prompt_*, Tab 2, and Tab 3.
 
         The model dropdowns (Tab0 B3:B4, Tab3 column D) list the baseline models plus every model
@@ -2355,11 +2498,12 @@ class GoogleSheetsConfigClient:
                 str((s.get("properties") or {}).get("title") or "")
                 for s in (meta.get("sheets") or [])
             }
-            if self.TAB2_SCHEDULED_TITLE in tab_titles:
+            tab2_existing = next((t for t in TAB2_ALIASES if t in tab_titles), None)
+            if tab2_existing is not None:
                 resp = (
                     svc.spreadsheets()
                     .values()
-                    .get(spreadsheetId=sheet_id, range=f"'{self.TAB2_SCHEDULED_TITLE}'!A1:I200")
+                    .get(spreadsheetId=sheet_id, range=f"'{tab2_existing}'!A1:I200")
                     .execute(num_retries=3)
                 )
                 raw_rows = [[str(c) for c in r] for r in resp.get("values", [])]
@@ -2367,17 +2511,18 @@ class GoogleSheetsConfigClient:
                 if changed and migrated_rows:
                     svc.spreadsheets().values().clear(
                         spreadsheetId=sheet_id,
-                        range=f"'{self.TAB2_SCHEDULED_TITLE}'!A1:I200",
+                        range=f"'{tab2_existing}'!A1:I200",
                         body={},
                     ).execute(num_retries=3)
                     svc.spreadsheets().values().update(
                         spreadsheetId=sheet_id,
-                        range=f"'{self.TAB2_SCHEDULED_TITLE}'!A1",
+                        range=f"'{tab2_existing}'!A1",
                         valueInputOption="RAW",
                         body={"values": migrated_rows},
                     ).execute(num_retries=3)
 
-            if self.TAB3_EVAL_TITLE not in tab_titles:
+            tab3_existing = next((t for t in TAB3_ALIASES if t in tab_titles), None)
+            if tab3_existing is None:
                 svc.spreadsheets().batchUpdate(
                     spreadsheetId=sheet_id,
                     body={
@@ -2409,7 +2554,7 @@ class GoogleSheetsConfigClient:
                 resp_t3 = (
                     svc.spreadsheets()
                     .values()
-                    .get(spreadsheetId=sheet_id, range=f"'{self.TAB3_EVAL_TITLE}'!A1:J200")
+                    .get(spreadsheetId=sheet_id, range=f"'{tab3_existing}'!A1:J200")
                     .execute(num_retries=3)
                 )
                 raw_t3 = [[str(c) for c in r] for r in resp_t3.get("values", [])]
@@ -2417,17 +2562,18 @@ class GoogleSheetsConfigClient:
                 if changed_t3 and migrated_t3:
                     svc.spreadsheets().values().clear(
                         spreadsheetId=sheet_id,
-                        range=f"'{self.TAB3_EVAL_TITLE}'!A1:J200",
+                        range=f"'{tab3_existing}'!A1:J200",
                         body={},
                     ).execute(num_retries=3)
                     svc.spreadsheets().values().update(
                         spreadsheetId=sheet_id,
-                        range=f"'{self.TAB3_EVAL_TITLE}'!A1",
+                        range=f"'{tab3_existing}'!A1",
                         valueInputOption="RAW",
                         body={"values": migrated_t3},
                     ).execute(num_retries=3)
 
-            if self.TAB4_SPOT_CHECK_TITLE not in tab_titles:
+            tab4_existing = next((t for t in TAB4_ALIASES if t in tab_titles), None)
+            if tab4_existing is None:
                 svc.spreadsheets().batchUpdate(
                     spreadsheetId=sheet_id,
                     body={
@@ -2486,17 +2632,26 @@ class GoogleSheetsConfigClient:
     async def update_scheduled_rule_status(
         self, sheet_id: str, row_index: int, status_text: str
     ) -> None:
-        """Writes `status_text` back to column I (`Last_Run_Status`) of `Tab2_定时巡检配置表` at `row_index`."""
+        """Writes `status_text` back to column I (`Last_Run_Status`) of `Tab2_Scheduled_Jobs` at `row_index`."""
         if not sheet_id or sheet_id.startswith("gs://") or row_index < 2:
             return
 
         def _update() -> None:
-            self._sheets_service().spreadsheets().values().update(
-                spreadsheetId=sheet_id,
-                range=f"'{self.TAB2_SCHEDULED_TITLE}'!I{row_index}",
-                valueInputOption="USER_ENTERED",
-                body={"values": [[status_text]]},
-            ).execute(num_retries=3)
+            svc = self._sheets_service().spreadsheets().values()
+            candidates = _alias_candidates_for_tab(self.TAB2_SCHEDULED_TITLE)
+            for idx, tab2_name in enumerate(candidates):
+                try:
+                    svc.update(
+                        spreadsheetId=sheet_id,
+                        range=f"'{tab2_name}'!I{row_index}",
+                        valueInputOption="USER_ENTERED",
+                        body={"values": [[status_text]]},
+                    ).execute(num_retries=3)
+                    return
+                except Exception as exc:
+                    if idx + 1 < len(candidates) and self._http_status_of(exc) == 400:
+                        continue
+                    raise
 
         try:
             await asyncio.to_thread(_update)
@@ -2551,12 +2706,16 @@ class PromptManager:
         cleaned = (requested_model or "").strip()
         effective_fallback = (fallback_model or "").strip() or config.fallback_model_version
         if not cleaned:
-            return effective_fallback, "⚠️ [Tab 0] 未填写模型版本，已自动使用保底模型 " + effective_fallback
+            return (
+                effective_fallback,
+                "⚠️ [Tab 0] Model version not specified; automatically using fallback model "
+                + effective_fallback,
+            )
 
         if cleaned.upper() == "AUTO_LATEST_FLASH":
             warning = (
-                f"⚠️ 已拦截 AUTO_LATEST_FLASH 自动盲切模式（防止生产准确率静默漂移），"
-                f"当前锁定使用受控保底模型 {effective_fallback}"
+                f"⚠️ Blocked AUTO_LATEST_FLASH blind auto-switch mode (prevents silent production accuracy drift); "
+                f"locked to governed fallback model {effective_fallback}"
             )
             logger.warning(warning)
             return effective_fallback, warning
@@ -2576,8 +2735,8 @@ class PromptManager:
                 except Exception:
                     chosen_fallback = config.fallback_model_version
             warning = (
-                f"⚠️ 配置表指定的模型 '{cleaned}' 探活不可用 ({exc.__class__.__name__})，"
-                f"本次已自动回退使用保底模型 {chosen_fallback}"
+                f"⚠️ Configured model '{cleaned}' failed health probe ({exc.__class__.__name__}); "
+                f"automatically fell back to fallback model {chosen_fallback}"
             )
             logger.warning(warning)
             return chosen_fallback, warning
@@ -2591,7 +2750,9 @@ class PromptManager:
                 target_sheet_id = config.master_prompt_sheet_id
             else:
                 # Zero-GWS deployments (main.tf master_prompt_sheet_id = "") have no Sheet at all.
-                logger.info("MASTER_PROMPT_SHEET_ID 未配置（Zero-GWS 模式），将直接使用内置 V25 基准规则库。")
+                logger.info(
+                    "MASTER_PROMPT_SHEET_ID not configured (Zero-GWS mode); using built-in V25 baseline rule library directly."
+                )
                 target_sheet_id = ""
         elif sheet_id.strip():
             target_sheet_id = extract_spreadsheet_id(sheet_id)
@@ -2684,7 +2845,7 @@ class PromptManager:
     async def ensure_master_sheet_validations(
         self, sheet_id: Optional[str] = None, *, force: bool = False
     ) -> bool:
-        """Ensures `Tab2_定时巡检配置表` is migrated to the UTC schema and native Google Sheets
+        """Ensures `Tab2_Scheduled_Jobs` is migrated to the UTC schema and native Google Sheets
         dropdown/formula validations are applied across the Master Config Sheet.
         """
         target_sheet_id = self._resolve_target_sheet_id(sheet_id)
@@ -2698,7 +2859,7 @@ class PromptManager:
     async def load_scheduled_rules_with_diagnostics(
         self, sheet_id: Optional[str] = None
     ) -> tuple[List[ScheduledAuditRule], List[ScheduledRuleRowError]]:
-        """Loads all rows from `[Tab 2: 定时巡检配置表]` (`Tab2_定时巡检配置表`) along with any row validation errors."""
+        """Loads all rows from `[Tab 2: Scheduled Inspection Jobs]` (`Tab2_Scheduled_Jobs`) along with any row validation errors."""
         target_sheet_id = self._resolve_target_sheet_id(sheet_id)
         if not target_sheet_id or self._sheet_client is None:
             self.last_scheduled_rule_errors = []
@@ -2717,7 +2878,7 @@ class PromptManager:
         return [], []
 
     async def load_scheduled_rules(self, sheet_id: Optional[str] = None) -> List[ScheduledAuditRule]:
-        """Loads all rows from `[Tab 2: 定时巡检配置表]` (`Tab2_定时巡检配置表`)."""
+        """Loads all rows from `[Tab 2: Scheduled Inspection Jobs]` (`Tab2_Scheduled_Jobs`)."""
         rules, errors = await self.load_scheduled_rules_with_diagnostics(sheet_id)
         self.last_scheduled_rule_errors = list(errors)
         return rules
@@ -2725,7 +2886,7 @@ class PromptManager:
     async def update_scheduled_rule_status(
         self, row_index: int, status_text: str, sheet_id: Optional[str] = None
     ) -> None:
-        """Updates column I (`Last_Run_Status`) for a rule row in `[Tab 2: 定时巡检配置表]`."""
+        """Updates column I (`Last_Run_Status`) for a rule row in `[Tab 2: Scheduled Inspection Jobs]`."""
         target_sheet_id = self._resolve_target_sheet_id(sheet_id)
         if not target_sheet_id or self._sheet_client is None:
             return
@@ -2742,14 +2903,15 @@ class PromptManager:
         *,
         probe_model: bool = True,
     ) -> PromptModelConfig:
-        """Loads a specific `Prompt_*` tab or `Tab4_专项测试表` and `model_version` directly from the Master SOP Sheet.
+        """Loads a specific `Prompt_*` tab or `Tab4_Spot_Check` and `model_version` directly from the Master SOP Sheet.
 
-        Used by `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) and `[Tab 4: 专项测试表]` (`Tab4_专项测试表`).
+        Used by `[Tab 3: Golden Set Evaluation Workbench]` (`Tab3_Golden_Eval`) and `[Tab 4: Targeted Spot-Check]` (`Tab4_Spot_Check`).
         When `model_version` is omitted/empty, inherits `Active_Model_Version` / `Fallback_Model_Version`
         from `[Tab 0]` so spot-checks and new-SOP tests automatically run on the active production model.
         """
         target_sheet_id = self._resolve_target_sheet_id(sheet_id)
         clean_tab = (prompt_tab_name or "").strip()
+        is_spot_check_tab = clean_tab in TAB4_ALIASES
         clean_model = (model_version or "").strip()
         fallback_model_ver = config.fallback_model_version
         scan_targets, bundled_rules = await asyncio.to_thread(load_rules_from_yaml, self._yaml_path)
@@ -2773,15 +2935,16 @@ class PromptManager:
                 except Exception as exc:
                     logger.warning("Could not read Tab0 model pointers for %s: %s", clean_tab, exc)
                     clean_model = config.fallback_model_version
-            if clean_tab == TAB4_SPOT_CHECK_TITLE:
-                _SHEET_RANGE_CACHE.pop(f"{target_sheet_id}:{clean_tab}!A1:I100", None)
+            if is_spot_check_tab:
+                for t4 in TAB4_ALIASES:
+                    _SHEET_RANGE_CACHE.pop(f"{target_sheet_id}:{t4}!A1:I100", None)
             try:
                 tab_rules = await asyncio.wait_for(
                     self._sheet_client.read_prompt_tab_rules(target_sheet_id, clean_tab),
                     timeout=15.0,
                 )
             except Exception as exc:
-                if clean_tab == TAB4_SPOT_CHECK_TITLE:
+                if is_spot_check_tab:
                     try:
                         await self.ensure_master_sheet_validations(sheet_id=target_sheet_id, force=True)
                         tab_rules = await asyncio.wait_for(
@@ -2790,15 +2953,16 @@ class PromptManager:
                         )
                     except Exception:
                         raise ValueError(
-                            f"无法读取总控表中的 `{clean_tab}` 分表（{exc}）。请确认总控表中存在 `{clean_tab}` 且已填写至少 1 条规则。"
+                            f"Cannot read tab `{clean_tab}` from the Master Sheet ({exc}). "
+                            f"Please confirm that `{clean_tab}` exists in the Master Sheet and contains at least 1 rule."
                         ) from exc
                 else:
                     raise
             if tab_rules:
                 rules = tab_rules
-        elif clean_tab == config.default_prompt_version:
+        elif clean_tab == config.default_prompt_version or clean_tab in PROMPT_TAB_ALIASES:
             rules = bundled_rules
-        elif clean_tab == TAB4_SPOT_CHECK_TITLE:
+        elif is_spot_check_tab:
             rules = parse_rules_from_sheet_rows(
                 [list(SHEET_RULE_HEADER), list(DEFAULT_TAB4_SAMPLE_ROW)]
             )
@@ -2807,13 +2971,14 @@ class PromptManager:
             clean_model = config.fallback_model_version
 
         if not rules:
-            if clean_tab == TAB4_SPOT_CHECK_TITLE:
+            if is_spot_check_tab:
                 raise ValueError(
-                    f"总控表的 `{TAB4_SPOT_CHECK_TITLE}` 当前为空（未读取到任何有效 SOP 规则行）。"
-                    f"请先在总控表的 `{TAB4_SPOT_CHECK_TITLE}` 页签中粘贴或编写至少 1 条要抽检/测试的 SOP 规则（A列 Rule_ID 不能为空），再重新发起专项测试。"
+                    f"Master Sheet tab `{clean_tab}` (`{TAB4_SPOT_CHECK_TITLE}`) is currently empty "
+                    f"(no valid SOP rule rows found). Please paste or enter at least 1 SOP rule to spot-check/test "
+                    f"in tab `{clean_tab}` (Column A `Rule_ID` cannot be empty) before starting a targeted test."
                 )
             raise ValueError(
-                f"未在总控表中找到名为 '{clean_tab}' 的有效 SOP 规则分表（或分表内容为空）"
+                f"No valid SOP rule tab named '{clean_tab}' was found in the Master Sheet (or the tab is empty)"
             )
 
         if probe_model:
@@ -2826,7 +2991,7 @@ class PromptManager:
             clean_tab,
             rules,
             visual_scan_targets=scan_targets,
-            is_spot_check=(clean_tab == TAB4_SPOT_CHECK_TITLE),
+            is_spot_check=is_spot_check_tab,
         )
         return PromptModelConfig(
             active_prompt_version=clean_tab,
@@ -2841,7 +3006,7 @@ class PromptManager:
     async def load_scheduled_eval_rules_with_diagnostics(
         self, sheet_id: Optional[str] = None
     ) -> tuple[List[ScheduledEvalRule], List[ScheduledEvalRowError]]:
-        """Loads all rows from `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`) along with any row validation errors."""
+        """Loads all rows from `[Tab 3: Golden Set Evaluation Workbench]` (`Tab3_Golden_Eval`) along with any row validation errors."""
         target_sheet_id = self._resolve_target_sheet_id(sheet_id)
         if not target_sheet_id or self._sheet_client is None:
             self.last_scheduled_eval_errors = []
@@ -2862,7 +3027,7 @@ class PromptManager:
     async def load_scheduled_eval_rules(
         self, sheet_id: Optional[str] = None
     ) -> List[ScheduledEvalRule]:
-        """Loads all rows from `[Tab 3: 黄金集评测工作台]` (`Tab3_黄金集评测工作台`)."""
+        """Loads all rows from `[Tab 3: Golden Set Evaluation Workbench]` (`Tab3_Golden_Eval`)."""
         rules, errors = await self.load_scheduled_eval_rules_with_diagnostics(sheet_id)
         self.last_scheduled_eval_errors = list(errors)
         return rules
@@ -2875,7 +3040,7 @@ class PromptManager:
         last_eval_report: Optional[str] = None,
         sheet_id: Optional[str] = None,
     ) -> None:
-        """Updates `Trigger_Action` (Col H) and/or `Last_Eval_Report` (Col I) in `[Tab 3: 黄金集评测工作台]`."""
+        """Updates `Trigger_Action` (Col I) and/or `Last_Eval_Report` (Col J) in `[Tab 3: Golden Set Evaluation Workbench]`."""
         target_sheet_id = self._resolve_target_sheet_id(sheet_id)
         if not target_sheet_id or self._sheet_client is None:
             return

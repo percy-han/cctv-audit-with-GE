@@ -99,7 +99,7 @@ def extract_drive_id(url_or_id: str) -> str:
     """
     raw = (url_or_id or "").strip()
     if not raw:
-        raise ValueError("Google Drive 链接不能为空")
+        raise ValueError("Google Drive link or GCS URI cannot be empty")
 
     gcs_target = normalize_gcs_target(raw)
     if gcs_target is not None:
@@ -120,7 +120,7 @@ def extract_drive_id(url_or_id: str) -> str:
     if "id" in qs and qs["id"]:
         return re.split(r"[:\]\s]", qs["id"][0], maxsplit=1)[0]
 
-    raise ValueError(f"无法从链接中解析出有效的 Google Drive ID: {raw}")
+    raise ValueError(f"Could not parse a valid Google Drive ID or GCS URI from link: {raw}")
 
 
 def calculate_sliding_windows(
@@ -161,13 +161,13 @@ def progress_unit_label(videos: Optional[List["VideoMetadataItem"]]) -> str:
     """User-facing unit for progress counters.
 
     Videos no longer than `config.segment_duration_sec` are NOT sliced (one video = one unit), so the
-    counter is "段视频". Only when at least one long video is split into overlapping windows does
-    "个分片" describe what is being counted. Decided per video (not by comparing totals), because a
+    counter is "videos". Only when at least one long video is split into overlapping windows does
+    "slices" describe what is being counted. Decided per video (not by comparing totals), because a
     0-second video yields zero windows and could otherwise make the totals coincide.
     """
     if not videos or any_video_sliced(videos):
-        return "个分片"
-    return "段视频"
+        return "slices"
+    return "videos"
 
 
 # Empirical benchmark from Validation v7 (`运行统计` tab across 16 x 5-min 1080P clips):
@@ -226,7 +226,7 @@ class VideoIngestor:
         sessions' jobs apart and the next turn can reference it.
         """
         folder_id = extract_drive_id(drive_url_or_id)
-        job_tag = f"（预检单号 `{job_id}`）" if job_id else ""
+        job_tag = f" (Preflight ID `{job_id}`)" if job_id else ""
         if preloaded_items is not None:
             items = list(preloaded_items)
         elif self._drive_reader is not None:
@@ -252,11 +252,11 @@ class VideoIngestor:
                 rejected_videos=[],
                 videos=[],
                 message_to_user=(
-                    f"❌ 预检未通过{job_tag}：GCS 目录 `{folder_id}/` 下未找到任何可读取的 `.mp4` 监控视频文件"
-                    "（只读取该目录的直接子文件，不含子目录）。请确认路径正确，且 Worker 服务账号在该存储桶上拥有 "
-                    "`roles/storage.objectViewer`（读取视频）与 `roles/storage.objectAdmin`（写入 Excel 报告与证据切片）。"
+                    f"❌ Preflight failed{job_tag}: No readable `.mp4` CCTV video files were found in GCS directory `{folder_id}/` "
+                    "(only direct child files of that prefix are scanned, excluding subfolders). Please verify the path and ensure the Worker service account has "
+                    "`roles/storage.objectViewer` (to read videos) and `roles/storage.objectAdmin` (to write the Excel report and evidence clips) on the bucket."
                     if folder_id.startswith("gs://")
-                    else f"❌ 预检未通过{job_tag}：文件夹 `{folder_id}` 中未找到任何可读取的 `.mp4` 监控视频文件。"
+                    else f"❌ Preflight failed{job_tag}: No readable `.mp4` CCTV video files were found in folder `{folder_id}`."
                 ),
             )
 
@@ -268,7 +268,7 @@ class VideoIngestor:
         for item in items:
             if not item.meets_resolution_gate:
                 rejected.append(
-                    f"{item.filename} ({item.width}x{item.height}, 低于 720P 红线)"
+                    f"{item.filename} ({item.width}x{item.height}, below 720P minimum gate)"
                 )
             windows = calculate_sliding_windows(
                 item.duration_sec,
@@ -281,10 +281,10 @@ class VideoIngestor:
 
         if rejected:
             msg = (
-                f"❌ **视频预检拦截 (`REJECTED_LOW_RESOLUTION`)**{job_tag}：\n"
-                f"以下视频分辨率低于 `720P` 硬门禁（无法看清糖度计刻度与 20 秒搓手细节，本次 0 Token 消耗）：\n"
+                f"❌ **Video Preflight Blocked (`REJECTED_LOW_RESOLUTION`)**{job_tag}:\n"
+                f"The following videos are below the mandatory `720P` resolution gate (insufficient clarity for refractometer readings and 20-second handwashing inspection; 0 Tokens consumed):\n"
                 + "\n".join(f"  • `{r}`" for r in rejected)
-                + "\n请更换 `≥720P` 高清原片后重新发送链接。"
+                + "\nPlease replace with `>=720P` HD footage and resend the link."
             )
             return InspectFolderResponse(
                 folder_id=folder_id,
@@ -314,24 +314,24 @@ class VideoIngestor:
         )
         if long_videos == 0:
             plan_line = (
-                f"  • **处理计划**：共 `{len(items)}` 段视频，单段均不超过 {seg_min} 分钟，无需切分，"
-                f"直接去除音轨后整段稽核\n"
+                f"  • **Processing Plan**: `{len(items)}` videos, each <= {seg_min} min; no slicing needed, "
+                f"audited as whole clips after audio stripping\n"
             )
         else:
             plan_line = (
-                f"  • **切片计划**：其中 `{long_videos}` 段超过 {seg_min} 分钟的长视频按 {seg_min} 分钟/段"
-                f"（相邻段重叠 {ovl_min} 分钟）切分，其余视频整段处理，合计 **`{total_segments}` 个无音分片**\n"
+                f"  • **Slicing Plan**: `{long_videos}` long video(s) over {seg_min} min will be sliced into {seg_min} min/segment windows "
+                f"({ovl_min} min overlap between adjacent segments) and remaining videos processed whole, totaling **`{total_segments}` audio-stripped slices**\n"
             )
         if folder_id.startswith("gs://"):
-            report_noun, report_place, report_kind = "Excel 报告", f"GCS 目录 `{folder_id}/` 内", " Excel（.xlsx）"
+            report_noun, report_place, report_kind = "Excel report", f"inside GCS directory `{folder_id}/`", " Excel (`.xlsx`)"
         else:
-            report_noun, report_place, report_kind = "报告 Sheet", "您的原文件夹内", " Sheet"
+            report_noun, report_place, report_kind = "Google Sheet report", "inside your original folder", " Google Sheet"
         msg = (
-            f"✅ **视频预检全部通过 (`{len(items)}` 段视频均 ≥720P){job_tag}**\n"
-            f"  • **总时长**：`{total_minutes:.1f} 分钟`\n"
+            f"✅ **Video Preflight Passed (`{len(items)}` videos all >=720P){job_tag}**\n"
+            f"  • **Total Duration**: `{total_minutes:.1f} min`\n"
             f"{plan_line}"
-            f"  • **预计耗时**：约 **`{est_wall_minutes}` 分钟**（按 1080P 每 5 分钟视频平均 {sec_per_5min} 秒顺序接力推算；实际耗时与 Token 消耗将在稽核完成后写入{report_noun}的 `Tab 2 真实账单`）\n\n"
-            f"👉 **请回复「确认开始」{('（单号 `' + job_id + '`）') if job_id else ''}，系统将在后台自动完成去音处理、AI 稽核并在{report_place}生成《稽核报告与 Token 账单{report_kind}》！**"
+            f"  • **Estimated Wall Time**: ~**`{est_wall_minutes}` min** (based on an average of {sec_per_5min} sec per 5-min 1080P video in sequential carryover mode; actual wall time and Token usage will be recorded in `Tab2_Token_Ledger` of the {report_noun})\n\n"
+            f"👉 **Reply 'Confirm and start'{(' (Job ID `' + job_id + '`)') if job_id else ''} to launch background audio stripping, multimodal AI auditing, and automatic `📊 AI_Audit_Report_and_Token_Ledger`{report_kind} generation {report_place}!**"
         )
 
         return InspectFolderResponse(
@@ -368,8 +368,8 @@ class VideoIngestor:
             return item.local_path
         if self._drive_reader is None:
             raise RuntimeError(
-                f"视频 `{item.filename}` 未落地到本地工作目录 {dest_path.parent}，"
-                "且未注入 Google Drive 下载网关 (`DriveMetadataReaderProtocol`)，无法执行 Agentic 稽核。"
+                f"Video `{item.filename}` is not present in local working directory {dest_path.parent}, "
+                "and no storage download gateway (`DriveMetadataReaderProtocol`) is configured to execute Agentic auditing."
             )
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         return await asyncio.wait_for(

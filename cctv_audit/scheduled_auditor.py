@@ -37,6 +37,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field
 
 from .config import config
+from .gcp import LEGACY_EVIDENCE_SUBFOLDER_NAMES
 from .gcs_gateway import EVIDENCE_DIR_MARKER, is_gcs_target, parse_gcs_uri
 from .jobs import AuditJob, JobState
 from .prompt_manager import PromptManager, ScheduledAuditRule, ScheduledEvalRule
@@ -518,7 +519,13 @@ def discover_and_route_drive_videos_sync(
             fname = str(meta.get("name") or curr_id).strip()
             if depth == 0:
                 leaf_folder_name = fname
-            if fname == EVIDENCE_SUBFOLDER_NAME or EVIDENCE_DIR_MARKER in fname:
+            if (
+                fname == EVIDENCE_SUBFOLDER_NAME
+                or fname in LEGACY_EVIDENCE_SUBFOLDER_NAMES
+                or EVIDENCE_DIR_MARKER in fname
+                or "Evidence_Clips" in fname
+                or "违规证据切片" in fname
+            ):
                 skip_video = True
                 break
             if curr_id in enabled_root_owners:
@@ -1154,20 +1161,20 @@ class ScheduledAuditEngine:
             if s["state"] == "DONE"
         )
         failed_notes = [
-            f"[{s['folder_name']}] {(s.get('error_message') or '预检/执行未通过').replace(chr(10), ' ')[:140]}"
+            f"[{s['folder_name']}] {(s.get('error_message') or 'Preflight/execution failed').replace(chr(10), ' ')[:140]}"
             for s in summaries
             if s["state"] != "DONE"
         ]
         prefix_icon = "✅" if ok_stores == total_stores else "⚠️"
         status_msg = (
-            f"{prefix_icon} {final_batch.local_date} 批次 {final_batch.batch_id} 完成："
-            f"门店 {ok_stores}/{total_stores} 家（共 {total_videos} 支视频），"
-            f"检出 {total_viol} 项，总计 {total_tok:,} Tokens"
+            f"{prefix_icon} Completed ({final_batch.local_date} Batch {final_batch.batch_id}) | "
+            f"Stores: {ok_stores}/{total_stores} ({total_videos} videos) | "
+            f"Violations: {total_viol} | Tokens: {total_tok:,}"
         )
         if skipped_low_res_cnt > 0:
-            status_msg += f"（另已自动跳过 {skipped_low_res_cnt} 支 <720P 低清视频）"
+            status_msg += f" (auto-skipped {skipped_low_res_cnt} <720P low-res video(s))"
         if failed_notes:
-            status_msg += f"；未通过原因：{'；'.join(failed_notes)}"
+            status_msg += f"; Failed: {'; '.join(failed_notes)}"
         await self.service.prompt_manager.update_scheduled_rule_status(
             final_batch.row_index, status_msg
         )
@@ -1247,7 +1254,7 @@ class ScheduledAuditEngine:
         if not effective_results_folder_id:
             return (
                 False,
-                "❌ 评测预检未通过：未配置 Results_Folder_URL（且系统环境变量 EVAL_RESULTS_FOLDER_ID 为空），无法保存 5-Tab 测评报告 Sheet（0 Token 消耗）",
+                "❌ Eval Preflight Failed: Results_Folder_URL is not configured (and EVAL_RESULTS_FOLDER_ID is empty); cannot save 5-Tab Eval Report Sheet (0 Tokens used)",
                 "",
             )
 
@@ -1262,7 +1269,7 @@ class ScheduledAuditEngine:
             except Exception as exc:
                 return (
                     False,
-                    f"❌ 评测预检未通过：SOP 标签页 '{rule.prompt_tab_name}' 或模型 '{rule.model_version}' 校验失败（{str(exc)[:180]}）（0 Token 消耗）",
+                    f"❌ Eval Preflight Failed: SOP tab '{rule.prompt_tab_name}' or model '{rule.model_version}' validation failed ({str(exc)[:180]}) (0 Tokens used)",
                     effective_results_folder_id,
                 )
 
@@ -1275,7 +1282,7 @@ class ScheduledAuditEngine:
             except Exception as exc:
                 return (
                     False,
-                    f"❌ 评测预检未通过：无法初始化 Google Drive 访问客户端：{str(exc)[:160]}（0 Token 消耗）",
+                    f"❌ Eval Preflight Failed: Could not initialize Google Drive client: {str(exc)[:160]} (0 Tokens used)",
                     effective_results_folder_id,
                 )
             if rule.golden_videos_folder_id:
@@ -1292,7 +1299,7 @@ class ScheduledAuditEngine:
                 except Exception as exc:
                     return (
                         False,
-                        f"❌ 评测预检未通过：无法访问黄金集视频目录 ({rule.golden_videos_folder_id})：{str(exc)[:160]}（0 Token 消耗）",
+                        f"❌ Eval Preflight Failed: Cannot access Golden Videos Folder ({rule.golden_videos_folder_id}): {str(exc)[:160]} (0 Tokens used)",
                         effective_results_folder_id,
                     )
             try:
@@ -1309,13 +1316,13 @@ class ScheduledAuditEngine:
                 if caps.get("canAddChildren") is False:
                     return (
                         False,
-                        f"❌ 评测预检未通过：结果归档目录 ({effective_results_folder_id}) 缺少写入权限 (canAddChildren=False)（0 Token 消耗）",
+                        f"❌ Eval Preflight Failed: Results Folder ({effective_results_folder_id}) lacks write permission (canAddChildren=False) (0 Tokens used)",
                         effective_results_folder_id,
                     )
             except Exception as exc:
                 return (
                     False,
-                    f"❌ 评测预检未通过：无法访问结果归档目录 ({effective_results_folder_id})：{str(exc)[:160]}（0 Token 消耗）",
+                    f"❌ Eval Preflight Failed: Cannot access Results Folder ({effective_results_folder_id}): {str(exc)[:160]} (0 Tokens used)",
                     effective_results_folder_id,
                 )
 
@@ -1449,21 +1456,21 @@ class ScheduledAuditEngine:
             fpc = float(summary.get("findings_per_clip", 0.0))
             cost_usd = float(summary.get("total_cost_usd", 0.0))
             guardrails_ok = bool(summary.get("guardrails_passed", False))
-            guard_tag = "护栏通过" if guardrails_ok else "触发护栏"
+            guard_tag = "Guardrails Passed" if guardrails_ok else "Guardrails Triggered"
             # Effective video mode (`agentic` / `static`): a model without agentic video serving
             # runs static, and a Tab3 model comparison must show that next to the recall.
             media_mode = str(summary.get("media_mode") or "").strip()
             report_msg = (
-                f"✅ 评测完成 ({task_rec.eval_task_id})：总体召回率 {overall_pct:.1f}% "
-                f"(仅 CONFIRMED {confirmed_pct:.1f}%) | "
-                f"密度 {fpc:.2f} 条/段 ({guard_tag}) | 成本 ${cost_usd:.2f}"
+                f"✅ Completed ({task_rec.eval_task_id}) | Recall {overall_pct:.1f}% "
+                f"(CONFIRMED-only {confirmed_pct:.1f}%) | "
+                f"Density {fpc:.2f}/clip ({guard_tag}) | Cost ${cost_usd:.2f}"
             )
             if media_mode:
-                report_msg += f" | 视频模式 {media_mode}"
+                report_msg += f" | Media Mode {media_mode}"
             if sheet_url:
-                report_msg += f" | 报告：{sheet_url}"
+                report_msg += f" | Report: {sheet_url}"
             elif summary.get("sheet_error"):
-                report_msg += f" | ⚠️ 报告表生成提示：{str(summary['sheet_error'])[:120]}"
+                report_msg += f" | ⚠️ Report Sheet Note: {str(summary['sheet_error'])[:120]}"
 
             finished_rec = task_rec.model_copy(
                 update={
@@ -1509,7 +1516,7 @@ class ScheduledAuditEngine:
             return finished_rec
         except Exception as exc:
             err_str = str(exc).replace("\n", " ")[:240]
-            fail_msg = f"❌ 评测执行异常 ({task_rec.eval_task_id})：{err_str}"
+            fail_msg = f"❌ Eval Failed ({task_rec.eval_task_id}): {err_str}"
             logger.error("Scheduled evaluation %s failed: %s", eval_task_id, exc)
             failed_rec = task_rec.model_copy(
                 update={
@@ -1647,8 +1654,8 @@ class ScheduledAuditEngine:
                     rule.row_index,
                     trigger_action="RUNNING",
                     last_eval_report=(
-                        f"⏳ 正在后台执行黄金集评测 ({eval_task_id})："
-                        f"SOP={rule.prompt_tab_name} | 模型={rule.model_version}"
+                        f"⏳ Running golden-set evaluation ({eval_task_id}): "
+                        f"SOP={rule.prompt_tab_name} | Model={rule.model_version}"
                     ),
                 )
             send_eval_start_fn = getattr(
@@ -1732,8 +1739,8 @@ class ScheduledAuditEngine:
             due, _ = is_rule_due(dup_rule, effective_now)
             if due:
                 msg = (
-                    f"⚠️ 配置重叠，已由第 {winner_rule.row_index} 行规则 "
-                    f"[{winner_rule.rule_id}] 代理执行，未重复计费"
+                    f"⚠️ Overlap: delegated to Row {winner_rule.row_index} rule "
+                    f"[{winner_rule.rule_id}] (no duplicate billing)"
                 )
                 await self.service.prompt_manager.update_scheduled_rule_status(
                     dup_rule.row_index, msg
@@ -1836,8 +1843,8 @@ class ScheduledAuditEngine:
                     else str(days_val)
                 )
                 no_vid_msg = (
-                    f"✅ {local_date} {rule.trigger_time} 巡检完成："
-                    f"过去 {days_str} 天（{int(rule.lookback_hours)} 小时）内无新增待检视频（0 Token 消耗）"
+                    f"✅ Completed ({local_date} {rule.trigger_time}): "
+                    f"No new videos found in the past {days_str} day(s) ({int(rule.lookback_hours)}h) (0 Tokens used)"
                 )
                 await self.service.prompt_manager.update_scheduled_rule_status(
                     rule.row_index, no_vid_msg
@@ -1892,7 +1899,7 @@ class ScheduledAuditEngine:
                         job_id=job.job_id,
                         succeeded=False,
                         error_message=(
-                            f"视频分辨率 {low_c.width}x{low_c.height} 低于 720P 门禁 ({low_c.filename})"
+                            f"Video resolution {low_c.width}x{low_c.height} is below the 720P gate ({low_c.filename})"
                         ),
                         terminal_state=FileLedgerState.REJECTED_LOW_RES,
                     )
@@ -1904,7 +1911,7 @@ class ScheduledAuditEngine:
                             if job.preflight_report
                             else job.error_message
                         )
-                        or "预检未通过"
+                        or "Preflight failed"
                     )
                     is_low_res_err = "REJECTED_LOW_RESOLUTION" in err_reason
                     for c in valid_cands:
@@ -1996,8 +2003,8 @@ class ScheduledAuditEngine:
 
             total_vids = sum(t.video_count for t in store_tasks.values())
             running_msg = (
-                f"⏳ {local_date} {rule.trigger_time} 已触发批次 {batch_id}："
-                f"共 {len(store_tasks)} 家门店 / {total_vids} 支新增视频正在后台稽核"
+                f"🔄 Running (Batch {batch_id}, triggered {local_date} {rule.trigger_time}): "
+                f"{len(store_tasks)} store(s) / {total_vids} new video(s) auditing in background..."
             )
             await self.service.prompt_manager.update_scheduled_rule_status(
                 rule.row_index, running_msg

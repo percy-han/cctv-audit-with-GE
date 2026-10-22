@@ -162,8 +162,8 @@ class AuditService:
                 rejected_videos=[],
                 videos=[],
                 message_to_user=(
-                    f"❌ 预检未通过（预检单号 `{job.job_id}`，本次 0 Token 消耗）：{setup_problem}\n"
-                    "• 处理好之后，重新发送一次这个文件夹链接即可（视频不用重新上传）。"
+                    f"❌ Preflight failed (Preflight ID `{job.job_id}`, 0 Tokens consumed): {setup_problem}\n"
+                    "• Once resolved, simply resend this folder link (no need to re-upload the videos)."
                 ),
             )
             job = job.model_copy(
@@ -197,8 +197,8 @@ class AuditService:
                     rejected_videos=[],
                     videos=[],
                     message_to_user=(
-                        f"❌ 专项抽检 / 新 SOP 测试预检未通过（预检单号 `{job.job_id}`，本次 0 Token 消耗）：{exc}\n"
-                        f"• 💡 如果您本意是做**完整的日常全量稽核**，请在 GE 对话框 `@` 稽核 Agent 直接发送：「`@CHAGEE 门店视频 AI 稽核专家 请帮忙稽核视频，{drive_url}`」"
+                        f"❌ Targeted Spot-Check / New SOP Test preflight failed (Preflight ID `{job.job_id}`, 0 Tokens consumed): {exc}\n"
+                        f"• 💡 If you intended to run a **Full Daily Audit**, mention the Agent in the Gemini Enterprise chat box and send: \"`@{config.agent_display_name} [Full Daily Audit] Please audit store videos: {drive_url}`\""
                     ),
                 )
                 job = job.model_copy(
@@ -219,26 +219,26 @@ class AuditService:
         if inspect_res.passed:
             if cleaned_tab and spot_cfg is not None:
                 audited_rule_ids = [r.rule_id for r in spot_cfg.rules]
-                rule_summary = "、".join(
-                    f"`{r.rule_id}`（{r.name}）" for r in spot_cfg.rules[:6]
+                rule_summary = ", ".join(
+                    f"`{r.rule_id}` ({r.name})" for r in spot_cfg.rules[:6]
                 )
                 if len(spot_cfg.rules) > 6:
-                    rule_summary += f" 等共 {len(spot_cfg.rules)} 条"
+                    rule_summary += f" and {len(spot_cfg.rules)} rules total"
                 rule_label = ",".join(audited_rule_ids[:6]) + (
                     "..." if len(audited_rule_ids) > 6 else ""
                 )
                 active_prompt_ver = f"{cleaned_tab}[{rule_label}]"
                 mode_banner = (
-                    f"⚠️ **【当前为专项抽检 / 新 SOP 测试模式（非全量稽核）】**\n"
-                    f"• 🧪 **锁定规则页签**：`{cleaned_tab}`（本次仅核查 {len(spot_cfg.rules)} 条规则：{rule_summary}；其余正式 SOP 条款本次不执行）\n"
-                    f"• 💡 **防误触提示**：如果您本意是做**完整的日常全量稽核**，请勿确认，直接在 GE 对话框 `@` 稽核 Agent 重新发送：「`@{config.agent_display_name} 请帮忙稽核视频，{drive_url}`」\n\n"
+                    f"⚠️ **[Targeted Spot-Check / New SOP Test Mode (Non-Full Audit)]**\n"
+                    f"• 🧪 **Locked Rule Tab**: `{cleaned_tab}` (checking only {len(spot_cfg.rules)} rule(s): {rule_summary}; all other official SOP rules are skipped in this run)\n"
+                    f"• 💡 **Anti-Misclick Tip**: If you intended to run a **Full Daily Audit**, do NOT confirm — instead mention the Agent in Gemini Enterprise and send: \"`@{config.agent_display_name} [Full Daily Audit] Please audit store videos: {drive_url}`\"\n\n"
                 )
                 inspect_res = inspect_res.model_copy(
                     update={"message_to_user": mode_banner + inspect_res.message_to_user}
                 )
             else:
                 mode_banner = (
-                    "✅ **稽核模式：【日常全量稽核】**（自动加载总控表 `Tab0` 当前生效主规则库，覆盖全部正式 SOP 条款）\n"
+                    "✅ **Audit Mode: [Full Daily Audit]** (automatically loads the active master rule set from `Tab0`, covering all official SOP rules)\n"
                 )
                 inspect_res = inspect_res.model_copy(
                     update={"message_to_user": mode_banner + inspect_res.message_to_user}
@@ -318,12 +318,12 @@ class AuditService:
                         job = session_job
                     elif session_job.state == JobState.RUNNING:
                         raise ValueError(
-                            f"当前会话的任务 `{session_job.job_id}` 已在后台运行中，无需重复确认；"
-                            "请直接询问「进度怎么样了」查看实时进度。"
+                            f"Job `{session_job.job_id}` in this session is already running in the background; no need to confirm again. "
+                            "Ask 'What is the current progress?' anytime to check real-time status."
                         )
                     else:
                         raise ValueError(
-                            f"当前任务 `{session_job.job_id}` 状态为 `{session_job.state.value}`，无法重复启动。"
+                            f"Job `{session_job.job_id}` is currently in state `{session_job.state.value}` and cannot be started again."
                         )
                 else:
                     recent_list = await self.jobs.list_for_user(user_id, limit=5)
@@ -337,15 +337,15 @@ class AuditService:
 
         if job is None:
             raise ValueError(
-                "未找到待确认的预检任务（或可断点续跑的中断任务），请先发送 Google Drive 监控视频文件夹链接进行预检。"
+                "No preflighted job awaiting confirmation (or interrupted job eligible for checkpoint resume) was found. Please send a Google Drive or GCS CCTV folder link to run preflight first."
             )
         # Re-running a DONE job needs the supervisor to name it; a job ID merely recovered from the
-        # thread history ("确认开始" after completion) must not silently restart a finished audit.
+        # thread history ("Confirm and start" after completion) must not silently restart a finished audit.
         if job.state not in (JobState.READY, JobState.FAILED, JobState.RUNNING) and not (
             job_id and not job_id_from_context and job.state == JobState.DONE
         ):
             raise ValueError(
-                f"当前任务 `{job.job_id}` 状态为 `{job.state.value}`，无法重复启动。"
+                f"Job `{job.job_id}` is currently in state `{job.state.value}` and cannot be started again."
             )
 
         # Every restart of a FAILED / stale-RUNNING job counts toward MAX_AUTO_RESUMES -- including one
@@ -555,7 +555,7 @@ class AuditService:
                 except Exception:
                     pass
         raise TimeoutError(
-            f"{label} 超过 {int(timeout_sec)} 秒未返回，已被容器内看门狗终止（将由跨实例巡检自动从最新切片断点续跑）"
+            f"{label} did not return within {int(timeout_sec)} seconds and was terminated by the in-container watchdog (will automatically resume from the latest segment checkpoint)"
         )
 
     async def _run_detached_audit(

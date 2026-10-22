@@ -150,12 +150,15 @@ class PartWindow:
         return self.before == self.after
 
     def label(self) -> str:
-        """Human-readable window, e.g. ``±60s`` or ``−60s / +330s（静置 5 分钟）``."""
+        """Human-readable window, e.g. ``±60s`` or ``−60s / +330s (dwell 5 min)``."""
         core = f"±{self.before}s" if self.symmetric else f"−{self.before}s / +{self.after}s"
         if self.dwell_sec:
             d = self.dwell_sec
-            dwell_txt = f"{d // 60} 分钟" if d % 60 == 0 else f"{d} 秒"
-            core += f"（静置 {dwell_txt}）"
+            if d % 60 == 0:
+                mins_str = str(d // 60)
+                core += f" (dwell {mins_str} min)"
+            else:
+                core += f" (dwell {self.dwell_sec}s)"
         return core
 
 
@@ -198,7 +201,7 @@ def part_time_window(item: dict[str, Any], part: dict[str, Any] | None, mode: st
     return PartWindow(before=before, after=after, dwell_sec=dwell, dwell_source=src if dwell else "")
 
 
-UNCATEGORIZED = "未分类"
+UNCATEGORIZED = "Uncategorized"
 
 
 def sop_category_and_source(item: dict[str, Any]) -> tuple[str, str]:
@@ -224,23 +227,23 @@ def classify_sop_category(item: dict[str, Any]) -> str:
     return sop_category_and_source(item)[0]
 
 
-JUDGE_TEMPLATE = """你是连锁茶饮门店 CCTV 稽核的阅卷老师。任务：判断 AI 稽核输出里，有没有抓到下面这 1 条人工标注的违规。
+JUDGE_TEMPLATE = """You are an expert evaluator for retail tea store CCTV SOP audits. Task: Determine whether the AI audit output captured the following human-labelled violation.
 
-【人工标注（标准答案）】
+[Human Label (Ground Truth Reference)]
 {reference}
 
-【同一视频、时间相近的 AI 稽核条目（候选，已由代码按视频文件和时间预筛）】
+[Candidate AI Audit Findings (same video, temporally pre-filtered by code)]
 {response}
 
-评分规则（只看候选条目，不要自己脑补视频内容；SOP 条款编号不同不影响判分）：
-- 1 分：至少有一条候选描述的是「同一时刻、同一人、同一种违规行为」。措辞可以不同。
-  例：标注“搓洗时间少于 20 秒”，候选必须明确指出搓洗/揉搓/起泡时间不足或洗手步骤时长不够。
-- 0.5 分：候选指向同一时刻、同一个动作或同一件物品，但报的是不同的毛病，或只覆盖了标注的一部分。
-  例：标注“搓洗时间少于 20 秒”，候选只说“洗手不规范/未按五步洗手”而没提时长。
-- 0 分：没有候选说到这件事。
+Scoring Rubric (evaluate strictly against the candidate findings above; do not hallucinate video content; differences in SOP clause numbering do not affect the score):
+- 1.0: At least one candidate describes the SAME moment, SAME person, and SAME violation behavior (wording may differ).
+  Example: If the label says "Soaping time is less than 20s", the candidate must explicitly note insufficient rubbing/lathering/soaping duration or handwashing step duration.
+- 0.5: A candidate points to the same moment, action, or object, but reports a different issue or only partially covers the labelled violation.
+  Example: If the label says "Soaping time is less than 20s", the candidate only states "improper handwashing / did not follow 5-step handwashing" without mentioning duration.
+- 0.0: No candidate describes this violation.
 
-只返回 JSON，不要任何其他文字：
-{{"score": <0 或 0.5 或 1>, "explanation": "MATCH=<命中的候选编号，多个用逗号，没有写 NONE>; <一句中文理由，引用候选里的关键原话>"}}"""
+Return ONLY valid JSON with no extra text:
+{{"score": <0 or 0.5 or 1>, "explanation": "MATCH=<matched candidate ID(s), comma-separated, or NONE>; <one-sentence explanation in English quoting key evidence from the candidate>"}}"""
 
 
 def hms_to_sec(text: str) -> int | None:
@@ -403,18 +406,18 @@ def render_candidates(cands: list[Finding]) -> str:
     lines = []
     for f in cands:
         lines.append(
-            f"[{f.finding_id}] OSD {f.osd or '?'} | 条款 {f.rule_id} | {f.disposition}/{f.severity} | {f.evidence}"
+            f"[{f.finding_id}] OSD {f.osd or '?'} | Clause {f.rule_id} | {f.disposition}/{f.severity} | {f.evidence}"
         )
     return "\n".join(lines)
 
 
 def render_reference(item: dict[str, Any], part: dict[str, Any]) -> str:
-    when = "、".join(part["osd_times"]) or "（标注未给时间）"
+    when = ", ".join(part["osd_times"]) or "(no timestamp in label)"
     return (
-        f"条款：{item['audit_clause']}\n"
-        f"视频：{', '.join(item['video_filenames'])}\n"
-        f"OSD 时间：{when}\n"
-        f"违规描述（客户原文）：{part['description']}"
+        f"Audit Clause: {item['audit_clause']}\n"
+        f"Video: {', '.join(item['video_filenames'])}\n"
+        f"OSD Timestamp: {when}\n"
+        f"Violation Description (Customer Verbatim): {part['description']}"
     )
 
 
@@ -469,7 +472,7 @@ def near_misses(part: dict[str, Any], files: list[str], findings: list[Finding],
             gaps = [signed_ring_gap(t, s) for t in f.osd_times]
             if any(-lo_band <= g <= hi_band for g in gaps):
                 gap = min(abs(g) for g in gaps)
-                out.append(f"{f.finding_id} {f.osd} {f.rule_id} (差 {gap}s)：{f.evidence[:60]}")
+                out.append(f"{f.finding_id} {f.osd} {f.rule_id} (gap {gap}s): {f.evidence[:60]}")
                 break
     return out
 
@@ -572,7 +575,7 @@ def vote(passes: list[list[tuple[float | None, str]]]) -> list[tuple[float | Non
         med = scores[len(scores) // 2]
         expl = next(e for s, e in votes if float(s) == med)
         if len(set(scores)) > 1:
-            expl = f"[{len(votes)} 次投票 {'/'.join(f'{x:g}' for x in scores)} 取中位] " + expl
+            expl = f"[median of {len(votes)} votes {'/'.join(f'{x:g}' for x in scores)}] " + expl
         out.append((med, expl))
     return out
 
@@ -662,7 +665,7 @@ def score(items: list[dict[str, Any]], findings: list[Finding],
             win_txt = row.get("window_label") or f"±{w_sec}s"
             row.update(
                 score=0.0,
-                explanation=f"代码预筛：同一视频 {win_txt} 内没有任何 AI 条目",
+                explanation=f"No candidate findings within the temporal window ({win_txt}) (Judge call skipped).",
                 matched_ids=[],
                 timestamp_drift_sec=None,
             )
@@ -839,36 +842,36 @@ def render_markdown(run_label: str, rep: dict[str, Any]) -> str:
     ad = rep["alert_density"]
     qm = rep.get("quality_metrics") or {}
     drift_str = (
-        f"平均 {qm['mean_point_timestamp_drift_sec']:.1f}s（最大 {qm['max_point_timestamp_drift_sec']}s，"
-        f"仅统计 {qm.get('point_parts_matched', 0)}/{qm.get('point_parts_total', 0)} 个 POINT 瞬时动作，±{qm.get('point_window_sec', POINT_WINDOW_SEC)}s 窗口；"
-        f"{qm.get('window_parts_total', 0)} 个 WINDOW 持续过程动作豁免偏移统计）"
+        f"mean {qm['mean_point_timestamp_drift_sec']:.1f}s (max {qm['max_point_timestamp_drift_sec']}s, "
+        f"computed across {qm.get('point_parts_matched', 0)}/{qm.get('point_parts_total', 0)} matched POINT instant actions, ±{qm.get('point_window_sec', POINT_WINDOW_SEC)}s window; "
+        f"{qm.get('window_parts_total', 0)} WINDOW continuous-process parts exempt)"
         if qm.get("mean_point_timestamp_drift_sec") is not None
-        else f"无命中的 POINT 瞬时动作（POINT ±{qm.get('point_window_sec', POINT_WINDOW_SEC)}s / WINDOW ±{qm.get('window_sec', WINDOW_SEC)}s）"
+        else f"no matched POINT instant actions (POINT ±{qm.get('point_window_sec', POINT_WINDOW_SEC)}s / WINDOW ±{qm.get('window_sec', WINDOW_SEC)}s)"
     )
-    mark = {1.0: "✓ 命中", 0.5: "◐ 半对", 0.0: "✗ 漏掉"}
+    mark = {1.0: "✅ Hit", 0.5: "⚠️ Partial", 0.0: "❌ Miss"}
     lines = [
-        f"# 尺子打分：{run_label}",
+        f"# Evaluation Score Report: {run_label}",
         "",
-        f"- 黄金集：{(rep.get('golden') or {}).get('golden_version', '未记录')}（{r['all']['rows']} 题）",
-        f"- 加权召回（全部 {r['all']['rows']} 行）：**{r['all']['points']:.1f} / {r['all']['rows']} = {r['all']['recall']:.1%}**",
-        f"- 仅 CONFIRMED 召回率：{qm.get('confirmed_only_points', 0.0):.1f} / {r['all']['rows']} = {qm.get('confirmed_only_recall', 0.0):.1%}",
-        f"- 告警密度：{ad['findings']} 条 / {ad['clips']} 段 = 平均 {ad['mean_per_clip']:.1f} 条/段，最多 {ad['max_per_clip']} 条/段（有效命中率 Hit Rate = {qm.get('hit_rate', 0.0):.1%}）",
-        f"- 瞬时动作时间戳定位误差（POINT ±{qm.get('point_window_sec', POINT_WINDOW_SEC)}s）：{drift_str}",
-        f"- 裁判调用：{rep['judge_cases']} 个 part；judge = {rep.get('judge_model', '?')}",
+        f"- Golden Set: {(rep.get('golden') or {}).get('golden_version', 'unrecorded')} ({r['all']['rows']} items)",
+        f"- Weighted Recall (all {r['all']['rows']} rows): **{r['all']['points']:.1f} / {r['all']['rows']} = {r['all']['recall']:.1%}**",
+        f"- CONFIRMED-Only Recall: {qm.get('confirmed_only_points', 0.0):.1f} / {r['all']['rows']} = {qm.get('confirmed_only_recall', 0.0):.1%}",
+        f"- Alert Density: {ad['findings']} findings / {ad['clips']} clips = mean {ad['mean_per_clip']:.1f} findings/clip, max {ad['max_per_clip']} findings/clip (Hit Rate = {qm.get('hit_rate', 0.0):.1%})",
+        f"- Instant-Action Timestamp Drift (POINT ±{qm.get('point_window_sec', POINT_WINDOW_SEC)}s): {drift_str}",
+        f"- Judge Calls: {rep['judge_cases']} parts; judge = {rep.get('judge_model', '?')}",
         "",
-        "| 行 | 分组 | 时间窗模式 | 客户标注 | 判分 | 裁判理由 | 命中的 AI 条目 | 窗口外近邻（仅供校准，不计分） |",
+        "| Row | Group | Temporal Window | Customer Label | Verdict | Judge Explanation | Matched AI Findings | Out-of-Window Near Misses (Calibration Only) |",
         "|---|---|---|---|---|---|---|---|",
     ]
     for it in rep["items"]:
         grp = f"{it['focus'].split()[0]} · {it['outlet_name']}"
         modes = "/".join(
             f"{p.get('temporal_mode', 'WINDOW')}({p.get('window_label') or '±' + str(p.get('window_sec', WINDOW_SEC)) + 's'}"
-            + (f",偏移{p['timestamp_drift_sec']}s)" if p.get("timestamp_drift_sec") is not None else ")")
+            + (f",drift {p['timestamp_drift_sec']}s)" if p.get("timestamp_drift_sec") is not None else ")")
             for p in it["parts"]
         )
         reasons = " / ".join(f"{p['part_id']}: {p['explanation']}" for p in it["parts"])
         hits = "<br>".join(
-            f"{m['finding_id']} {m['osd']} {m['rule_id']}：{m['evidence'][:80]}" for m in it["matched"]
+            f"{m['finding_id']} {m['osd']} {m['rule_id']}: {m['evidence'][:80]}" for m in it["matched"]
         ) or "—"
         near = "<br>".join(n for p in it["parts"] for n in p.get("near_misses", [])) or "—"
         label = it["finding_verbatim"].replace("|", "/")
@@ -877,6 +880,9 @@ def render_markdown(run_label: str, rep: dict[str, Any]) -> str:
             f"{reasons.replace('|', '/')} | {hits.replace('|', '/')} | {near.replace('|', '/')} |"
         )
     return "\n".join(lines) + "\n"
+
+
+render_markdown_report = render_markdown
 
 
 def resolve_judge_model(project: str, credentials: Any = None) -> str:

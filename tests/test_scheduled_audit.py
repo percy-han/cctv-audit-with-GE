@@ -376,8 +376,8 @@ def test_method_1_smart_append_preserves_history_in_google_sheets(
 
     async def _run() -> None:
         gw = GoogleWorkspaceGateway(impersonate_user="sup@chagee.com")
-        tab1_title = "违规事件 3 秒复核台"
-        tab2_title = "本次视频 Token 消耗与耗时账单"
+        tab1_title = "Tab1_Violation_Review"
+        tab2_title = "Tab2_Token_Ledger"
 
         # In-memory simulated Google Sheet state
         sheet_store: Dict[str, List[List[Any]]] = {
@@ -395,7 +395,7 @@ def test_method_1_smart_append_preserves_history_in_google_sheets(
                         "files": [
                             {
                                 "id": "sheet_existing_123",
-                                "name": "📊 AI稽核报告与Token账单",
+                                "name": "📊 AI_Audit_Report_and_Token_Ledger",
                                 "webViewLink": "https://docs.google.com/spreadsheets/d/sheet_existing_123/edit",
                             }
                         ]
@@ -487,7 +487,7 @@ def test_method_1_smart_append_preserves_history_in_google_sheets(
         )
         await gw.create_dual_tab_report_sheet(
             parent_folder_id="folder_store_1",
-            title="📊 AI稽核报告与Token账单",
+            title="📊 AI_Audit_Report_and_Token_Ledger",
             tab1_rows=[day1_finding],
             tab2_rows=[day1_ledger],
         )
@@ -524,7 +524,7 @@ def test_method_1_smart_append_preserves_history_in_google_sheets(
         )
         await gw.create_dual_tab_report_sheet(
             parent_folder_id="folder_store_1",
-            title="📊 AI稽核报告与Token账单",
+            title="📊 AI_Audit_Report_and_Token_Ledger",
             tab1_rows=[day2_finding],
             tab2_rows=[day2_ledger],
         )
@@ -544,7 +544,7 @@ def test_method_1_smart_append_preserves_history_in_google_sheets(
         )
         await gw.create_dual_tab_report_sheet(
             parent_folder_id="folder_store_1",
-            title="📊 AI稽核报告与Token账单",
+            title="📊 AI_Audit_Report_and_Token_Ledger",
             tab1_rows=[],
             tab2_rows=[day3_ledger],
         )
@@ -642,10 +642,10 @@ def test_method_1_smart_append_preserves_history_in_gcs_xlsx(
 
         raw_xlsx = uploaded_blobs["latest"]
         sheets = read_xlsx_sheets(raw_xlsx)
-        rows1 = sheets["违规事件 3 秒复核台"]
+        rows1 = sheets["Tab1_Violation_Review"]
         assert [r[1] for r in rows1[1:3]] == ["gcs_cam01.mp4", "gcs_cam02.mp4"]
 
-        rows2 = sheets["本次视频 Token 消耗与耗时账单"]
+        rows2 = sheets["Tab2_Token_Ledger"]
         assert [r[2] for r in rows2[1:3]] == ["gcs_cam01.mp4", "gcs_cam02.mp4"]
         assert [int(float(r[10])) for r in rows2[1:3]] == [8700, 9300]
 
@@ -832,7 +832,7 @@ def test_scheduled_engine_e2e_multi_store_batch_3state_ledger_and_watchdog_isola
 
         assert tick_res["status"] == "triggered"
         assert tick_res["shadowed_rules"] == ["RULE-DUP"]
-        assert "配置重叠，已由第 2 行规则 [RULE-REGION] 代理执行" in status_updates[4]
+        assert "Overlap: delegated to Row 2 rule [RULE-REGION]" in status_updates[4]
         assert len(dispatched_jobs) == 2  # Store_A and Store_B (Store_Flagship was carved out!)
 
         # Verify 2-minute Service watchdog ignores `execution_backend == "cloud_run_job"`
@@ -861,7 +861,7 @@ def test_scheduled_engine_e2e_multi_store_batch_3state_ledger_and_watchdog_isola
         summary_call = batch_summary_notifications[0]
         assert summary_call["rule_id"] == "RULE-REGION"
         assert len(summary_call["store_summaries"]) == 2
-        assert "门店 2/2 家（共 2 支视频）" in status_updates[2]
+        assert "Stores: 2/2 (2 videos)" in status_updates[2]
         assert len(single_store_notifications) == 0
 
         # Verify both videos' 3-state ledgers are now COMPLETED
@@ -877,7 +877,7 @@ def test_scheduled_engine_e2e_multi_store_batch_3state_ledger_and_watchdog_isola
         videos[1]["createdTime"] = "2026-10-15T18:05:00Z"
         tick3_res = await engine.run_scheduled_tick(now_utc=next_day_tick)
         assert tick3_res["triggered_batches"][0]["status"] == "no_new_videos"
-        assert "无新增待检视频（0 Token 消耗）" in status_updates[2]
+        assert "No new videos found" in status_updates[2] and "(0 Tokens used)" in status_updates[2]
 
         # Now simulate a video whose previous job FAILED -> 3-state ledger must allow re-claim on Day 3!
         await engine.mark_file_ledger_terminal(
@@ -1353,10 +1353,10 @@ def test_req015_portal_hmac_signing_and_composite_key_review_writeback(
         assert res["updated_count"] == 2
         # Row 0 is now cam02_noon.mp4 (inc_2_id -> DISMISSED) and Row 1 is cam01_morning.mp4 (inc_1_id -> CONFIRMED)
         assert tab1_rows[0][1] == "cam02_noon.mp4"
-        assert tab1_rows[0][9] == "❌ 误报排除 (FALSE_POSITIVE)"
+        assert tab1_rows[0][9] == "❌ FALSE_POSITIVE"
         assert tab1_rows[0][10] == "冰铲实际在消毒盒边缘"
         assert tab1_rows[1][1] == "cam01_morning.mp4"
-        assert tab1_rows[1][9] == "✅ 确认违规 (CONFIRMED)"
+        assert tab1_rows[1][9] == "✅ CONFIRMED"
         assert tab1_rows[1][10] == "已与店长核实，确系未洗手"
 
         # 6. Verify browser JS payload contract (`job`/`user`/`updates` via `PortalReviewRequestPayload`)
@@ -1390,7 +1390,7 @@ def test_req015_portal_hmac_signing_and_composite_key_review_writeback(
         )
         assert res_js["ok"] is True
         assert res_js["updated_count"] == 1
-        assert tab1_rows[1][9] == "⚠️ 待调取后续录像 (FOLLOWUP)"
+        assert tab1_rows[1][9] == "⚠️ FOLLOWUP"
         assert tab1_rows[1][10] == "待调取次日复训录像"
 
     asyncio.run(_run())
@@ -1476,8 +1476,8 @@ def test_unified_start_and_completion_chat_notifications_and_dedup_guard(
         assert ok_done is True
         assert "text" not in webhook_posts[-1]  # Single clean cardsV2 card, no duplicate text block
         done_payload_str = json.dumps(webhook_posts[-1], ensure_ascii=False)
-        assert "🖥️ 打开 HTML 督导复核工作台" in done_payload_str
-        assert "📊 打开原 Google Sheet 账单" in done_payload_str
+        assert "🖥️ Open HTML Supervisor Review Workbench" in done_payload_str
+        assert "📊 Open Original Google Sheet Report" in done_payload_str
         assert "/portal?job=job_abc" in done_payload_str
 
         # 2. Test batch start & batch completion webhook payloads
@@ -1518,7 +1518,7 @@ def test_unified_start_and_completion_chat_notifications_and_dedup_guard(
         assert ok_bdone is True
         assert "text" not in webhook_posts[-1]
         bdone_str = json.dumps(webhook_posts[-1], ensure_ascii=False)
-        assert "🌐 打开本批次多门店 HTML 复核工作台" in bdone_str
+        assert "🌐 Open Multi-Store HTML Review Workbench" in bdone_str
         assert "/portal?batch=batch_xyz" in bdone_str
 
         # 3. Verify [P1-1] start_notification_sent deduplication on AuditService.start_audit
@@ -1811,7 +1811,7 @@ def test_tab2_diagnostics_writeback_and_same_day_reschedule_lock(
     assert len(valid_rules) == 1
     assert valid_rules[0].rule_id == "SCHED-OK"
     assert [e.row_index for e in row_errors] == [3, 4, 5, 6]
-    assert "重复" in row_errors[0].error_message
+    assert "duplicates" in row_errors[0].error_message
     assert "/file/d/" in row_errors[1].error_message
     assert "Trigger_Minute_UTC" in row_errors[2].error_message
     assert "Lookback_Days" in row_errors[3].error_message
@@ -1850,7 +1850,7 @@ def test_tab2_diagnostics_writeback_and_same_day_reschedule_lock(
     assert res_idle["status"] == "idle"
     assert res_idle["invalid_rows"] == [3, 4, 5, 6]
     for r_idx in (3, 4, 5, 6):
-        assert status_updates[r_idx].startswith("❌ 配置错误：")
+        assert status_updates[r_idx].startswith("❌ Config Error:")
 
     # Test same-day reschedule lock: acquire at 01:00 UTC on 2026-10-16, then change trigger_time to 05:15 UTC
     rule_0100 = valid_rules[0]
@@ -2052,7 +2052,7 @@ def test_preflight_rejected_store_preserves_error_message_in_batch_and_portal(
         assert "REJECTED_LOW_RESOLUTION" in payload["error_message"]
         assert "low_res_clip1.mp4" in payload["error_message"]
         assert "REJECTED_LOW_RESOLUTION" in payload["batch_stores"][0]["error_message"]
-        assert "未通过原因：[test03]" in status_updates[2]
+        assert "; Failed: [test03]" in status_updates[2]
 
         # Verify both low-res videos are permanently marked REJECTED_LOW_RES and NOT re-claimed on Day 2!
         for vid_id in ("vid_low1", "vid_low2"):

@@ -14,6 +14,7 @@ Why this exists (from `percy-han/cctv-audit/deploy/phase0/README.md` empirical w
 from __future__ import annotations
 
 import logging
+import re
 from enum import Enum
 from typing import Optional
 
@@ -26,7 +27,21 @@ from .prompt_manager import TAB4_SPOT_CHECK_TITLE
 
 logger = logging.getLogger("cctv_audit.turn")
 
+_APPROVE_RE = re.compile(
+    r"^\s*(?:confirm\s+and\s+start|confirm|start|yes|go\s+ahead|proceed|run|ok|okay|确认开始|开始|确认|好的|好)\s*[.!。！]*\s*$",
+    re.IGNORECASE,
+)
+_CANCEL_RE = re.compile(
+    r"^\s*(?:cancel|stop|abort|nevermind|never\s+mind|停止|取消)\s*[.!。！]*\s*$",
+    re.IGNORECASE,
+)
+
 _SPOT_CHECK_KEYWORDS: tuple[str, ...] = (
+    "spot-check",
+    "spot check",
+    "only test tab4",
+    "tab4_spot_check",
+    "tab4 spot check",
     "仅测 tab4_专项测试表（非全量）",
     "tab4_专项测试表",
     "tab4",
@@ -47,8 +62,8 @@ def _extract_latest_user_utterance(conversation_text: str) -> str:
 
 
 def detect_spot_check_tab(conversation_text: str) -> str:
-    """Deterministically returns `TAB4_SPOT_CHECK_TITLE` (`'Tab4_专项测试表'`) if and only if the
-    current user turn explicitly requests the fixed spot-check / new-SOP test tab (`Tab4_专项测试表`),
+    """Deterministically returns `TAB4_SPOT_CHECK_TITLE` (`'Tab4_Spot_Check'`) if and only if the
+    current user turn explicitly requests the fixed spot-check / new-SOP test tab (`Tab4_Spot_Check`),
     preventing both prompt injection and LLM routing ambiguity.
     """
     latest = _extract_latest_user_utterance(conversation_text)
@@ -70,42 +85,45 @@ class TurnDecision(BaseModel):
 
     action: TurnAction = Field(
         description=(
-            "本轮用户意图分类：inspect=提供新的 Google Drive 文件夹/视频链接，或 GCS 目录（gs://存储桶/目录 或 Cloud Console Storage 链接）发起预检；"
-            "confirm=同意/确认启动刚才预检通过的稽核任务（如'确认开始'、'好'、'行吧那就跑'）；"
-            "status=询问当前正在运行的稽核任务进度或结果；"
-            "unclear=意图不明或缺少 Drive 链接 / GCS 目录，需礼貌反问。"
+            "Intent classification for the current user turn: "
+            "inspect = user provides a new Google Drive folder/video URL or GCS directory (gs://bucket/prefix or Cloud Console Storage URL) to run preflight; "
+            "confirm = user approves/confirms starting the audit job that just passed preflight (e.g., 'Confirm and start', 'start', 'confirm', 'yes', 'go ahead', 'proceed', 'run', 'ok', 'okay', '确认开始', '开始'); "
+            "status = user asks for the progress or result of a running/completed audit job; "
+            "unclear = user intent is unclear or missing a Drive link / GCS path (or user asks to cancel/stop without a running job), requiring a polite clarification prompt."
         )
     )
     drive_url: str = Field(
         default="",
         description=(
-            "当 action=inspect 时，逐字符原样提取对话中的 Google Drive 链接或文件夹 ID，或 GCS 路径（gs://... 或 Cloud Console Storage 链接）；"
-            "严禁改写或臆造。若对话中无链接则留空。"
+            "When action=inspect, extract the exact Google Drive URL/folder ID or GCS path (gs://... or Cloud Console Storage URL) character-for-character from the user turn; "
+            "never rewrite or fabricate URLs. Leave empty if no link is present."
         ),
     )
     job_id: str = Field(
         default="",
-        description="当用户明确提及 6 位任务单号时提取该单号，否则留空。",
+        description="Extract the 6-character hex job ID if explicitly mentioned by the user; otherwise leave empty.",
     )
     target_prompt_tab: str = Field(
         default="",
         description=(
-            "当用户明确要求使用 Tab4_专项测试表 进行专项抽检或新 SOP 测试时填入 'Tab4_专项测试表'；"
-            "日常完整全量稽核一律留空 ''。"
+            "Set to 'Tab4_Spot_Check' when the user explicitly requests a targeted spot-check or new SOP test using Tab4_Spot_Check (or legacy Tab4_专项测试表); "
+            "always leave empty '' for a standard full daily audit."
         ),
     )
     reply_summary: str = Field(
         default="",
-        description="用一句中文总结理解到的用户意图，或当 action=unclear 时向用户发出的追问提示。",
+        description="A concise one-sentence English summary of the recognized user intent, or a helpful English clarification prompt when action=unclear.",
     )
 
 
-_ROUTER_SYSTEM_INSTRUCTION = """你是霸王茶姬 (CHAGEE) 门店视频 AI 稽核助手的会话路由器。
-本系统采用严格的两步式受控工作流：
-- 第一步 (`inspect`)：督导粘贴个人专属 Google Drive 文件夹链接，或无 Google Workspace 时粘贴 GCS 目录（`gs://存储桶/目录` 或 Cloud Console Storage 链接），系统执行秒级 `<720P` 分辨率预检与 Token 报数；若用户消息中明确包含 `Tab4`、`Tab4_专项测试表` 或 `专项抽检`，则将 `target_prompt_tab` 设为 `"Tab4_专项测试表"`，否则 `target_prompt_tab` 必须为空字符串 `""`（日常全量稽核）；
-- 第二步 (`confirm`)：督导看到预检报告后表示同意（例如说“确认开始”、“好的”、“可以，跑吧”、“开始稽核”），系统才正式启动后台消音切片与 AI 稽核；
-- 查询进度 (`status`)：督导询问“跑完了吗”、“进度如何”。
-请严格按 `TurnDecision` JSON Schema 输出分类结果。注意：`drive_url`（Drive 链接或 GCS 路径）必须逐字符出现在用户输入中，严禁自己编造链接！"""
+TURN_CLASSIFIER_SYSTEM_INSTRUCTION = """You are the conversation turn router for the CHAGEE Store CCTV AI Auditor.
+This system enforces a strict two-step controlled workflow and understands both English and Chinese user inputs:
+- Step 1 (`inspect`): The supervisor pastes a Google Drive folder/video link or a GCS directory (`gs://bucket/prefix` or Cloud Console Storage URL). The system runs a fast `<720P` resolution preflight and token estimate. If the user's message explicitly mentions `Tab4`, `Tab4_Spot_Check`, `Spot-Check`, `Tab4_专项测试表`, or `专项抽检`, set `target_prompt_tab` to `"Tab4_Spot_Check"`; otherwise `target_prompt_tab` MUST be an empty string `""` (Full Daily Audit).
+- Step 2 (`confirm`): After reviewing the preflight report, the supervisor confirms starting the audit (e.g., "Confirm and start", "confirm", "start", "yes", "go ahead", "proceed", "run", "ok", "okay", "确认开始", "开始", "好的", "开始稽核"). Only then does the system launch background audio stripping, video slicing, and multimodal AI auditing.
+- Check Progress (`status`): The supervisor asks about progress or results (e.g., "What is the current progress?", "Is it done?", "进度如何", "跑完了吗").
+Output your classification strictly following the `TurnDecision` JSON Schema. IMPORTANT: `drive_url` (Drive link or GCS path) must appear character-for-character in the user's input — never fabricate or guess a link! Always write `reply_summary` in English."""
+
+_ROUTER_SYSTEM_INSTRUCTION = TURN_CLASSIFIER_SYSTEM_INSTRUCTION
 
 
 def verify_url_verbatim(decision: TurnDecision, raw_conversation_text: str) -> TurnDecision:
@@ -125,9 +143,9 @@ def verify_url_verbatim(decision: TurnDecision, raw_conversation_text: str) -> T
                 job_id="",
                 target_prompt_tab="",
                 reply_summary=(
-                    "未在您的消息中识别到有效的 Google Drive 文件夹链接或 GCS 目录。\n"
-                    f"• 💡 **如果您想完整稽核整个视频（日常全量稽核）**，请在 GE 对话框 `@` 本 Agent 输入：「`{agent_handle} 请帮忙稽核视频，<视频文件夹链接>`」\n"
-                    f"• 🧪 **如果您想做专项抽检或测试新 SOP**，请先在总控表 `Tab4_专项测试表` 更新规则，再 `@` 本 Agent（或点击【仅测 Tab4_专项测试表】气泡）输入：「`{agent_handle} 【仅测 Tab4_专项测试表】请帮忙稽核视频，<视频文件夹链接>`」"
+                    "No valid Google Drive folder link or GCS directory was detected in your message.\n"
+                    f"• 💡 **For a Full Daily Audit (all active SOP rules)**, `@` this Agent in the Gemini Enterprise chat box and enter: \"`{agent_handle} [Full Daily Audit] Please audit store videos: <video folder link>`\"\n"
+                    f"• 🧪 **For a Targeted Spot-Check or New SOP Test**, update rules in `{TAB4_SPOT_CHECK_TITLE}` of the Master Control Sheet first, then `@` this Agent (or click the `[Spot-Check Tab4 Only]` chip) and enter: \"`{agent_handle} [Spot-Check Tab4 Only (Non-Full)] Please audit store videos: <video folder link>`\""
                 ),
             )
         return decision.model_copy(
@@ -147,14 +165,23 @@ async def classify_turn_with_llm(
         return TurnDecision(
             action=TurnAction.UNCLEAR,
             reply_summary=(
-                f"请先在 Gemini Enterprise 对话框确认已选中或 `{agent_handle}`，并粘贴您需要稽核的监控视频文件夹链接：\n"
-                f"• 💡 **如果您想完整稽核整个视频（日常全量稽核）**，请在提示词中输入：「`{agent_handle} 请帮忙稽核视频，<视频文件夹链接>`」\n"
-                f"• 🧪 **如果您想做专项抽检或测试新 SOP**，请点击【仅测 Tab4_专项测试表】气泡（或 `{agent_handle}`）并贴上视频文件夹链接。"
+                f"Please make sure you have selected or mentioned `{agent_handle}` in the Gemini Enterprise chat box and paste the store CCTV video folder link you want to audit:\n"
+                f"• 💡 **For a Full Daily Audit (all active SOP rules)**, enter: \"`{agent_handle} [Full Daily Audit] Please audit store videos: <video folder link>`\"\n"
+                f"• 🧪 **For a Targeted Spot-Check or New SOP Test**, click the `[Spot-Check Tab4 Only (Non-Full)]` chip (or mention `{agent_handle}` with `{TAB4_SPOT_CHECK_TITLE}`) and paste your video folder link."
+            ),
+        )
+
+    latest_utterance = _extract_latest_user_utterance(cleaned)
+    if _CANCEL_RE.match(latest_utterance):
+        return TurnDecision(
+            action=TurnAction.UNCLEAR,
+            reply_summary=(
+                "Audit launch cancelled. Whenever you are ready, paste a Google Drive folder link or GCS directory (`gs://bucket/prefix`) to run a new preflight check, or reply '**Confirm and start**' to launch an existing preflighted job."
             ),
         )
 
     gen_config = types.GenerateContentConfig(
-        system_instruction=_ROUTER_SYSTEM_INSTRUCTION,
+        system_instruction=TURN_CLASSIFIER_SYSTEM_INSTRUCTION,
         response_mime_type="application/json",
         response_schema=TurnDecision,
         temperature=0.0,

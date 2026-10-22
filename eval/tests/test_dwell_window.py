@@ -77,7 +77,7 @@ class PartWindowTest(unittest.TestCase):
         it = _item("After spray sanitiser, do not wait for 5 minutes contact time before wiping", "12:56:00")
         pw = sr.part_time_window(it, it["parts"][0], "WINDOW")
         self.assertEqual((pw.before, pw.after, pw.dwell_sec, pw.dwell_source), (60, 330, 300, "label_text"))
-        self.assertEqual(pw.label(), "−60s / +330s（静置 5 分钟）")
+        self.assertEqual(pw.label(), "−60s / +330s (dwell 5 min)")
 
     def test_dwell_capped_at_span_max(self):
         it = _item("Langtuo: not wait 10 minutes before installing back", "12:00:00")
@@ -153,7 +153,7 @@ class Ic5aCaseTest(unittest.TestCase):
         self.assertEqual(part["candidate_ids"], ["F001"])
         self.assertEqual((part["window_before_sec"], part["window_after_sec"], part["dwell_sec"]), (60, 330, 300))
         self.assertEqual(part["window_sec"], 60)
-        self.assertEqual(part["window_label"], "−60s / +330s（静置 5 分钟）")
+        self.assertEqual(part["window_label"], "−60s / +330s (dwell 5 min)")
         self.assertEqual(rep["quality_metrics"]["dwell_parts_total"], 1)
         self.assertEqual(rep["quality_metrics"]["window_sec"], 60)
         self.assertEqual(rep["quality_metrics"]["point_window_sec"], 20)
@@ -161,7 +161,7 @@ class Ic5aCaseTest(unittest.TestCase):
         # F002 is +515s: outside the new window, and inside the near band (330 + 120 = 450)? no -> not listed
         self.assertEqual(part["near_misses"], [])
         md = sr.render_markdown("t", rep)
-        self.assertIn("WINDOW(−60s / +330s（静置 5 分钟）)", md)
+        self.assertIn("WINDOW(−60s / +330s (dwell 5 min))", md)
 
     def test_near_miss_relative_to_new_window(self):
         it = _item("do not wait for 5 minutes contact time before wiping", "13:31:25")
@@ -182,7 +182,7 @@ class Ic5aCaseTest(unittest.TestCase):
         self.assertEqual((part["window_before_sec"], part["window_after_sec"], part["dwell_sec"]), (60, 60, None))
         self.assertEqual(part["candidate_ids"], [])
         self.assertEqual([n.split()[0] for n in part["near_misses"]], ["F001", "F002"])
-        self.assertEqual(part["explanation"], "代码预筛：同一视频 ±60s 内没有任何 AI 条目")
+        self.assertEqual(part["explanation"], "No candidate findings within the temporal window (±60s) (Judge call skipped).")
         self.assertEqual(rep["quality_metrics"]["dwell_parts_total"], 0)
 
 

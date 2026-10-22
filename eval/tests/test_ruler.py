@@ -145,7 +145,7 @@ class ScoreRunTest(unittest.TestCase):
     def test_vote_median(self):
         out = sr.vote([[(0.0, "MATCH=NONE; a")], [(0.5, "MATCH=F1; b")], [(0.0, "MATCH=NONE; c")]])
         self.assertEqual(out[0][0], 0.0)
-        self.assertIn("取中位", out[0][1])
+        self.assertIn("median of", out[0][1])
         self.assertEqual(sr.vote([[(1.0, "x")]]), [(1.0, "x")])
 
     def test_off_scale_score_rejected(self):
@@ -310,7 +310,7 @@ class EvalRecordsTest(unittest.TestCase):
             ]
         }
         rec = mp.build_eval_monitoring_record(
-            project_id="example-project",
+            project_id="example-project-000000",
             round_id="r01",
             run_id="r01_b",
             model_version="gemini-3.8-flash",
@@ -413,27 +413,27 @@ class EvalRecordsTest(unittest.TestCase):
             score_doc=score_with_parts,
             golden_items=sample_golden,
             job_docs=job_docs,
-            agent_engine_id="9999999999999999999",
+            agent_engine_id="5931521464169725952",
         )
         self.assertEqual(len(items_spec), 1)
         self.assertEqual(items_spec[0]["part_id"], "R02_p0")
         self.assertIn("✓ 命中 (1.0)", items_spec[0]["formatted_response"])
-        self.assertEqual(items_spec[0]["agent_engine_id"], "9999999999999999999")
+        self.assertEqual(items_spec[0]["agent_engine_id"], "5931521464169725952")
 
         from types import SimpleNamespace
 
         fake_eval_client = mock.MagicMock()
         fake_eval_client.evals.create_evaluation_item.return_value = SimpleNamespace(
-            name="projects/123456789012/locations/us-central1/evaluationItems/111"
+            name="projects/596821501265/locations/us-central1/evaluationItems/111"
         )
         fake_eval_client.evals.create_evaluation_set.return_value = SimpleNamespace(
-            name="projects/123456789012/locations/us-central1/evaluationSets/222"
+            name="projects/596821501265/locations/us-central1/evaluationSets/222"
         )
         fake_eval_client.evals.create_evaluation_experiment.return_value = SimpleNamespace(
-            name="projects/123456789012/locations/us-central1/evaluationExperiments/333"
+            name="projects/596821501265/locations/us-central1/evaluationExperiments/333"
         )
         fake_eval_client.evals.create_evaluation_run.return_value = SimpleNamespace(
-            name="projects/123456789012/locations/us-central1/evaluationRuns/444"
+            name="projects/596821501265/locations/us-central1/evaluationRuns/444"
         )
         fake_storage_client = mock.MagicMock()
         with (
@@ -441,8 +441,8 @@ class EvalRecordsTest(unittest.TestCase):
             mock.patch("google.cloud.storage.Client", return_value=fake_storage_client),
         ):
             pub_res = mp.publish_agent_platform_evaluation(
-                project_id="example-project",
-                gcs_bucket="gs://example-project-tfstate",
+                project_id="example-project-000000",
+                gcs_bucket="gs://example-project-000000-tfstate",
                 round_id="r01",
                 run_id="r01_run1",
                 sop_version="v2.6_r01",
@@ -450,25 +450,25 @@ class EvalRecordsTest(unittest.TestCase):
                 score_doc=score_with_parts,
                 golden_items=sample_golden,
                 job_docs=job_docs,
-                agent_engine_id="9999999999999999999",
+                agent_engine_id="5931521464169725952",
             )
         self.assertEqual(
             pub_res,
             {
-                "experiment_name": "projects/123456789012/locations/us-central1/evaluationExperiments/333",
-                "evaluation_set_name": "projects/123456789012/locations/us-central1/evaluationSets/222",
-                "evaluation_run_name": "projects/123456789012/locations/us-central1/evaluationRuns/444",
+                "experiment_name": "projects/596821501265/locations/us-central1/evaluationExperiments/333",
+                "evaluation_set_name": "projects/596821501265/locations/us-central1/evaluationSets/222",
+                "evaluation_run_name": "projects/596821501265/locations/us-central1/evaluationRuns/444",
             },
         )
         exp_call_kwargs = fake_eval_client.evals.create_evaluation_experiment.call_args.kwargs
         self.assertIn("Recall 79.0%", exp_call_kwargs["display_name"])
         self.assertEqual(
             exp_call_kwargs["labels"]["vertex-ai-evaluation-agent-engine-id"],
-            "9999999999999999999",
+            "5931521464169725952",
         )
         self.assertEqual(
             exp_call_kwargs["labels"]["vertex-ai-evaluation-set-name"],
-            "projects/123456789012/locations/us-central1/evaluationSets/222",
+            "projects/596821501265/locations/us-central1/evaluationSets/222",
         )
 
     def test_run_sheet_triggered_eval_extracts_nested_metrics_from_mon_record(self):
@@ -604,13 +604,14 @@ class EvalRecordsTest(unittest.TestCase):
                 status_line="ok",
             )
             with (
-                patch.dict("os.environ", {"GCP_PROJECT": "example-project", "STAGING_BUCKET": "bkt"}),
+                patch.dict("os.environ", {"GCP_PROJECT": "example-project-000000", "STAGING_BUCKET": "bkt"}),
                 patch.object(rgr.PromptManager, "load_config_for_tab", _fake_load_cfg),
                 patch.object(rgr, "load_golden_source", return_value=("sheet", fake_golden_bundle)),
                 patch.object(rgr, "folder_specs_from_golden", return_value=[{"job_id": "job_01"}]),
                 patch.object(rgr, "evaluate_single_folder", _fake_eval_single_folder),
                 patch.object(rgr, "score_run", return_value=dict(score_with_parts)),
                 patch.object(rgr, "render_markdown", return_value="# Mock Report"),
+                patch.object(rgr, "THIS_DIR", td_path),
                 patch.object(rgr, "publish_run_sheet_report_safely", return_value=fake_sheet_outcome),
             ):
                 res = asyncio.run(

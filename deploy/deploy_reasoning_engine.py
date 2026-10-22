@@ -36,6 +36,9 @@ from typing import Any, Callable
 import google.auth
 import google.auth.transport.requests
 
+DISPLAY_NAME = "CHAGEE Store CCTV AI Auditor"
+DESCRIPTION = "Automated CCTV SOP compliance auditing for CHAGEE stores (24 SOP rules, timestamped video evidence clips, Token ledger & Supervisor Workbench)."
+
 CLASS_METHODS: list[dict[str, Any]] = [
     {
         "name": "streaming_agent_run_with_events",
@@ -218,11 +221,12 @@ def build_reasoning_engine_body(
     if service_account:
         spec["serviceAccount"] = service_account
 
+    brand_prefix = f"{_brand(company_name, tenant_label)} " if _brand(company_name, tenant_label) else ""
     return {
         "displayName": display_name,
         "description": (
-            f"{_brand(company_name, tenant_label)}门店 CCTV AI 合规稽核 Agent（Tier-1 GE 网关 + Tier-2 Cloud Run 弹性切片推理）。"
-            "支持 Google Drive 监控文件夹零 Token 预检、确认启动、进度查询及自动回写双页签 Google Sheet 报表。"
+            f"{brand_prefix}Store CCTV AI SOP Compliance Auditor (Tier-1 GE Gateway + Tier-2 Cloud Run Elastic Video Inference). "
+            "Supports zero-token Google Drive / GCS folder preflight, confirmation-gated execution, progress tracking, and dual-tab Google Sheet / Excel reporting."
         ),
         "spec": spec,
     }
@@ -367,15 +371,19 @@ def build_engine_prompt_chips(
         (
             "cctv-full-audit",
             {
-                "displayName": "门店视频日常全量稽核",
+                "displayName": "Full Daily Store Video Audit",
                 "defaultTexts": {
-                    "title": "门店视频日常全量稽核",
-                    "prefix": "请根据你要稽核的内容选择如下的气泡",
+                    "title": "Full Daily Store Video Audit",
+                    "prefix": "Select a prompt chip below based on the audit mode you want to run",
                     "suggestedPrompts": [
                         {
-                            "promptText": (
-                                "请帮忙稽核视频：<门店监控 Google Drive 文件夹链接或 gs:// 目录>"
-                            )
+                            "promptText": "[Full Daily Audit] Please audit store videos: "
+                        },
+                        {
+                            "promptText": "Confirm and start"
+                        },
+                        {
+                            "promptText": "What is the current progress?"
                         },
                     ],
                 },
@@ -385,16 +393,19 @@ def build_engine_prompt_chips(
         (
             "cctv-tab4-spot-check",
             {
-                "displayName": "专项抽检与新SOP测试",
+                "displayName": "Spot-Check Tab4 & New SOP Test",
                 "defaultTexts": {
-                    "title": "专项抽检与新SOP测试",
-                    "prefix": "请根据你要稽核的内容选择如下的气泡",
+                    "title": "Spot-Check Tab4 & New SOP Test",
+                    "prefix": "Select a prompt chip below based on the audit mode you want to run",
                     "suggestedPrompts": [
                         {
-                            "promptText": (
-                                "【仅测 Tab4_专项测试表（非全量）】"
-                                "请帮忙稽核视频：<门店监控 Google Drive 文件夹链接>"
-                            )
+                            "promptText": "[Spot-Check Tab4 Only (Non-Full)] Please audit store videos: "
+                        },
+                        {
+                            "promptText": "Confirm and start"
+                        },
+                        {
+                            "promptText": "What is the current progress?"
                         },
                     ],
                 },
@@ -617,13 +628,16 @@ def ensure_gemini_enterprise_and_bind_agent(
             continue
         target_engines.append(extra)
 
-    folder_example = example_folder_url or "<门店监控 Google Drive 文件夹链接或 gs:// 目录>"
+    folder_example = example_folder_url or "<Drive/GCS link>"
+    _ = folder_example
+    brand_label = f"{_brand(company_name, tenant_label)} " if _brand(company_name, tenant_label) else ""
     agent_payload = {
         "displayName": agent_display_name,
         "description": (
-            f"负责{tenant_label}门店 CCTV 监控视频 SOP 合规稽核。使用时请在 GE 对话框 @{agent_display_name}（或在左侧选中本 Agent）："
-            "日常完整稽核请输入「请帮忙稽核视频，<视频文件夹链接>」；特定 SOP 专项抽检或新 SOP 测试请先在总控表 Tab4_专项测试表 更新规则，"
-            "再点击【专项抽检与新SOP测试】气泡并粘贴链接。"
+            f"Automated CCTV SOP compliance auditing for {brand_label}stores (24 SOP rules, timestamped video evidence clips, Token ledger & Supervisor Workbench). "
+            f"To use, mention @{agent_display_name} in Gemini Enterprise (or select this Agent in the sidebar): "
+            "for a full SOP audit, enter 'Please audit store videos: <Drive/GCS link>'; for targeted SOP spot-checks or new SOP testing, update rules in Tab4_Spot_Check first, "
+            "then click the [Spot-Check Tab4 Only (Non-Full)] prompt chip and paste your link."
         ),
         "adkAgentDefinition": {
             "provisionedReasoningEngine": {
@@ -631,13 +645,18 @@ def ensure_gemini_enterprise_and_bind_agent(
             }
         },
         "state": "ENABLED",
-        "languageCode": "zh-CN",
+        "languageCode": "en-US",
         "sharingConfig": {"scope": "ALL_USERS"},
         "starterPrompts": [
-            {"text": f"请帮忙稽核视频：{folder_example}"},
-            {"text": "【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频：<门店监控 Google Drive 文件夹链接>"},
+            {"text": "[Full Daily Audit] Please audit store videos: "},
+            {"text": "[Spot-Check Tab4 Only (Non-Full)] Please audit store videos: "},
+            {"text": "Confirm and start"},
+            {"text": "What is the current progress?"},
         ],
-        "customPlaceholderText": "请根据你要稽核的内容选择如下的气泡",
+        "customPlaceholderText": (
+            "For a full SOP audit, enter 'Please audit store videos: <Drive/GCS link>'; "
+            "for targeted SOP spot-checks, click [Spot-Check Tab4 Only]."
+        ),
     }
 
     engine_cache: dict[str, dict[str, Any]] = {}
@@ -674,10 +693,15 @@ def ensure_gemini_enterprise_and_bind_agent(
                 # `state` is immutable on PATCH (HTTP 400 "updateMask contains an immutable path"); an agent
                 # created ENABLED stays ENABLED, so it is only sent when the agent is first created.
                 patch_body.pop("state", None)
-                # Preserve existing custom displayName if already set on a legacy engine
-                if ag.get("displayName"):
-                    patch_body["displayName"] = ag["displayName"]
-                    effective_agent_name = ag["displayName"]
+                # Preserve existing custom displayName on extra apps unless it is the old default Chinese display name
+                existing_disp = ag.get("displayName", "")
+                if existing_disp and existing_disp not in (
+                    "霸王茶姬 (CHAGEE) 门店监控 AI 稽核专家",
+                    "霸王茶姬 门店监控 AI 稽核专家",
+                    "CHAGEE 霸王茶姬 门店监控 AI 稽核专家",
+                ):
+                    patch_body["displayName"] = existing_disp
+                    effective_agent_name = existing_disp
                 patch_url = (
                     f"https://discoveryengine.googleapis.com/v1alpha/{existing_agent_name}"
                     "?updateMask=displayName,description,adkAgentDefinition,starterPrompts,customPlaceholderText"
@@ -748,8 +772,8 @@ def _add_ge_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ge-app-display-name", default="", help="Display name of a newly created GE app (default: the app ID)")
     p.add_argument(
         "--ge-agent-display-name",
-        default="",
-        help="Display name of a newly created agent; also identifies this stack's agent (default: '<app ID> agent')",
+        default=DISPLAY_NAME,
+        help="Display name of a newly created agent; also identifies this stack's agent (default: DISPLAY_NAME)",
     )
     p.add_argument("--ge-company-name", default="", help="commonConfig.companyName of a newly created GE app")
     p.add_argument("--ge-tenant-label", default="", help="Brand label used in agent/engine descriptions")
@@ -762,7 +786,7 @@ def _bind_from_args(args: argparse.Namespace, reasoning_engine_name: str) -> dic
         reasoning_engine_name=reasoning_engine_name,
         ge_engine_id=args.ge_engine_id,
         ge_display_name=args.ge_app_display_name or args.ge_engine_id,
-        agent_display_name=args.ge_agent_display_name or f"{args.ge_engine_id} agent",
+        agent_display_name=args.ge_agent_display_name or DISPLAY_NAME,
         company_name=args.ge_company_name,
         tenant_label=args.ge_tenant_label,
         example_folder_url=args.ge_example_folder_url,
@@ -1123,7 +1147,8 @@ def main(argv: list[str] | None = None) -> int:
     p_create.add_argument("--image-uri", required=True, help="Artifact Registry Docker image URI")
     p_create.add_argument(
         "--display-name",
-        required=True,
+        default=DISPLAY_NAME,
+        required=False,
         help="This stack's ReasoningEngine display name (main.tf: <name_prefix>-agent); the engine to update is found by it",
     )
     p_create.add_argument(

@@ -74,27 +74,27 @@ class ConfigParsingTest(unittest.TestCase):
         rows = [list(r) for r in rows]
         def find(first):
             return next(i for i, r in enumerate(rows) if r and r[0] == first)
-        rows[find("黄金集名称")][1] = "bad name!"
+        rows[find("Golden Set Name")][1] = "bad name!"
         rows[find("ga")][3] = "https://drive.google.com/x"
         rows[find("R02")][2] = "SOMETIMES"
-        rows.append(["gb", "X", "Y", "1FolderC_cccccccccc", ""])  # lands in [逐题设置] -> stable column bad
-        rows.append(["[未知分区]"])
+        rows.append(["gb", "X", "Y", "1FolderC_cccccccccc", ""])  # lands in [Per-Item Settings] -> stable column bad
+        rows.append(["[Unknown Section]"])
         with self.assertRaises(gsh.GoldenSheetError) as ctx:
             gsh.parse_config(rows)
         msg = str(ctx.exception)
-        self.assertIn(f"{gsh.CONFIG_TAB}!B{find('黄金集名称') + 1}", msg)
+        self.assertIn(f"{gsh.CONFIG_TAB}!B{find('Golden Set Name') + 1}", msg)
         self.assertIn(f"{gsh.CONFIG_TAB}!D{find('ga') + 1}", msg)
-        self.assertIn(f"{gsh.CONFIG_TAB}!C{find('R02') + 1}: 时间判定模式只能是", msg)
-        self.assertIn("不认识的分区 [未知分区]", msg)
+        self.assertIn(f"{gsh.CONFIG_TAB}!C{find('R02') + 1}: Temporal Mode must be", msg)
+        self.assertIn("Unknown section [Unknown Section]", msg)
 
     def test_missing_sections_and_header(self):
         with self.assertRaises(gsh.GoldenSheetError) as ctx:
-            gsh.parse_config([["[基本设置]"], ["项目", "值"], ["黄金集名称", "g1"]])
-        self.assertIn("缺少必填分区 [视频文件夹]", str(ctx.exception))
-        self.assertIn("缺少 标注页范围", str(ctx.exception))
+            gsh.parse_config([["[Basic Settings]"], ["Field", "Value"], ["Golden Set Name", "g1"]])
+        self.assertIn("Missing required section [Video Folders]", str(ctx.exception))
+        self.assertIn("Missing Label Range", str(ctx.exception))
         with self.assertRaises(gsh.GoldenSheetError) as ctx:
-            gsh.parse_config([["[视频文件夹]"], ["wrong", "header"]])
-        self.assertIn("表头应为", str(ctx.exception))
+            gsh.parse_config([["[Video Folders]"], ["wrong", "header"]])
+        self.assertIn("header should be", str(ctx.exception))
 
     def test_blank_and_comment_rows_are_ignored(self):
         rows = [["# note"], [], ["", ""]] + gsh.render_config_rows(_cfg()) + [[], ["# trailing"]]
@@ -140,7 +140,7 @@ class SheetToGoldenTest(unittest.TestCase):
         labels[3][5] = "B_clip1 .mov"
         with self.assertRaises(gsh.GoldenSheetError) as ctx:
             _load(labels=labels)
-        self.assertIn("必须完全一致", str(ctx.exception))
+        self.assertIn("must match verbatim", str(ctx.exception))
         self.assertIn("B_clip1 .mov", str(ctx.exception))
 
     def test_duplicate_filename_across_folders_fails(self):
@@ -148,7 +148,7 @@ class SheetToGoldenTest(unittest.TestCase):
         folders["1FolderB_bbbbbbbbbb"] = folders["1FolderB_bbbbbbbbbb"] + [{"id": "dup", "name": "A_clip1.mov"}]
         with self.assertRaises(gsh.GoldenSheetError) as ctx:
             _load(folders=folders)
-        self.assertIn("出现了不止一次", str(ctx.exception))
+        self.assertIn("appears more than once", str(ctx.exception))
 
     def test_unknown_item_in_settings_and_missing_tab_and_access(self):
         cfg = _cfg(items=[gsh.ItemSetting("R99", "X", "", False, 0)])
@@ -158,10 +158,10 @@ class SheetToGoldenTest(unittest.TestCase):
         sheets = FakeSheets({"Sheet1": LABELS})
         with self.assertRaises(gsh.GoldenSheetError) as ctx:
             gsh.load_golden_from_sheet(SID, sheets=sheets, drive=FakeDrive(FOLDERS))
-        self.assertIn(f"没有「{gsh.CONFIG_TAB}」页", str(ctx.exception))
+        self.assertIn(f"does not have an '{gsh.CONFIG_TAB}' tab", str(ctx.exception))
         with self.assertRaises(gsh.GoldenSheetError) as ctx:
             gsh.load_golden_from_sheet(SID, sheets=FakeSheets({}, fail_status=403), drive=FakeDrive(FOLDERS))
-        self.assertIn("共享给评测使用的 Workspace 身份", str(ctx.exception))
+        self.assertIn("evaluation Workspace identity", str(ctx.exception))
 
     def test_pure_human_labels_sheet_with_golden_videos_folder_id(self):
         """Verifies 3-path mode (`golden_videos_folder_id`): works without `测评配置` tab and supports 5-col & 6-col sheets."""
@@ -279,10 +279,10 @@ class InitConfigAndCheckTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             self.assertEqual(gsh.main(["check", "--sheet-id", SID], services=lambda: (sheets, drive)), 0)
         text = out.getvalue()
-        self.assertIn("黄金集版本: golden_demo@", text)
-        self.assertIn("题数 3 / 标注点 4", text)
-        self.assertIn("3 段视频，其中 2 段有标注、1 段无标注", text)
-        self.assertIn("合计 4 段视频", text)
+        self.assertIn("Golden Version: golden_demo@", text)
+        self.assertIn("Items 3 / Parts 4", text)
+        self.assertIn("3 videos, 2 labelled, 1 unlabelled", text)
+        self.assertIn("Total: 4 videos", text)
         bad_sheets, _ = _fakes(cfg=_cfg(expected_rows=5))
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
@@ -308,7 +308,7 @@ class RunnerSelectionTest(unittest.TestCase):
         cases = [
             (["--round", "r01", "--golden-sheet-id", SID, "--golden", "x.jsonl"], None, "只能选一个"),
             (["--round", "r01", "--golden-sheet-id", SID], (FakeSheets({"Sheet1": LABELS}), FakeDrive(FOLDERS)),
-             f"没有「{gsh.CONFIG_TAB}」页"),
+             f"does not have an '{gsh.CONFIG_TAB}' tab"),
         ]
         for argv, services, expect in cases:
             err = io.StringIO()
@@ -345,15 +345,15 @@ class SnapshotTabTest(unittest.TestCase):
 
         g = _load()
         t = srp.build_golden_snapshot_table(g.items, g.stable_baseline()[0])
-        self.assertEqual(t.title, "本次黄金集快照")
+        self.assertEqual(t.title, srp.TAB_GOLDEN)
         self.assertEqual([r[1] for r in t.rows[1:]], ["R02", "R03a", "R03b", "R04"])
         r02 = t.rows[1]
-        self.assertEqual((r02[t.col("SOP 大类")], r02[t.col("SOP 大类来源")]), ("A_Handwashing", "explicit"))
-        self.assertEqual((r02[t.col("时间判定模式")], r02[t.col("时间模式来源")]), ("POINT", "explicit"))
-        self.assertEqual(r02[t.col("稳定基线题")], "是")
+        self.assertEqual((r02[t.col("SOP Category")], r02[t.col("SOP Category Source")]), ("A_Handwashing", "explicit"))
+        self.assertEqual((r02[t.col("Temporal Mode")], r02[t.col("Temporal Mode Source")]), ("POINT", "explicit"))
+        self.assertEqual(r02[t.col("Stable Baseline Item")], "Yes")
         r03b = t.rows[3]
-        self.assertEqual(r03b[t.col("标注时间点 (OSD)")], "08:06:40")
-        self.assertEqual(r03b[t.col("SOP 大类来源")], "audit_clause")
+        self.assertEqual(r03b[t.col("Labelled Timestamp (OSD)")], "08:06:40")
+        self.assertEqual(r03b[t.col("SOP Category Source")], "audit_clause")
 
 
 if __name__ == "__main__":

@@ -226,12 +226,12 @@ def _build_workspace_credentials(subject: str, dwd_sa: str) -> Any:
     if not subject:
         creds = credentials_without_quota_project()
         if creds is None:
-            raise WorkspaceAuthError("无法获取运行时服务账号凭证（ADC 不可用）")
+            raise WorkspaceAuthError("Failed to obtain runtime service account credentials (ADC unavailable)")
         return creds
     if not dwd_sa:
         raise WorkspaceAuthError(
-            "已设置 WORKSPACE_IMPERSONATE_USER，但缺少 WORKSPACE_DWD_SERVICE_ACCOUNT"
-            "（被授权域级委派的服务账号邮箱）"
+            "WORKSPACE_IMPERSONATE_USER is set, but WORKSPACE_DWD_SERVICE_ACCOUNT "
+            "(the service account email authorized for domain-wide delegation) is missing"
         )
     from google.auth import impersonated_credentials
 
@@ -250,29 +250,29 @@ def _build_workspace_credentials(subject: str, dwd_sa: str) -> Any:
 def _explain_refresh_error(exc: Exception, subject: str, dwd_sa: str) -> str:
     raw = str(exc)
     if not subject:
-        return f"服务账号获取 Workspace 访问令牌失败：{raw}"
+        return f"Service account failed to obtain Workspace access token: {raw}"
     if "unauthorized_client" in raw:
         return (
-            "域级委派尚未生效：请 Workspace 超级管理员在 admin.google.com → 安全 → API 控制 → "
-            f"全网域委派 中，为服务账号 {dwd_sa} 的客户端 ID 授权 scopes "
-            f"{','.join(_WORKSPACE_SCOPES)}（原始错误：{raw}）"
+            "Domain-Wide Delegation (DWD) is not yet active: ask a Workspace Super Admin to authorize "
+            f"the Client ID of service account {dwd_sa} in admin.google.com -> Security -> API controls -> "
+            f"Domain-wide delegation for scopes {','.join(_WORKSPACE_SCOPES)} (raw error: {raw})"
         )
     if "invalid_grant" in raw:
         return (
-            f"被代表账号 {subject} 无法使用：账号不存在、已停用，或不属于授权域级委派的 Workspace 域"
-            f"（原始错误：{raw}）"
+            f"Impersonated user {subject} cannot be used: the account does not exist, is suspended, "
+            f"or does not belong to the Workspace domain authorized for DWD (raw error: {raw})"
         )
     if "SERVICE_DISABLED" in raw or "has not been used in project" in raw:
         return (
-            "项目未启用 IAM Service Account Credentials API（iamcredentials.googleapis.com），"
-            f"无法无密钥签名：请启用后重试（原始错误：{raw}）"
+            "IAM Service Account Credentials API (iamcredentials.googleapis.com) is not enabled in the project "
+            f"for keyless JWT signing: please enable it and retry (raw error: {raw})"
         )
     if "signJwt" in raw or "PERMISSION_DENIED" in raw:
         return (
-            f"运行时服务账号没有 {dwd_sa} 的 roles/iam.serviceAccountTokenCreator 权限，无法签名"
-            f"（原始错误：{raw}）"
+            f"Runtime service account lacks roles/iam.serviceAccountTokenCreator on {dwd_sa} and cannot sign JWTs "
+            f"(raw error: {raw})"
         )
-    return f"以 {subject} 身份获取 Workspace 访问令牌失败：{raw}"
+    return f"Failed to obtain Workspace access token as {subject}: {raw}"
 
 
 _workspace_creds_lock = threading.Lock()
@@ -417,7 +417,7 @@ def workspace_principal() -> str:
     if dwd_sa:
         return dwd_sa
     email = str(getattr(_workspace_creds, "service_account_email", "") or "")
-    return email if "@" in email else "运行时服务账号"
+    return email if "@" in email else "runtime service account"
 
 
 def _http_status(exc: BaseException) -> Optional[int]:
@@ -446,10 +446,10 @@ def _is_storage_quota_error(exc: BaseException) -> bool:
 def _storage_quota_message() -> str:
     subject, _ = workspace_identity()
     if subject:
-        return f"Drive 拒绝写入：被代表账号 {subject} 的云端硬盘空间已满或未开通 Drive，请清理或扩容后重试"
+        return f"Drive write rejected: Google Drive storage for impersonated account {subject} is full or Drive is not enabled; please free up space or upgrade storage and retry"
     return (
-        "Drive 拒绝写入：服务账号没有云端硬盘空间（Google 规定），不能在个人 My Drive 里新建表格"
-        "或上传视频。请管理员配置域级委派（Terraform 变量 workspace_impersonate_user）后重试"
+        "Drive write rejected: service accounts do not have Google Drive storage quota and cannot create new Sheets "
+        "or upload clips inside a personal My Drive. Please ask an administrator to configure Domain-Wide Delegation (Terraform variable workspace_impersonate_user) and retry"
     )
 
 
@@ -466,13 +466,13 @@ def _classify_write_error(exc: BaseException, folder_id: str) -> BaseException:
     who = workspace_principal()
     if status == 404:
         return WorkspaceAccessError(
-            f"找不到文件夹 `{folder_id}`，或 `{who}` 没有访问权限："
-            f"请在 Google Drive 里把该文件夹以「编辑者」身份共享给 `{who}`"
+            f"Folder `{folder_id}` not found, or `{who}` does not have access: "
+            f"please share the folder in Google Drive with `{who}` as 'Editor'"
         )
     if status == 403 and "insufficient" in _http_error_text(exc).lower():
         return WorkspaceAccessError(
-            f"`{who}` 对文件夹 `{folder_id}` 只有查看权限，无法写入报告和证据视频："
-            "请把共享权限改为「编辑者」"
+            f"`{who}` only has Viewer access to folder `{folder_id}` and cannot write reports or evidence clips: "
+            "please change its sharing permission to 'Editor'"
         )
     return exc
 
@@ -488,6 +488,45 @@ def _reraise_as_config_error(exc: BaseException, folder_id: str) -> NoReturn:
 _FOLDER_MIME = "application/vnd.google-apps.folder"
 _SPREADSHEET_MIME = "application/vnd.google-apps.spreadsheet"
 _WRITE_PROBE_NAME = ".cctv_audit_write_probe"
+
+REPORT_SHEET_TITLE = "📊 AI_Audit_Report_and_Token_Ledger"
+LEGACY_REPORT_SHEET_TITLES = ("📊 AI_Audit_Report_and_Token_Ledger", "📊 AI稽核报告与Token账单")
+EVIDENCE_SUBFOLDER_NAME = "📁 Evidence_Clips"
+LEGACY_EVIDENCE_SUBFOLDER_NAMES = ("📁 Evidence_Clips", "Evidence_Clips", "📁 违规证据切片_Evidence", "📁 违规证据切片")
+TAB1_TITLE = "Tab1_Violation_Review"
+LEGACY_TAB1_TITLES = ("Tab1_Violation_Review", "违规事件 3 秒复核台")
+TAB2_TITLE = "Tab2_Token_Ledger"
+LEGACY_TAB2_TITLES = ("Tab2_Token_Ledger", "本次视频 Token 消耗与耗时账单")
+TAB1_HEADERS = [
+    "Store/Folder Name",
+    "Video Filename",
+    "Violation Timestamp (MM:SS)",
+    "SOP Rule ID",
+    "Severity",
+    "Violation Description & Timestamped Trajectory",
+    "Evidence Clip Link (Click to Play)",
+    "Audited Prompt Version",
+    "Audited Model Version",
+    "Supervisor Review Status (Dropdown)",
+    "Supervisor Review Note",
+]
+TAB2_HEADERS = [
+    "Store/Folder Name",
+    "Video Filename",
+    "Video Duration (sec)",
+    "Media Processing Mode",
+    "Input Tokens",
+    "Thinking Tokens",
+    "Output Tokens",
+    "Total Tokens",
+    "Estimated Cost (USD)",
+    "Inference Time (sec)",
+    "Violations Found",
+    "Audit Completion Time (UTC)",
+    "Audited Prompt Version",
+    "Audited Model Version",
+]
+REVIEW_STATUS_OPTIONS = ["PENDING", "✅ CONFIRMED", "❌ FALSE_POSITIVE", "⚠️ FOLLOWUP"]
 
 
 from .video_ingestor import VideoMetadataItem
@@ -538,12 +577,12 @@ class GoogleWorkspaceGateway:
         name = str(meta.get("name") or folder_id)
         if meta.get("mimeType") != _FOLDER_MIME:
             raise WorkspaceAccessError(
-                f"链接指向的是文件「{name}」，不是文件夹：请发送存放监控视频的 Google Drive 文件夹链接"
+                f"The link points to a file '{name}', not a folder: please send the Google Drive folder link containing the CCTV videos"
             )
         if not (meta.get("capabilities") or {}).get("canAddChildren"):
             raise WorkspaceAccessError(
-                f"`{who}` 对文件夹「{name}」只有查看权限，无法写入报告和证据视频："
-                "请把共享权限改为「编辑者」"
+                f"`{who}` only has Viewer access to folder '{name}' and cannot write reports or evidence clips: "
+                "please change its sharing permission to 'Editor'"
             )
         if not workspace_identity()[0] and not meta.get("driveId"):
             # A bare SA can never own a non-folder file in My Drive; say so before trying.
@@ -611,17 +650,17 @@ class GoogleWorkspaceGateway:
                 if _http_status(exc) == 404:
                     who = workspace_principal()
                     raise WorkspaceAccessError(
-                        f"读不到 SOP 总控表 `{sheet_id}`：请把它以「查看者」（或以上）身份共享给 `{who}`"
+                        f"Cannot read Master SOP Sheet `{sheet_id}`: please share it with `{who}` as 'Viewer' (or higher)"
                     ) from exc
                 raise
             name = str(meta.get("name") or sheet_id)
             mime = meta.get("mimeType")
             if mime and mime != _SPREADSHEET_MIME:
                 raise WorkspaceAccessError(
-                    f"SOP 总控表「{name}」(`{sheet_id}`) 当前不是原生 Google 表格（当前格式：`{mime}`，"
-                    "例如直接上传的 `.xlsx` 文件左上角会带有 `.XLSX` 标记），Google Sheets API 无法直接读取："
-                    "请在浏览器打开它，点击左上角「文件 (File) → 另存为 Google 表格 (Save as Google Sheets)」，"
-                    "然后把新生成的 Google 表格 ID 填入 `master_prompt_sheet_id` 并共享给运行身份"
+                    f"Master SOP Sheet '{name}' (`{sheet_id}`) is not a native Google Sheet (current format: `{mime}`, "
+                    "e.g. a directly uploaded `.xlsx` file shows an `.XLSX` badge in the top-left corner) and cannot be read directly by the Google Sheets API: "
+                    "please open it in your browser, click 'File -> Save as Google Sheets', "
+                    "then set `master_prompt_sheet_id` to the new Google Sheet ID and share it with the runtime identity"
                 )
             return name
 
@@ -694,7 +733,13 @@ class GoogleWorkspaceGateway:
                 )
                 .execute(num_retries=3)
             )
-            raw_files = res.get("files", [])
+            raw_files = [
+                f
+                for f in res.get("files", [])
+                if str(f.get("name") or "").strip() not in LEGACY_EVIDENCE_SUBFOLDER_NAMES
+                and "Evidence_Clips" not in str(f.get("name") or "")
+                and "违规证据切片" not in str(f.get("name") or "")
+            ]
             missing_ids: List[str] = []
             for f in raw_files:
                 meta = f.get("videoMediaMetadata", {})
@@ -743,6 +788,10 @@ class GoogleWorkspaceGateway:
 
         return await loop.run_in_executor(None, _fetch)
 
+    async def list_videos_in_folder(self, folder_id: str) -> List[VideoMetadataItem]:
+        """Alias for `list_folder_videos`."""
+        return await self.list_folder_videos(folder_id)
+
     async def download_video_to_path(self, file_id: str, dest_path: Path) -> Path:
         import httpx
 
@@ -774,7 +823,7 @@ class GoogleWorkspaceGateway:
             drive = self._drive_service()
             q = (
                 f"'{parent_folder_id}' in parents and "
-                f"(name='{name}' or name contains '违规证据切片_Evidence') and "
+                f"(name='{name}' or name contains 'Evidence_Clips' or name contains '违规证据切片') and "
                 f"mimeType='application/vnd.google-apps.folder' and trashed=false"
             )
             res = (
@@ -908,13 +957,14 @@ class GoogleWorkspaceGateway:
             sheets = self._sheets_service()
             sid = ""
             surl = ""
-            tab1_title = "违规事件 3 秒复核台"
-            tab2_title = "本次视频 Token 消耗与耗时账单"
+            tab1_title = TAB1_TITLE
+            tab2_title = TAB2_TITLE
             created_new_sheet = False
 
             # 1. Resume / fixed-title idempotency: reuse the folder's report Sheet whose name
-            #    equals `title` (e.g. `📊 AI稽核报告与Token账单`) or ends with `reuse_suffix`.
-            #    Unrelated spreadsheets in the folder (e.g. "门店排班表") never match.
+            #    equals `title` (or a legacy report title) or ends with `reuse_suffix`.
+            #    Unrelated spreadsheets in the folder (e.g. "Store Roster") never match.
+            accepted_titles = {title, *LEGACY_REPORT_SHEET_TITLES}
             page_token = None
             while not sid:
                 page = (
@@ -932,14 +982,22 @@ class GoogleWorkspaceGateway:
                     )
                     .execute(num_retries=3)
                 )
-                for f in page.get("files", []):
-                    fname = str(f.get("name", ""))
-                    if fname == title or (reuse_suffix and fname.endswith(reuse_suffix)):
-                        sid = f["id"]
-                        surl = (
-                            f.get("webViewLink")
-                            or f"https://docs.google.com/spreadsheets/d/{sid}/edit"
-                        )
+                files = page.get("files", [])
+                # Prefer exact `title` (`REPORT_SHEET_TITLE`) match first, then legacy titles or `reuse_suffix`
+                for candidate_check in (
+                    lambda fn: fn == title or (reuse_suffix and fn.endswith(reuse_suffix)),
+                    lambda fn: fn in accepted_titles,
+                ):
+                    for f in files:
+                        fname = str(f.get("name", ""))
+                        if candidate_check(fname):
+                            sid = f["id"]
+                            surl = (
+                                f.get("webViewLink")
+                                or f"https://docs.google.com/spreadsheets/d/{sid}/edit"
+                            )
+                            break
+                    if sid:
                         break
                 page_token = page.get("nextPageToken")
                 if not page_token:
@@ -969,12 +1027,21 @@ class GoogleWorkspaceGateway:
                 surl = res.get("webViewLink") or f"https://docs.google.com/spreadsheets/d/{sid}/edit"
                 created_new_sheet = True
 
-            # 3. Ensure both target tabs exist on spreadsheet `sid`
+            # 3. Ensure both target tabs exist on spreadsheet `sid` (honoring legacy tab titles if already present)
             meta = sheets.spreadsheets().get(spreadsheetId=sid).execute(num_retries=3)
             existing_sheets = meta.get("sheets", [])
             existing_titles = {
                 s.get("properties", {}).get("title", "") for s in existing_sheets
             }
+            if not created_new_sheet:
+                for leg_t1 in LEGACY_TAB1_TITLES:
+                    if leg_t1 in existing_titles:
+                        tab1_title = leg_t1
+                        break
+                for leg_t2 in LEGACY_TAB2_TITLES:
+                    if leg_t2 in existing_titles:
+                        tab2_title = leg_t2
+                        break
             requests_body = []
 
             if created_new_sheet and existing_sheets:
@@ -1016,11 +1083,12 @@ class GoogleWorkspaceGateway:
             kept_tab2_rows: List[List[Any]] = []
             if not created_new_sheet and audited_video_filenames:
                 try:
-                    if tab1_title in existing_titles:
+                    read_t1 = next((t for t in LEGACY_TAB1_TITLES if t in existing_titles), tab1_title)
+                    if read_t1 in existing_titles:
                         res1 = (
                             sheets.spreadsheets()
                             .values()
-                            .get(spreadsheetId=sid, range=f"'{tab1_title}'!A2:K")
+                            .get(spreadsheetId=sid, range=f"'{read_t1}'!A2:K")
                             .execute(num_retries=3)
                         )
                         for raw_row in res1.get("values", []) or []:
@@ -1035,12 +1103,15 @@ class GoogleWorkspaceGateway:
                                     padded[6] = float(padded[6] or 0.0)
                                 except (TypeError, ValueError):
                                     padded[6] = 0.0
+                                if not str(padded[9]).strip():
+                                    padded[9] = "PENDING"
                                 kept_tab1_rows.append(padded)
-                    if tab2_title in existing_titles:
+                    read_t2 = next((t for t in LEGACY_TAB2_TITLES if t in existing_titles), tab2_title)
+                    if read_t2 in existing_titles:
                         res2 = (
                             sheets.spreadsheets()
                             .values()
-                            .get(spreadsheetId=sid, range=f"'{tab2_title}'!A2:O")
+                            .get(spreadsheetId=sid, range=f"'{read_t2}'!A2:O")
                             .execute(num_retries=3)
                         )
                         for raw_row in res2.get("values", []) or []:
@@ -1083,21 +1154,9 @@ class GoogleWorkspaceGateway:
                     body={"ranges": [f"'{tab1_title}'", f"'{tab2_title}'"]},
                 ).execute(num_retries=3)
 
-            # 4. Clear & write Tab 1 (`违规事件 3 秒复核台`) and Tab 2 (`本次视频 Token 消耗与耗时账单`)
+            # 4. Clear & write Tab 1 (`Tab1_Violation_Review`) and Tab 2 (`Tab2_Token_Ledger`)
             tab1_values: List[List[Any]] = [
-                [
-                    "稽核单号 (Audit_ID)",
-                    "监控原片 (Video_Filename)",
-                    "违规时间点 (Timestamp)",
-                    "SOP条款 (Rule_ID)",
-                    "判定类型 (Disposition)",
-                    "严重等级 (Severity)",
-                    "置信度 (Confidence)",
-                    "AI稽核证据描述 (Evidence_Description)",
-                    "20秒证据视频链接 (Evidence_Drive_URL)",
-                    "人工复核状态 (Human_Review_Status)",
-                    "人工复核备注 (Human_Review_Note)",
-                ],
+                list(TAB1_HEADERS),
                 *kept_tab1_rows,
             ]
             for r in tab1_rows:
@@ -1112,29 +1171,13 @@ class GoogleWorkspaceGateway:
                         float(getattr(r, "confidence", 0.0)),
                         str(getattr(r, "evidence_description", "")),
                         str(getattr(r, "evidence_drive_url", "")),
-                        str(getattr(r, "human_review_status", "")),
+                        str(getattr(r, "human_review_status", "") or "PENDING"),
                         str(getattr(r, "human_review_note", "") or ""),
                     ]
                 )
 
             tab2_values: List[List[Any]] = [
-                [
-                    "稽核单号 (Audit_ID)",
-                    "文件夹ID (Folder_ID)",
-                    "监控原片 (Video_Filename)",
-                    "切片时长秒 (Duration_Sec)",
-                    "分辨率 (Resolution)",
-                    "实际调用模型 (Model_Version)",
-                    "实际调用Prompt (Prompt_Version)",
-                    "输入Token (Prompt_Tokens)",
-                    "思考Token (Thoughts_Tokens)",
-                    "输出Token (Candidates_Tokens)",
-                    "总Token (Total_Tokens)",
-                    "预估成本USD (Cost_USD)",
-                    "端到端耗时ms (Latency_ms)",
-                    "检出事件数 (Flagged_Events)",
-                    "降级告警 (Fallback_Warning)",
-                ],
+                list(TAB2_HEADERS),
                 *kept_tab2_rows,
             ]
             for r in tab2_rows:
@@ -1195,8 +1238,14 @@ class GoogleWorkspaceGateway:
             )
             .execute(num_retries=3)
         )
-        for f in res.get("files", []) or []:
-            if "AI稽核报告与Token账单" in str(f.get("name") or ""):
+        files = res.get("files", []) or []
+        for f in files:
+            fname = str(f.get("name") or "")
+            if fname == REPORT_SHEET_TITLE or "AI_Audit_Report_and_Token_Ledger" in fname:
+                return str(f.get("id") or "")
+        for f in files:
+            fname = str(f.get("name") or "")
+            if fname in LEGACY_REPORT_SHEET_TITLES or "AI稽核报告与Token账单" in fname:
                 return str(f.get("id") or "")
         return ""
 
@@ -1212,18 +1261,31 @@ class GoogleWorkspaceGateway:
             sid = self._resolve_report_sheet_id_sync(parent_folder_id, sheet_id_or_url)
             if not sid:
                 return [], []
-            tab1_title = "违规事件 3 秒复核台"
-            tab2_title = "本次视频 Token 消耗与耗时账单"
             sheets = self._sheets_service()
-            res = (
-                sheets.spreadsheets()
-                .values()
-                .batchGet(
-                    spreadsheetId=sid,
-                    ranges=[f"'{tab1_title}'!A2:K", f"'{tab2_title}'!A2:O"],
+            tab1_title = TAB1_TITLE
+            tab2_title = TAB2_TITLE
+            try:
+                res = (
+                    sheets.spreadsheets()
+                    .values()
+                    .batchGet(
+                        spreadsheetId=sid,
+                        ranges=[f"'{tab1_title}'!A2:K", f"'{tab2_title}'!A2:O"],
+                    )
+                    .execute(num_retries=3)
                 )
-                .execute(num_retries=3)
-            )
+            except Exception:
+                tab1_title = "违规事件 3 秒复核台"
+                tab2_title = "本次视频 Token 消耗与耗时账单"
+                res = (
+                    sheets.spreadsheets()
+                    .values()
+                    .batchGet(
+                        spreadsheetId=sid,
+                        ranges=[f"'{tab1_title}'!A2:K", f"'{tab2_title}'!A2:O"],
+                    )
+                    .execute(num_retries=3)
+                )
             val_ranges = res.get("valueRanges", []) or []
             raw_t1 = (val_ranges[0].get("values", []) if len(val_ranges) > 0 else []) or []
             raw_t2 = (val_ranges[1].get("values", []) if len(val_ranges) > 1 else []) or []
@@ -1259,15 +1321,24 @@ class GoogleWorkspaceGateway:
 
             sid = self._resolve_report_sheet_id_sync(parent_folder_id, sheet_id_or_url)
             if not sid:
-                raise WorkspaceAccessError("找不到该门店的稽核报告 Google Sheet，无法回写人工复核结果")
-            tab1_title = "违规事件 3 秒复核台"
+                raise WorkspaceAccessError("Could not find the store's audit report Google Sheet to write back human review decisions")
+            tab1_title = TAB1_TITLE
             sheets = self._sheets_service()
-            res1 = (
-                sheets.spreadsheets()
-                .values()
-                .get(spreadsheetId=sid, range=f"'{tab1_title}'!A2:K")
-                .execute(num_retries=3)
-            )
+            try:
+                res1 = (
+                    sheets.spreadsheets()
+                    .values()
+                    .get(spreadsheetId=sid, range=f"'{tab1_title}'!A2:K")
+                    .execute(num_retries=3)
+                )
+            except Exception:
+                tab1_title = "违规事件 3 秒复核台"
+                res1 = (
+                    sheets.spreadsheets()
+                    .values()
+                    .get(spreadsheetId=sid, range=f"'{tab1_title}'!A2:K")
+                    .execute(num_retries=3)
+                )
             raw_rows = res1.get("values", []) or []
             _, patches = match_and_apply_tab1_reviews(raw_rows, updates)
             if not patches:

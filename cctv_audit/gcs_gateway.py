@@ -46,11 +46,18 @@ logger = logging.getLogger("cctv_audit.gcs_gateway")
 
 # Internal prefixes of the staging bucket; the whole bucket is refused (30-day auto-delete).
 INTERNAL_STATE_PREFIXES: Tuple[str, ...] = ("jobs", "eval", "smoke", "agent_platform_eval")
-EVIDENCE_DIR_MARKER = "违规证据切片_Evidence"
+REPORT_SHEET_TITLE = "📊 AI_Audit_Report_and_Token_Ledger"
+LEGACY_REPORT_SHEET_TITLES = ("📊 AI_Audit_Report_and_Token_Ledger", "📊 AI稽核报告与Token账单")
+EVIDENCE_SUBFOLDER_NAME = "📁 Evidence_Clips"
+LEGACY_EVIDENCE_SUBFOLDER_NAMES = ("📁 Evidence_Clips", "Evidence_Clips", "📁 违规证据切片_Evidence", "📁 违规证据切片")
+EVIDENCE_DIR_MARKER = "Evidence_Clips"
 WRITE_PROBE_OBJECT = ".cctv_audit_write_probe"
 XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-TAB1_TITLE = "违规事件 3 秒复核台"
-TAB2_TITLE = "本次视频 Token 消耗与耗时账单"
+TAB1_TITLE = "Tab1_Violation_Review"
+LEGACY_TAB1_TITLES = ("Tab1_Violation_Review", "违规事件 3 秒复核台")
+TAB2_TITLE = "Tab2_Token_Ledger"
+LEGACY_TAB2_TITLES = ("Tab2_Token_Ledger", "本次视频 Token 消耗与耗时账单")
+REVIEW_STATUS_OPTIONS = ["PENDING", "✅ CONFIRMED", "❌ FALSE_POSITIVE", "⚠️ FOLLOWUP"]
 _VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".avi", ".mkv", ".ts")
 _DOWNLOAD_CHUNK = 4 * 1024 * 1024
 _STORAGE_API = "https://storage.googleapis.com/storage/v1"
@@ -71,7 +78,7 @@ def parse_gcs_uri_with_generation(uri: str) -> Tuple[str, str, Optional[str]]:
     except ValueError as exc:
         raise WorkspaceAccessError(str(exc)) from exc
     if canonical is None:
-        raise WorkspaceAccessError(f"不是有效的 GCS 路径（应为 `gs://存储桶/目录`）：`{uri}`")
+        raise WorkspaceAccessError(f"Not a valid GCS URI (expected `gs://bucket/prefix`): `{uri}`")
     base, generation = split_generation(canonical)
     bucket, _, prefix = base[len(GCS_SCHEME):].partition("/")
     return bucket, prefix.strip("/"), (generation or None)
@@ -129,17 +136,17 @@ def _assert_not_internal_state_prefix(bucket: str, prefix: str) -> None:
     if norm_prefix == "config" or norm_prefix.startswith("config/"):
         shown = f"gs://{bucket}/{norm_prefix}"
         raise WorkspaceAccessError(
-            f"`{shown}` 位于本稽核服务的内部配置目录（`config/`），"
-            "不能存放门店视频、稽核报告或 SOP 配置文件：请改用门店目录（例如 `gs://<客户存储桶>/stores/门店名/`）"
+            f"`{shown}` is inside the audit service's internal configuration directory (`config/`) "
+            "and cannot store store videos, audit reports, or SOP workbooks: please use a store prefix (e.g. `gs://<customer-bucket>/stores/store_name/`)"
         )
     staging = _staging_bucket_name()
     if not staging or bucket.lower() != staging:
         return
     shown = f"gs://{bucket}/{prefix}".rstrip("/")
     raise WorkspaceAccessError(
-        f"`{shown}` 位于本稽核服务的内部暂存存储桶（存放任务状态与临时切片，30 天后自动删除），"
-        "不能存放门店视频、稽核报告或 SOP 配置文件：请改用客户自己的存储桶（例如 "
-        "`gs://<客户存储桶>/stores/门店名/`、`gs://<客户存储桶>/sop/master_sheet.xlsx`）后重新发送"
+        f"`{shown}` is inside the audit service's internal staging bucket (used for job state and temporary slices, auto-deleted after 30 days) "
+        "and cannot store store videos, audit reports, or SOP workbooks: please use your own customer bucket (e.g. "
+        "`gs://<customer-bucket>/stores/store_name/`, `gs://<customer-bucket>/sop/master_sheet.xlsx`) and resend"
     )
 
 
@@ -152,41 +159,40 @@ def _object_parent(obj: str) -> str:
 # --------------------------------------------------------------------------------------------
 
 TAB1_HEADERS = [
-    "稽核单号 (Audit_ID)",
-    "监控原片 (Video_Filename)",
-    "违规时间点 (Timestamp)",
-    "SOP条款 (Rule_ID)",
-    "判定类型 (Disposition)",
-    "严重等级 (Severity)",
-    "置信度 (Confidence)",
-    "AI稽核证据描述 (Evidence_Description)",
-    "20秒证据视频链接 (Evidence_Drive_URL)",
-    "人工复核状态 (Human_Review_Status)",
-    "人工复核备注 (Human_Review_Note)",
+    "Store/Folder Name",
+    "Video Filename",
+    "Violation Timestamp (MM:SS)",
+    "SOP Rule ID",
+    "Severity",
+    "Violation Description & Timestamped Trajectory",
+    "Evidence Clip Link (Click to Play)",
+    "Audited Prompt Version",
+    "Audited Model Version",
+    "Supervisor Review Status (Dropdown)",
+    "Supervisor Review Note",
 ]
 TAB2_HEADERS = [
-    "稽核单号 (Audit_ID)",
-    "文件夹ID (Folder_ID)",
-    "监控原片 (Video_Filename)",
-    "切片时长秒 (Duration_Sec)",
-    "分辨率 (Resolution)",
-    "实际调用模型 (Model_Version)",
-    "实际调用Prompt (Prompt_Version)",
-    "输入Token (Prompt_Tokens)",
-    "思考Token (Thoughts_Tokens)",
-    "输出Token (Candidates_Tokens)",
-    "总Token (Total_Tokens)",
-    "预估成本USD (Cost_USD)",
-    "端到端耗时ms (Latency_ms)",
-    "检出事件数 (Flagged_Events)",
-    "降级告警 (Fallback_Warning)",
+    "Store/Folder Name",
+    "Video Filename",
+    "Video Duration (sec)",
+    "Media Processing Mode",
+    "Input Tokens",
+    "Thinking Tokens",
+    "Output Tokens",
+    "Total Tokens",
+    "Estimated Cost (USD)",
+    "Inference Time (sec)",
+    "Violations Found",
+    "Audit Completion Time (UTC)",
+    "Audited Prompt Version",
+    "Audited Model Version",
 ]
 TAB1_WIDTHS = [22, 28, 16, 14, 16, 12, 10, 60, 48, 28, 36]
 TAB2_WIDTHS = [22, 36, 28, 12, 12, 22, 30, 12, 12, 12, 12, 12, 14, 12, 30]
-TAB1_STATUS_COL = 4  # 判定类型 (Disposition)
-TAB1_LINK_COL = 8  # 20秒证据视频链接
+TAB1_STATUS_COL = 4  # Disposition
+TAB1_LINK_COL = 8  # Evidence Clip Link
 
-STATUS_RED, STATUS_YELLOW, STATUS_GREEN = "🔴 违规", "🟡 疑似", "🟢 合规"
+STATUS_RED, STATUS_YELLOW, STATUS_GREEN = "🔴 VIOLATION", "🟡 SUSPECTED", "🟢 COMPLIANT"
 _DISPOSITION_STATUS = {
     "CONFIRMED": STATUS_RED,
     "SUSPECTED": STATUS_YELLOW,
@@ -301,7 +307,7 @@ def build_tab1_values(tab1_rows: Sequence[Any]) -> List[List[Any]]:
                 float(getattr(r, "confidence", 0.0)),
                 str(getattr(r, "evidence_description", "")),
                 str(getattr(r, "evidence_drive_url", "")),
-                str(getattr(r, "human_review_status", "")),
+                str(getattr(r, "human_review_status", "") or "PENDING"),
                 str(getattr(r, "human_review_note", "") or ""),
             ]
         )
@@ -648,7 +654,8 @@ def read_xlsx_sheets(data: bytes) -> Dict[str, List[List[str]]]:
     return out
 
 
-SOP_TAB0_TITLE = "Tab0_版本总控与回滚开关"
+SOP_TAB0_TITLE = "Tab0_Version_Control"
+LEGACY_SOP_TAB0_TITLES = ("Tab0_Version_Control", "Tab0_Control_and_Rollback", "Tab0_版本总控与回滚开关")
 
 
 def load_gcs_sop_tabs(raw: bytes, source_uri: str) -> Dict[str, List[List[str]]]:
@@ -657,13 +664,13 @@ def load_gcs_sop_tabs(raw: bytes, source_uri: str) -> Dict[str, List[List[str]]]
     Raises ValueError (with the source URI) when the bytes are not a readable workbook.
     """
     if len(raw) > SOP_MAX_BYTES:
-        raise ValueError(f"文件大小 {len(raw)} 字节超过 {SOP_MAX_BYTES // (1024 * 1024)} MiB 上限")
+        raise ValueError(f"File size {len(raw)} bytes exceeds the {SOP_MAX_BYTES // (1024 * 1024)} MiB limit")
     try:
         if split_generation(source_uri)[0].lower().endswith(".json"):
             doc = json.loads(raw.decode("utf-8-sig"))
             tabs = doc.get("tabs") if isinstance(doc, dict) else None
             if not isinstance(tabs, list):
-                raise ValueError("缺少 `tabs` 列表")
+                raise ValueError("Missing `tabs` list")
             return {
                 str(t.get("title")): [[str(c) for c in row] for row in (t.get("values") or [])]
                 for t in tabs
@@ -671,7 +678,7 @@ def load_gcs_sop_tabs(raw: bytes, source_uri: str) -> Dict[str, List[List[str]]]
             }
         return read_xlsx_sheets(raw)
     except (ValueError, KeyError, zipfile.BadZipFile, ET.ParseError, UnicodeDecodeError) as exc:
-        raise ValueError(f"无法解析 SOP 配置文件 `{source_uri}`：{exc}") from exc
+        raise ValueError(f"Failed to parse SOP configuration file `{source_uri}`: {exc}") from exc
 
 
 # --------------------------------------------------------------------------------------------
@@ -704,7 +711,7 @@ class GcsStorageGateway:
             return str(self._creds.token)
 
     def _principal(self) -> str:
-        return str(getattr(self._creds, "service_account_email", "") or "Worker 服务账号")
+        return str(getattr(self._creds, "service_account_email", "") or "Worker service account")
 
     def _request(
         self,
@@ -804,16 +811,16 @@ class GcsStorageGateway:
         who = self._principal()
         if status in (401, 403):
             raise WorkspaceAccessError(
-                f"运行身份 `{who}` 无权{action} `{shown}`（HTTP {status}）：请在存储桶 `gs://{bucket}` 上为它授予 "
-                "`roles/storage.objectAdmin`（仅读取视频需 `roles/storage.objectViewer`；写入 Excel 报告与证据切片需 "
-                "`roles/storage.objectAdmin`）"
+                f"Runtime identity `{who}` lacks permission to {action} `{shown}` (HTTP {status}): please grant it "
+                f"`roles/storage.objectAdmin` on bucket `gs://{bucket}` (`roles/storage.objectViewer` is required to read videos; "
+                "`roles/storage.objectAdmin` is required to write Excel reports and evidence clips)"
             )
         if status == 404:
             raise WorkspaceAccessError(
-                f"找不到 `{shown}`（HTTP 404）：请确认存储桶名称与目录路径正确，且运行身份 `{who}` 有访问权限"
+                f"`{shown}` not found (HTTP 404): please verify the bucket name and prefix path, and ensure `{who}` has access"
             )
         detail = body[:300].decode("utf-8", "replace")
-        raise RuntimeError(f"GCS {action} `{shown}` 失败（HTTP {status}）：{detail}")
+        raise RuntimeError(f"GCS {action} on `{shown}` failed (HTTP {status}): {detail}")
 
     # ---- gateway interface ------------------------------------------------------------------
 
@@ -829,12 +836,12 @@ class GcsStorageGateway:
                 f"&prefix={urllib.parse.quote(prefix + '/' if prefix else '', safe='')}"
             )
             status, body = self._request("GET", list_url, timeout=15.0)
-            self._check(status, body, bucket, prefix, "读取")
+            self._check(status, body, bucket, prefix, "read")
             probe_obj = f"{prefix}/{WRITE_PROBE_OBJECT}" if prefix else WRITE_PROBE_OBJECT
             status, body = self._request(
                 "POST", self._upload_url(bucket, probe_obj), body=b"ok", content_type="text/plain", timeout=15.0
             )
-            self._check(status, body, bucket, prefix, "写入")
+            self._check(status, body, bucket, prefix, "write")
             status, _ = self._request("DELETE", self._object_url(bucket, probe_obj), timeout=15.0)
             if status >= 400 and status != 404:
                 logger.warning("GCS write probe gs://%s/%s left behind (HTTP %s)", bucket, probe_obj, status)
@@ -847,7 +854,7 @@ class GcsStorageGateway:
         _assert_not_internal_state_prefix(bucket, obj)
         if not obj:
             raise WorkspaceAccessError(
-                "GCS SOP 配置路径必须指向具体的 .xlsx 或 .json 文件对象（如 gs://bucket/sop/master_sheet.xlsx）"
+                "GCS SOP configuration path must point to a specific .xlsx or .json file object (e.g. gs://bucket/sop/master_sheet.xlsx)"
             )
         return bucket, obj, generation
 
@@ -865,7 +872,7 @@ class GcsStorageGateway:
         gen_q = f"&generation={generation}" if generation else ""
         shown = f"gs://{bucket}/{obj}" + (f"#{generation}" if generation else "")
         too_big = WorkspaceAccessError(
-            f"SOP 配置文件 `{shown}` 超过 {max_bytes // (1024 * 1024)} MiB 上限：请只保留 Tab0 与规则页签后重新上传"
+            f"SOP configuration file `{shown}` exceeds the {max_bytes // (1024 * 1024)} MiB limit: please keep only Tab0 and rule tabs and re-upload"
         )
         status, body = self._request(
             "GET", self._object_url(bucket, obj) + "?fields=size,generation" + gen_q, timeout=15.0
@@ -882,20 +889,20 @@ class GcsStorageGateway:
             who = self._principal()
             if status == 404 and generation:
                 raise WorkspaceAccessError(
-                    f"找不到 SOP 配置文件的历史版本 `{shown}`（HTTP 404）：该版本号不存在或已被删除。"
-                    "请在控制台该文件的「版本历史记录」中确认版本号，或去掉 `#<版本号>` 使用最新版本"
+                    f"Historical version `{shown}` of SOP configuration file not found (HTTP 404): that generation does not exist or was deleted. "
+                    "Please check 'Version history' in Cloud Console or remove `#<generation>` to use the live version"
                 )
             if status == 404:
                 raise WorkspaceAccessError(
-                    f"找不到 SOP 配置文件 `{shown}`（HTTP 404）：请先运行 "
-                    f"`python3 scripts/init_sop_sheet.py --gcs-uri {shown} --tfvars <env>.tfvars` 上传，"
-                    f"或确认路径正确且运行身份 `{who}` 有 `roles/storage.objectViewer` 权限"
+                    f"SOP configuration file `{shown}` not found (HTTP 404): please run "
+                    f"`python3 scripts/init_sop_sheet.py --gcs-uri {shown} --tfvars <env>.tfvars` to upload it first, "
+                    f"or verify the path and ensure `{who}` has `roles/storage.objectViewer`"
                 )
             raise WorkspaceAccessError(
-                f"运行身份 `{who}` 无权读取 SOP 配置文件 `{shown}`（HTTP {status}）：请在存储桶 `gs://{bucket}` 上为它授予 "
-                "`roles/storage.objectViewer`（或 `roles/storage.objectAdmin`）"
+                f"Runtime identity `{who}` lacks permission to read SOP configuration file `{shown}` (HTTP {status}): please grant it "
+                f"`roles/storage.objectViewer` (or `roles/storage.objectAdmin`) on bucket `gs://{bucket}`"
             )
-        self._check(status, body, bucket, obj, "读取")
+        self._check(status, body, bucket, obj, "read")
         if len(body) > max_bytes:
             raise too_big
         return body
@@ -918,7 +925,7 @@ class GcsStorageGateway:
             content_length=len(data),
             timeout=60.0,
         )
-        self._check(status, body, bucket, obj, "写入")
+        self._check(status, body, bucket, obj, "write")
         try:
             generation = str(json.loads(body.decode("utf-8") or "{}").get("generation") or "")
         except (ValueError, AttributeError):
@@ -943,7 +950,7 @@ class GcsStorageGateway:
 
         Raises WorkspaceAccessError (an operator-fixable setup problem, same contract as the Drive
         gateway) when the object is missing, not readable by the identity, not a workbook, or has no
-        `Tab0_版本总控与回滚开关` -- otherwise every audit would silently fall back to the built-in rules.
+        `Tab0_Control_and_Rollback` (or legacy `Tab0_版本总控与回滚开关`) -- otherwise every audit would silently fall back to the built-in rules.
         """
         if not (sheet_id or "").strip():
             return ""
@@ -954,12 +961,12 @@ class GcsStorageGateway:
                 tabs = load_gcs_sop_tabs(raw, sheet_id)
             except ValueError as exc:
                 raise WorkspaceAccessError(
-                    f"{exc}：请用 Excel / WPS 另存为 .xlsx（或使用 init_sop_sheet.py 导出的 .json），重新上传"
+                    f"{exc}: please save as `.xlsx` in Excel / WPS (or use `.json` exported by `init_sop_sheet.py`) and re-upload"
                 ) from exc
-            if SOP_TAB0_TITLE not in tabs:
+            if not any(t in tabs for t in LEGACY_SOP_TAB0_TITLES):
                 raise WorkspaceAccessError(
-                    f"SOP 配置文件 `{sheet_id}` 中缺少总控页签「{SOP_TAB0_TITLE}」（现有页签：{', '.join(tabs) or '无'}）："
-                    "请勿重命名该页签，可重新运行 `scripts/init_sop_sheet.py --gcs-uri ...` 生成标准模板"
+                    f"SOP configuration file `{sheet_id}` is missing control tab '{SOP_TAB0_TITLE}' (found tabs: {', '.join(tabs) or 'none'}): "
+                    "do not rename that tab; you can re-run `scripts/init_sop_sheet.py --gcs-uri ...` to generate the standard template"
                 )
             return ""
 
@@ -997,10 +1004,18 @@ class GcsStorageGateway:
         base = posixpath.basename(name)
         if not base or name.endswith("/") or base == WRITE_PROBE_OBJECT:
             return False
-        if EVIDENCE_DIR_MARKER in name:
+        if (
+            any(ev in name for ev in LEGACY_EVIDENCE_SUBFOLDER_NAMES)
+            or "Evidence_Clips" in name
+            or "违规证据切片" in name
+        ):
             return False
         ctype = str(item.get("contentType") or "").lower()
         return ctype.startswith("video/") or base.lower().endswith(_VIDEO_EXTS)
+
+    async def list_videos_in_folder(self, folder_id: str) -> List[VideoMetadataItem]:
+        """Alias for `list_folder_videos`."""
+        return await self.list_folder_videos(folder_id)
 
     async def list_folder_videos(self, folder_id: str) -> List[VideoMetadataItem]:
         bucket, prefix = parse_gcs_uri(folder_id)
@@ -1018,7 +1033,7 @@ class GcsStorageGateway:
                 if page_token:
                     url += f"&pageToken={urllib.parse.quote(page_token, safe='')}"
                 status, body = self._request("GET", url, timeout=15.0)
-                self._check(status, body, bucket, prefix, "读取")
+                self._check(status, body, bucket, prefix, "read")
                 page = json.loads(body.decode("utf-8") or "{}")
                 raw.extend(i for i in page.get("items", []) if self._is_video_object(i))
                 page_token = str(page.get("nextPageToken") or "")
@@ -1058,7 +1073,7 @@ class GcsStorageGateway:
             status = self._download(self._media_url(bucket, obj), tmp_path)
             if status >= 400:
                 tmp_path.unlink(missing_ok=True)
-                self._check(status, b"", bucket, obj, "下载")
+                self._check(status, b"", bucket, obj, "download")
             tmp_path.rename(dest_path)
             return dest_path
 
@@ -1092,7 +1107,7 @@ class GcsStorageGateway:
                     timeout=120.0,
                 )
             if status in (401, 403, 404):
-                self._check(status, body, bucket, obj, "写入")
+                self._check(status, body, bucket, obj, "write")
             if status >= 400:
                 logger.warning("Failed to upload evidence clip %s to %s: HTTP %s", local_path.name, uri, status)
                 return ""
@@ -1112,7 +1127,7 @@ class GcsStorageGateway:
     ) -> Tuple[str, str]:
         """Writes the dual-tab `.xlsx` report into the prefix, preserving historical rows from
         previously audited videos in the same folder (Method 1: Same-Sheet Smart Append).
-        When `audited_rule_ids` is non-empty (`Tab4_专项测试表` spot-check), preserves existing rows
+        When `audited_rule_ids` is non-empty (`Tab4_Spot_Check` spot-check), preserves existing rows
         for other SOP rules on the same video.
         """
         bucket, prefix = parse_gcs_uri(parent_folder_id)
@@ -1120,6 +1135,12 @@ class GcsStorageGateway:
         fname = re.sub(r'[\\/:*?"<>|]+', "_", title) + reuse_suffix + ".xlsx"
         obj = f"{prefix}/{fname}" if prefix else fname
         uri = f"gs://{bucket}/{obj}"
+        candidate_objs = [obj]
+        for leg_title in LEGACY_REPORT_SHEET_TITLES:
+            leg_fname = re.sub(r'[\\/:*?"<>|]+', "_", leg_title) + reuse_suffix + ".xlsx"
+            leg_obj = f"{prefix}/{leg_fname}" if prefix else leg_fname
+            if leg_obj not in candidate_objs:
+                candidate_objs.append(leg_obj)
         audited_video_filenames = {
             str(getattr(r, "video_filename", "")).strip()
             for r in (*tab1_rows, *tab2_rows)
@@ -1141,10 +1162,19 @@ class GcsStorageGateway:
             kept_tab2_rows: List[List[Any]] = []
             if audited_video_filenames:
                 try:
-                    ex_status, ex_body = self._request("GET", self._media_url(bucket, obj), timeout=20.0)
-                    if ex_status == 200 and ex_body:
+                    ex_body = b""
+                    for cand_obj in candidate_objs:
+                        ex_status, cand_body = self._request("GET", self._media_url(bucket, cand_obj), timeout=20.0)
+                        if ex_status == 200 and cand_body:
+                            ex_body = cand_body
+                            break
+                    if ex_body:
                         ex_sheets = read_xlsx_sheets(ex_body)
-                        for raw_row in (ex_sheets.get(TAB1_TITLE) or [])[1:]:
+                        ex_t1_rows = next(
+                            (ex_sheets[t] for t in LEGACY_TAB1_TITLES if t in ex_sheets),
+                            ex_sheets.get(TAB1_TITLE) or [],
+                        )
+                        for raw_row in ex_t1_rows[1:]:
                             row_video = str(raw_row[1]).strip() if len(raw_row) > 1 else ""
                             row_rule = str(raw_row[3]).strip().upper() if len(raw_row) > 3 else ""
                             if row_video and (
@@ -1156,8 +1186,14 @@ class GcsStorageGateway:
                                     padded[6] = float(padded[6] or 0.0)
                                 except (TypeError, ValueError):
                                     padded[6] = 0.0
+                                if not str(padded[9]).strip():
+                                    padded[9] = "PENDING"
                                 kept_tab1_rows.append(padded)
-                        for raw_row in (ex_sheets.get(TAB2_TITLE) or [])[1:]:
+                        ex_t2_rows = next(
+                            (ex_sheets[t] for t in LEGACY_TAB2_TITLES if t in ex_sheets),
+                            ex_sheets.get(TAB2_TITLE) or [],
+                        )
+                        for raw_row in ex_t2_rows[1:]:
                             row_video2 = str(raw_row[2]).strip() if len(raw_row) > 2 else ""
                             row_prompt2 = str(raw_row[6]).strip() if len(raw_row) > 6 else ""
                             if row_video2 and (
@@ -1215,7 +1251,7 @@ class GcsStorageGateway:
                 content_length=len(payload),
                 timeout=60.0,
             )
-            self._check(status, body, bucket, obj, "写入")
+            self._check(status, body, bucket, obj, "write")
             return uri, build_gcs_console_object_url(uri)
 
         return await asyncio.to_thread(_write)
@@ -1225,7 +1261,7 @@ class GcsStorageGateway:
             return parse_gcs_uri(sheet_id_or_url)
         bucket, prefix = parse_gcs_uri(parent_folder_id)
         _assert_not_internal_state_prefix(bucket, prefix)
-        fname = "📊 AI稽核报告与Token账单.xlsx"
+        fname = f"{REPORT_SHEET_TITLE}.xlsx"
         obj = f"{prefix}/{fname}" if prefix else fname
         return bucket, obj
 
@@ -1239,18 +1275,29 @@ class GcsStorageGateway:
 
         def _read() -> Tuple[List[List[str]], List[List[str]]]:
             status, body = self._request("GET", self._media_url(bucket, obj), timeout=20.0)
+            if (status == 404 or not body) and not (sheet_id_or_url and is_gcs_target(sheet_id_or_url)):
+                _, prefix = parse_gcs_uri(parent_folder_id)
+                for leg_title in LEGACY_REPORT_SHEET_TITLES:
+                    leg_obj = f"{prefix}/{leg_title}.xlsx" if prefix else f"{leg_title}.xlsx"
+                    if leg_obj != obj:
+                        leg_status, leg_body = self._request("GET", self._media_url(bucket, leg_obj), timeout=20.0)
+                        if leg_status == 200 and leg_body:
+                            status, body = leg_status, leg_body
+                            break
             if status == 404 or not body:
                 return [], []
-            self._check(status, body, bucket, obj, "读取")
+            self._check(status, body, bucket, obj, "read")
             sheets = read_xlsx_sheets(body)
+            raw_t1 = next((sheets[t] for t in LEGACY_TAB1_TITLES if t in sheets), sheets.get(TAB1_TITLE) or [])
+            raw_t2 = next((sheets[t] for t in LEGACY_TAB2_TITLES if t in sheets), sheets.get(TAB2_TITLE) or [])
             t1 = [
                 [str(c) for c in r[:11]] + [""] * max(0, 11 - len(r))
-                for r in (sheets.get(TAB1_TITLE) or [])[1:]
+                for r in raw_t1[1:]
                 if any(str(c).strip() for c in r)
             ]
             t2 = [
                 [str(c) for c in r[:15]] + [""] * max(0, 15 - len(r))
-                for r in (sheets.get(TAB2_TITLE) or [])[1:]
+                for r in raw_t2[1:]
                 if any(str(c).strip() for c in r)
             ]
             return t1, t2
@@ -1269,11 +1316,21 @@ class GcsStorageGateway:
         bucket, obj = self._resolve_report_object(parent_folder_id, sheet_id_or_url)
 
         def _update() -> int:
-            status, body = self._request("GET", self._media_url(bucket, obj), timeout=20.0)
-            self._check(status, body, bucket, obj, "读取")
+            target_obj = obj
+            status, body = self._request("GET", self._media_url(bucket, target_obj), timeout=20.0)
+            if (status == 404 or not body) and not (sheet_id_or_url and is_gcs_target(sheet_id_or_url)):
+                _, prefix = parse_gcs_uri(parent_folder_id)
+                for leg_title in LEGACY_REPORT_SHEET_TITLES:
+                    leg_obj = f"{prefix}/{leg_title}.xlsx" if prefix else f"{leg_title}.xlsx"
+                    if leg_obj != obj:
+                        leg_status, leg_body = self._request("GET", self._media_url(bucket, leg_obj), timeout=20.0)
+                        if leg_status == 200 and leg_body:
+                            status, body, target_obj = leg_status, leg_body, leg_obj
+                            break
+            self._check(status, body, bucket, target_obj, "read")
             ex_sheets = read_xlsx_sheets(body)
-            raw_t1 = (ex_sheets.get(TAB1_TITLE) or [])[1:]
-            raw_t2 = (ex_sheets.get(TAB2_TITLE) or [])[1:]
+            raw_t1 = next((ex_sheets[t] for t in LEGACY_TAB1_TITLES if t in ex_sheets), ex_sheets.get(TAB1_TITLE) or [])[1:]
+            raw_t2 = next((ex_sheets[t] for t in LEGACY_TAB2_TITLES if t in ex_sheets), ex_sheets.get(TAB2_TITLE) or [])[1:]
             updated_t1, patches = match_and_apply_tab1_reviews(raw_t1, updates)
             if not patches:
                 return 0
@@ -1305,13 +1362,13 @@ class GcsStorageGateway:
             )
             up_status, up_body = self._request(
                 "POST",
-                self._upload_url(bucket, obj),
+                self._upload_url(bucket, target_obj),
                 body=payload,
                 content_type=XLSX_CONTENT_TYPE,
                 content_length=len(payload),
                 timeout=60.0,
             )
-            self._check(up_status, up_body, bucket, obj, "写入")
+            self._check(up_status, up_body, bucket, target_obj, "write")
             return len(patches)
 
         return await asyncio.to_thread(_update)

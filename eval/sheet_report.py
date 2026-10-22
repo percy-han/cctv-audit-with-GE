@@ -2,14 +2,15 @@
 """Per-run Google Sheet report for CCTV AI Audit evaluation rounds (Round 67).
 
 Every eval run creates ONE new spreadsheet in the Drive folder ``EVAL_RESULTS_FOLDER_ID`` (Terraform
-variable ``eval_results_folder_id``), named ``CHAGEE AI稽核测评_<round>_<run>_<YYYYMMDD-HHMMSS>``
+variable ``eval_results_folder_id``), named ``CHAGEE_AI_Audit_Eval_<round>_<run>_<YYYYMMDD-HHMMSS>``
 with the timestamp in ``EVAL_REPORT_TIME_ZONE`` (Terraform ``scheduler_time_zone``; default
-Asia/Singapore). Four tabs:
+Asia/Singapore). Five tabs:
 
-1. ``本次测评概览``  this run's headline numbers (record built by eval/eval_records.py).
-2. ``本次逐题结果``  one row per golden part, copied from this run's ``score.json`` (never re-judged).
-3. ``历史轮次对比``  one row per round (runs of the same round/model/SOP/media mode averaged) + 3 charts.
-4. ``历史单跑明细``  one row per run in ``eval_history.jsonl`` + 1 chart.
+1. ``1. Executive Summary``            this run's headline numbers (record built by eval/eval_records.py).
+2. ``2. Per-Question Breakdown``       one row per golden part, copied from this run's ``score.json`` (never re-judged).
+3. ``3. Historical Round Comparison``  one row per round (runs of the same round/model/SOP/media mode averaged) + 3 charts.
+4. ``4. Historical Run Ledger``        one row per run in ``eval_history.jsonl`` + 1 chart.
+5. ``5. Metric Guide & Tuning Playbook`` golden set snapshot as evaluated by this run.
 
 Tabs 3/4 and their charts only include runs scored on the SAME ``golden_version`` as this run (recall
 on different golden sets is not comparable); a note cell says how many were left out. Every count,
@@ -54,15 +55,15 @@ logger = logging.getLogger("eval.sheet_report")
 ENV_FOLDER_ID = "EVAL_RESULTS_FOLDER_ID"
 ENV_TIME_ZONE = "EVAL_REPORT_TIME_ZONE"
 DEFAULT_TIME_ZONE = "Asia/Singapore"
-TITLE_PREFIX = "CHAGEE AI稽核测评"
+TITLE_PREFIX = "CHAGEE_AI_Audit_Eval"
 SPREADSHEET_MIME = "application/vnd.google-apps.spreadsheet"
 REPORT_JSON_NAME = "sheet_report.json"
 
-TAB_OVERVIEW = "本次测评概览"
-TAB_ITEMS = "本次逐题结果"
-TAB_ROUNDS = "历史轮次对比"
-TAB_RUNS = "历史单跑明细"
-TAB_GOLDEN = "本次黄金集快照"
+TAB_OVERVIEW = "1. Executive Summary"
+TAB_ITEMS = "2. Per-Question Breakdown"
+TAB_ROUNDS = "3. Historical Round Comparison"
+TAB_RUNS = "4. Historical Run Ledger"
+TAB_GOLDEN = "5. Metric Guide & Tuning Playbook"
 # Fixed sheet IDs so the pure layer can address every tab; the spreadsheet's default sheet is deleted.
 SHEET_IDS = {TAB_OVERVIEW: 101, TAB_ITEMS: 102, TAB_ROUNDS: 103, TAB_RUNS: 104, TAB_GOLDEN: 105}
 
@@ -115,7 +116,7 @@ def resolve_time_zone(name: str | None) -> ZoneInfo:
         return ZoneInfo(tz_name)
     except (ZoneInfoNotFoundError, ValueError) as exc:
         raise ValueError(
-            f"EVAL_REPORT_TIME_ZONE={tz_name!r} 不是合法的 IANA 时区（例如 Asia/Singapore）"
+            f"EVAL_REPORT_TIME_ZONE={tz_name!r} is not a valid IANA time zone (e.g. Asia/Singapore)"
         ) from exc
 
 
@@ -153,7 +154,7 @@ def history_up_to_run(history: Sequence[dict[str, Any]], run_id: str) -> list[di
     for i, rec in enumerate(history):
         if rec.get("run_id") == run_id:
             return list(history[: i + 1])
-    raise ValueError(f"run_id {run_id!r} 不在 eval_history.jsonl 中")
+    raise ValueError(f"run_id {run_id!r} not found in eval_history.jsonl")
 
 
 def golden_version_of(record: Mapping[str, Any]) -> str:
@@ -170,8 +171,12 @@ def same_golden_history(
     kept = [r for r in history if golden_version_of(r) == ver]
     other = [r for r in history if golden_version_of(r) != ver]
     other_rounds = {(r.get("round_id"), golden_version_of(r)) for r in other}
-    note = f"仅对比使用同一版黄金集 {ver} 的轮次"
-    note += (f"；其他版本 {len(other_rounds)} 轮（{len(other)} 次运行）未纳入" if other else "；无其他版本的历史运行")
+    note = f"Comparing only rounds evaluated on the same golden set version ({ver})"
+    note += (
+        f"; {len(other_rounds)} round(s) ({len(other)} run(s)) on other versions excluded"
+        if other
+        else "; no historical runs on other versions"
+    )
     return kept, note
 
 
@@ -188,7 +193,7 @@ def build_overview_table(
                   or run_record.get("golden_item_count") or 0)
     splits = run_record.get("golden_split_counts") or golden.get("split_counts") or {}
     density = score_doc.get("alert_density") or {}
-    rows: list[list[Any]] = [["指标", "数值", "说明"]]
+    rows: list[list[Any]] = [["Metric", "Value", "Notes"]]
     cells: list[tuple[int, int, dict[str, str]]] = []
 
     def add(label: str, value: Any, note: str = "", fmt: dict[str, str] | None = None) -> None:
@@ -196,65 +201,75 @@ def build_overview_table(
         if fmt is not None and value is not None:
             cells.append((len(rows) - 1, 1, fmt))
 
-    add("测评轮次 (round_id)", run_record.get("round_id"))
-    add("运行 ID (run_id)", run_record.get("run_id"))
-    add(f"报告生成时间 ({time_zone})", created_at_local)
-    add("评分完成时间 (scored_at, UTC)", score_doc.get("scored_at") or run_record.get("timestamp"))
-    add("稽核模型 (model_version)", run_record.get("model_version"))
-    add("SOP / 提示词版本 (sop_version)", run_record.get("sop_version"))
-    add("视频理解模式 (media_mode)", run_record.get("media_mode"))
-    add("黄金集版本 (golden_version)", run_record.get("golden_version") or golden.get("golden_version"),
-        "文件名@评分标尺哈希（ruler-v2）；不同版本的召回率不可比")
+    add("Evaluation Round (round_id)", run_record.get("round_id"))
+    add("Run ID (run_id)", run_record.get("run_id"))
+    add(f"Report Generated At ({time_zone})", created_at_local)
+    add("Scoring Completed At (scored_at, UTC)", score_doc.get("scored_at") or run_record.get("timestamp"))
+    add("Audit Model (model_version)", run_record.get("model_version"))
+    add("SOP / Prompt Version (sop_version)", run_record.get("sop_version"))
+    add("Video Processing Mode (media_mode)", run_record.get("media_mode"))
+    add("Golden Set Version (golden_version)", run_record.get("golden_version") or golden.get("golden_version"),
+        "stem@ruler-hash (ruler-v2); recall across different golden versions is not comparable")
     origin = golden.get("golden_origin") or {}
-    add("黄金集来源", origin.get("sheet_url") or golden.get("golden_source") or "",
-        (f"{origin.get('sheet_name', '')}（{origin.get('label_range', '')}"
-         + (f" + 「{origin.get('config_tab', '')}」页" if origin.get("config_tab") else "")
-         + f"，读取时表格修改时间 {origin.get('sheet_modified_time', '')}）") if origin else "黄金集文件")
-    add("黄金集题数 / 标注点数", f"{n_items} 题 / {run_record.get('golden_part_count') or golden.get('part_count') or ''} 个标注点",
+    add("Golden Set Source", origin.get("sheet_url") or golden.get("golden_source") or "",
+        (f"{origin.get('sheet_name', '')} ({origin.get('label_range', '')}"
+         + (f" + '{origin.get('config_tab', '')}' tab" if origin.get("config_tab") else "")
+         + f", sheet modified at {origin.get('sheet_modified_time', '')})") if origin else "Golden set file")
+    add("Golden Set Items / Parts", f"{n_items} items / {run_record.get('golden_part_count') or golden.get('part_count') or ''} parts",
         "")
-    add("裁判模型 (judge_model)", run_record.get("judge_model") or score_doc.get("judge_model"),
-        f"每题裁判 {score_doc.get('judge_passes', '')} 次取中位" if score_doc.get("judge_passes") else "")
-    add(f"总体召回率 ({n_items} 题)", m.get("overall_recall"), "权威数字：eval/score_run.py 本地评分", PERCENT)
-    add("仅 CONFIRMED 召回率", m.get("confirmed_only_recall"), "只算 CONFIRMED 处置的告警", PERCENT)
-    add("平均告警数 / 视频 (findings_per_clip)", m.get("findings_per_clip"),
-        f"守卫线 ≤ {MAX_MEAN_ALERT_DENSITY:.1f}", DECIMAL_2)
-    add("告警总数", m.get("total_findings"), f"{density.get('clips', '')} 段视频", INTEGER)
-    add("告警命中率 (hit_rate)", m.get("hit_rate"), "命中人工标注的告警 / 全部告警", PERCENT)
+    add("Judge Model (judge_model)", run_record.get("judge_model") or score_doc.get("judge_model"),
+        f"Median of {score_doc.get('judge_passes', '')} passes per part" if score_doc.get("judge_passes") else "")
+    add(f"Overall Recall ({n_items} items)", m.get("overall_recall"), "Authoritative score from local eval/score_run.py", PERCENT)
+    add("CONFIRMED-Only Recall", m.get("confirmed_only_recall"), "Counts only findings with CONFIRMED disposition", PERCENT)
+    add("Mean Alert Density / Clip (findings_per_clip)", m.get("findings_per_clip"),
+        f"Guardrail <= {MAX_MEAN_ALERT_DENSITY:.1f}", DECIMAL_2)
+    add("Total Findings", m.get("total_findings"), f"{density.get('clips', '')} video clips", INTEGER)
+    add("Alert Hit Rate (hit_rate)", m.get("hit_rate"), "Findings matching human labels / total findings", PERCENT)
     stable_state = m.get("stable_guardrail") or "not_configured"
     stable_ids = run_record.get("stable_baseline_items") or golden.get("stable_baseline_items") or []
-    add("稳定基线题退化数 (regressed_stable_items)", m.get("regressed_stable_items"),
-        {"pass": f"稳定基线 {len(stable_ids)} 题全部保持 1 分", "fail": f"稳定基线 {len(stable_ids)} 题中有退化",
-         }.get(stable_state, "未配置稳定基线题（黄金集 manifest stable_baseline_items），本项不检查"), INTEGER)
-    add("护栏是否通过 (guardrails_passed)", "是" if m.get("guardrails_passed") else "否",
-        f"告警密度 ≤ {MAX_MEAN_ALERT_DENSITY:.1f} 且稳定基线零退化")
-    add("同轮次翻转率 (flip_rate)", m.get("flip_rate"), "同一轮次多次运行间得分变化的题目比例", PERCENT)
-    add("瞬时动作时间漂移均值 (秒)", m.get("mean_point_timestamp_drift_sec"), "仅 POINT 规则 (±20s)", DECIMAL_2)
-    add("瞬时动作时间漂移最大 (秒)", m.get("max_point_timestamp_drift_sec"), "", INTEGER)
-    add("单视频平均成本 (USD)", m.get("cost_per_clip_usd"),
-        "按 Input ($0.75/1M) + Thinking ($3.75/1M) + Output ($3.75/1M) 统一折算", USD)
-    add("本次总成本 (USD)", m.get("total_cost_usd"), "稽核模型调用，不含裁判", USD)
-    add("单视频平均耗时 (秒)", m.get("mean_clip_latency_sec"), "", DECIMAL_2)
-    add("单视频最大耗时 (秒)", m.get("max_clip_latency_sec"), "", DECIMAL_2)
-    add("Input Token 数 (含动态抽帧)", m.get("prompt_token_count"),
-        "视频流 + 提示词 + Agentic 动态高清抽帧回传 (tool_use)", INTEGER)
-    add("Thinking Token 数", m.get("thoughts_token_count"), "模型内部多步视觉推演消耗", INTEGER)
-    add("Output Token 数", m.get("candidates_token_count"), "最终结构化 JSON 报告输出", INTEGER)
-    add("总 Token 数", m.get("total_token_count"), "Input + Thinking + Output 合计", INTEGER)
+    add("Regressed Stable Baseline Items (regressed_stable_items)", m.get("regressed_stable_items"),
+        {"pass": f"✅ Pass — all {len(stable_ids)} stable baseline items held at 1.0",
+         "fail": f"🔴 Regression — regression detected among {len(stable_ids)} stable baseline items",
+         }.get(stable_state, "Not configured (no stable_baseline_items in golden manifest); check skipped"), INTEGER)
+    guardrail_badge = (
+        "✅ Pass"
+        if m.get("guardrails_passed")
+        else ("🔴 Regression" if int(m.get("regressed_stable_items") or 0) > 0 else "⚠️ Review")
+    )
+    add("Guardrails Status (guardrails_passed)", guardrail_badge,
+        f"Alert density <= {MAX_MEAN_ALERT_DENSITY:.1f} and zero stable baseline regressions")
+    add("Intra-Round Flip Rate (flip_rate)", m.get("flip_rate"), "Fraction of items whose score changed across runs in the same round", PERCENT)
+    add("Mean Point-Action Timestamp Drift (sec)", m.get("mean_point_timestamp_drift_sec"), "POINT rules only (±20s)", DECIMAL_2)
+    add("Max Point-Action Timestamp Drift (sec)", m.get("max_point_timestamp_drift_sec"), "", INTEGER)
+    add("Mean Cost per Clip (USD)", m.get("cost_per_clip_usd"),
+        "Normalized at Input ($0.75/1M) + Thinking ($3.75/1M) + Output ($3.75/1M)", USD)
+    add("Total Run Cost (USD)", m.get("total_cost_usd"), "Audit model calls only, excluding Judge", USD)
+    add("Mean Clip Latency (sec)", m.get("mean_clip_latency_sec"), "", DECIMAL_2)
+    add("Max Clip Latency (sec)", m.get("max_clip_latency_sec"), "", DECIMAL_2)
+    add("Input Tokens (incl. Agentic Frame Sampling)", m.get("prompt_token_count"),
+        "Video stream + prompt + Agentic high-res frame sampling callbacks (tool_use)", INTEGER)
+    add("Thinking Tokens", m.get("thoughts_token_count"), "Internal multi-step visual reasoning tokens", INTEGER)
+    add("Output Tokens", m.get("candidates_token_count"), "Final structured JSON report output", INTEGER)
+    add("Total Tokens", m.get("total_token_count"), "Input + Thinking + Output total", INTEGER)
     rows.append([
-        "说明",
-        "召回率由 eval/score_run.py 在本地评分一次得出，是权威数字；本表只展示 score.json 与 "
-        "eval_history.jsonl 中的结果，不做二次评分。",
+        "Note",
+        "Recall is computed once locally by eval/score_run.py as the single source of truth; this sheet "
+        "displays results from score.json and eval_history.jsonl without re-scoring.",
         "",
     ])
     return Table(TAB_OVERVIEW, rows, cell_formats=cells, wide_cols={1: 420, 2: 360})
 
 
-def _score_badge(score: float) -> str:
+def _score_badge(score: float, *, candidate_ids: Sequence[str] | None = None, explanation: str = "") -> str:
     if score >= 1.0:
-        return "✓ 命中"
+        return "✅ Hit"
     if score >= 0.5:
-        return "◐ 半对"
-    return "✗ 漏检"
+        return "⚠️ Partial"
+    if candidate_ids is not None:
+        return "❌ Miss (Judge)" if len(candidate_ids) > 0 else "❌ Miss (Window)"
+    if "Judge call skipped" in explanation or "没有任何 AI 条目" in explanation or "代码预筛" in explanation:
+        return "❌ Miss (Window)"
+    return "❌ Miss (Judge)" if explanation else "❌ Miss (Window)"
 
 
 def build_items_table(
@@ -267,10 +282,10 @@ def build_items_table(
             golden_parts[str(p.get("part_id"))] = p
 
     header = [
-        "part_id", "题号 (item_id)", "门店", "稽核重点", "SOP 大类", "时间判定模式", "时间窗 (±秒)",
-        "人工标注原文", "标注时间点 (OSD)", "本题得分", "整题得分", "判定",
-        "时间模式来源", "SOP 大类来源",
-        "匹配的 AI 告警", "时间漂移 (秒)", "裁判理由",
+        "part_id", "Item ID (item_id)", "Outlet", "Audit Focus", "SOP Category", "Temporal Mode", "Time Window (±sec)",
+        "Human Label (Verbatim)", "Labelled Timestamp (OSD)", "Part Score", "Item Score", "Verdict",
+        "Temporal Mode Source", "SOP Category Source",
+        "Matched AI Findings", "Timestamp Drift (sec)", "Judge Explanation",
     ]
     rows: list[list[Any]] = [header]
     for item in score_doc.get("items") or []:
@@ -285,6 +300,8 @@ def build_items_table(
                 for f in [matched_by_id.get(str(fid), {})]
             )
             score = float(part.get("score") or 0.0)
+            cands = part.get("candidate_ids")
+            expl = str(part.get("explanation") or "")
             rows.append([
                 pid,
                 item.get("item_id", ""),
@@ -299,17 +316,21 @@ def build_items_table(
                 ", ".join(gpart.get("osd_times") or []),
                 score,
                 float(item.get("score") or 0.0),
-                _score_badge(score),
-                {"explicit": "黄金集指定", "heuristic": "规则推断"}.get(
-                    str(part.get("temporal_mode_source") or ""), "未记录"),
-                {"explicit": "黄金集指定", "audit_clause": "取稽核条款原文", "focus": "取稽核重点",
-                 "none": "未分类"}.get(str(item.get("sop_category_source") or ""), "未记录"),
+                _score_badge(score, candidate_ids=cands if isinstance(cands, list) else None, explanation=expl),
+                {"explicit": "Golden Set Explicit", "heuristic": "Rule Heuristic"}.get(
+                    str(part.get("temporal_mode_source") or ""), "Unrecorded"),
+                {"explicit": "Golden Set Explicit", "audit_clause": "Audit Clause Text", "focus": "Audit Focus",
+                 "none": "Uncategorized"}.get(str(item.get("sop_category_source") or ""), "Unrecorded"),
                 matched_txt,
                 _blank(part.get("timestamp_drift_sec")),
-                part.get("explanation", ""),
+                expl,
             ])
     t = Table(TAB_ITEMS, rows)
-    t.wide_cols = {t.col("人工标注原文"): 320, t.col("匹配的 AI 告警"): 420, t.col("裁判理由"): 420}
+    t.wide_cols = {
+        t.col("Human Label (Verbatim)"): 320,
+        t.col("Matched AI Findings"): 420,
+        t.col("Judge Explanation"): 420,
+    }
     return t
 
 
@@ -317,8 +338,9 @@ def build_golden_snapshot_table(golden_items: Sequence[Mapping[str, Any]], stabl
     """One row per golden part exactly as this run used it (category / time mode with their source)."""
     from eval.score_run import sop_category_and_source, temporal_mode_and_source
 
-    header = ["题号", "part_id", "门店", "稽核重点", "稽核条款", "人工标注原文", "标注时间点 (OSD)",
-              "视频文件名", "SOP 大类", "SOP 大类来源", "时间判定模式", "时间模式来源", "稳定基线题"]
+    header = ["Item ID", "part_id", "Outlet", "Audit Focus", "Audit Clause", "Human Label (Verbatim)",
+              "Labelled Timestamp (OSD)", "Video Filename(s)", "SOP Category", "SOP Category Source",
+              "Temporal Mode", "Temporal Mode Source", "Stable Baseline Item"]
     rows: list[list[Any]] = [header]
     for it in golden_items:
         cat, cat_src = sop_category_and_source(dict(it))
@@ -328,10 +350,10 @@ def build_golden_snapshot_table(golden_items: Sequence[Mapping[str, Any]], stabl
                 it.get("item_id", ""), p.get("part_id", ""), it.get("outlet_name", ""), it.get("focus", ""),
                 it.get("audit_clause", ""), p.get("description") or it.get("finding_verbatim", ""),
                 ", ".join(p.get("osd_times") or []), "\n".join(it.get("video_filenames") or []),
-                cat, cat_src, mode, mode_src, "是" if it.get("stable_baseline") or it.get("item_id") in stable_ids else "",
+                cat, cat_src, mode, mode_src, "Yes" if it.get("stable_baseline") or it.get("item_id") in stable_ids else "",
             ])
     t = Table(TAB_GOLDEN, rows)
-    t.wide_cols = {t.col("人工标注原文"): 360, t.col("视频文件名"): 320}
+    t.wide_cols = {t.col("Human Label (Verbatim)"): 360, t.col("Video Filename(s)"): 320}
     return t
 
 
@@ -342,10 +364,10 @@ def build_rounds_table(history: Sequence[dict[str, Any]]) -> tuple[Table, list[s
     cats = sorted({k for r in rounds for k in (r.get("sop_category_recall") or {})})
     ofs = sorted({k for r in rounds for k in (r.get("outlet_focus_recall") or {})})
     header = [
-        "轮次", "round_id", "SOP 版本", "模型版本", "视频模式", "运行次数", "run_ids",
-        "总体召回率", "仅 CONFIRMED 召回率", "告警命中率",
+        "Round", "round_id", "SOP Version", "Model Version", "Media Mode", "Runs Count", "run_ids",
+        "Overall Recall", "CONFIRMED-Only Recall", "Alert Hit Rate",
         *cats, *ofs,
-        "平均告警数 / 视频", "时间漂移均值 (秒)", "单视频平均成本 (USD)",
+        "Mean Findings / Clip", "Mean Timestamp Drift (sec)", "Mean Cost / Clip (USD)",
     ]
     rows: list[list[Any]] = [header]
     for lbl, r in zip(labels, rounds):
@@ -361,28 +383,33 @@ def build_rounds_table(history: Sequence[dict[str, Any]]) -> tuple[Table, list[s
             _blank(m.get("cost_per_clip_usd")),
         ])
     t = Table(TAB_ROUNDS, rows)
-    pct = ["总体召回率", "仅 CONFIRMED 召回率", "告警命中率", *cats, *ofs]
+    pct = ["Overall Recall", "CONFIRMED-Only Recall", "Alert Hit Rate", *cats, *ofs]
     t.col_formats = {t.col(h): PERCENT for h in pct}
-    t.col_formats[t.col("平均告警数 / 视频")] = DECIMAL_2
-    t.col_formats[t.col("时间漂移均值 (秒)")] = DECIMAL_2
-    t.col_formats[t.col("单视频平均成本 (USD)")] = USD
+    t.col_formats[t.col("Mean Findings / Clip")] = DECIMAL_2
+    t.col_formats[t.col("Mean Timestamp Drift (sec)")] = DECIMAL_2
+    t.col_formats[t.col("Mean Cost / Clip (USD)")] = USD
     return t, cats, ofs
 
 
-GUARDRAIL_HEADER = f"告警密度守卫线 ({MAX_MEAN_ALERT_DENSITY:.1f})"
+GUARDRAIL_HEADER = f"Alert Density Guardrail ({MAX_MEAN_ALERT_DENSITY:.1f})"
 
 
 def build_runs_table(history: Sequence[dict[str, Any]], current_run_id: str) -> Table:
     header = [
-        "运行", "本次", "round_id", "run_id", "SOP 版本", "模型版本", "视频模式",
-        "总体召回率", "仅 CONFIRMED 召回率", "平均告警数 / 视频", GUARDRAIL_HEADER,
-        "时间漂移均值 (秒)", "单视频平均成本 (USD)", "总成本 (USD)",
-        "Input Token 数", "Thinking Token 数", "Output Token 数", "总 Token 数",
-        "单视频平均耗时 (秒)", "护栏通过",
+        "Run", "Current", "round_id", "run_id", "SOP Version", "Model Version", "Media Mode",
+        "Overall Recall", "CONFIRMED-Only Recall", "Mean Findings / Clip", GUARDRAIL_HEADER,
+        "Mean Timestamp Drift (sec)", "Mean Cost / Clip (USD)", "Total Cost (USD)",
+        "Input Tokens", "Thinking Tokens", "Output Tokens", "Total Tokens",
+        "Mean Clip Latency (sec)", "Guardrails Status",
     ]
     rows: list[list[Any]] = [header]
     for rec in history:
         m = rec.get("metrics") or {}
+        g_status = (
+            "✅ Pass"
+            if m.get("guardrails_passed")
+            else ("🔴 Regression" if int(m.get("regressed_stable_items") or 0) > 0 else "⚠️ Review")
+        )
         rows.append([
             run_label(rec), "★" if rec.get("run_id") == current_run_id else "",
             rec.get("round_id", ""), rec.get("run_id", ""), rec.get("sop_version", ""),
@@ -394,15 +421,15 @@ def build_runs_table(history: Sequence[dict[str, Any]], current_run_id: str) -> 
             _blank(m.get("prompt_token_count")), _blank(m.get("thoughts_token_count")),
             _blank(m.get("candidates_token_count")), _blank(m.get("total_token_count")),
             _blank(m.get("mean_clip_latency_sec")),
-            "是" if m.get("guardrails_passed") else "否",
+            g_status,
         ])
     t = Table(TAB_RUNS, rows)
-    t.col_formats = {t.col(h): PERCENT for h in ("总体召回率", "仅 CONFIRMED 召回率")}
-    for h in ("平均告警数 / 视频", GUARDRAIL_HEADER, "时间漂移均值 (秒)", "单视频平均耗时 (秒)"):
+    t.col_formats = {t.col(h): PERCENT for h in ("Overall Recall", "CONFIRMED-Only Recall")}
+    for h in ("Mean Findings / Clip", GUARDRAIL_HEADER, "Mean Timestamp Drift (sec)", "Mean Clip Latency (sec)"):
         t.col_formats[t.col(h)] = DECIMAL_2
-    for h in ("单视频平均成本 (USD)", "总成本 (USD)"):
+    for h in ("Mean Cost / Clip (USD)", "Total Cost (USD)"):
         t.col_formats[t.col(h)] = USD
-    for h in ("Input Token 数", "Thinking Token 数", "Output Token 数", "总 Token 数"):
+    for h in ("Input Tokens", "Thinking Tokens", "Output Tokens", "Total Tokens"):
         t.col_formats[t.col(h)] = INTEGER
     return t
 
@@ -491,30 +518,30 @@ def build_chart_requests(rounds: Table, cats: Sequence[str], ofs: Sequence[str],
     base = len(rounds.rows) + 2
     reqs = [
         build_chart_request(
-            rounds, title="图1 各轮次核心召回率与告警命中率", domain_header="轮次",
-            series=[("总体召回率", "COLUMN", "LEFT_AXIS"), ("仅 CONFIRMED 召回率", "COLUMN", "LEFT_AXIS"),
-                    ("告警命中率", "LINE", "LEFT_AXIS")],
-            bottom_title="轮次 · SOP 版本", left_title="比例", anchor_row=base,
+            rounds, title="Chart 1: Core Recall & Alert Hit Rate by Round", domain_header="Round",
+            series=[("Overall Recall", "COLUMN", "LEFT_AXIS"), ("CONFIRMED-Only Recall", "COLUMN", "LEFT_AXIS"),
+                    ("Alert Hit Rate", "LINE", "LEFT_AXIS")],
+            bottom_title="Round · SOP Version", left_title="Rate", anchor_row=base,
             max_data_rows=MAX_CHART_ROUNDS),
     ]
     if cats:
         reqs.append(build_chart_request(
-            rounds, title="图2 各轮次按 SOP 大类召回率", domain_header="轮次",
+            rounds, title="Chart 2: Recall by SOP Category across Rounds", domain_header="Round",
             series=[(c, "COLUMN", "LEFT_AXIS") for c in cats],
-            bottom_title="轮次 · SOP 版本", left_title="召回率", anchor_row=base + CHART_ROW_STRIDE,
+            bottom_title="Round · SOP Version", left_title="Recall", anchor_row=base + CHART_ROW_STRIDE,
             max_data_rows=MAX_CHART_ROUNDS))
     if ofs:
         reqs.append(build_chart_request(
-            rounds, title="图3 各轮次按门店 × 稽核重点召回率", domain_header="轮次",
+            rounds, title="Chart 3: Recall by Outlet × Audit Focus across Rounds", domain_header="Round",
             series=[(o, "COLUMN", "LEFT_AXIS") for o in ofs],
-            bottom_title="轮次 · SOP 版本", left_title="召回率", anchor_row=base + 2 * CHART_ROW_STRIDE,
+            bottom_title="Round · SOP Version", left_title="Recall", anchor_row=base + 2 * CHART_ROW_STRIDE,
             max_data_rows=MAX_CHART_ROUNDS))
     reqs.append(build_chart_request(
-        runs, title=f"图4 每次运行的告警密度 / 时间漂移 / 单视频成本（守卫线 {MAX_MEAN_ALERT_DENSITY:.1f} 条/视频）",
-        domain_header="运行",
-        series=[("平均告警数 / 视频", "COLUMN", "LEFT_AXIS"), ("时间漂移均值 (秒)", "COLUMN", "LEFT_AXIS"),
-                (GUARDRAIL_HEADER, "LINE", "LEFT_AXIS"), ("单视频平均成本 (USD)", "LINE", "RIGHT_AXIS")],
-        bottom_title="轮次 · 运行", left_title="条/视频 · 秒", right_title="USD / 视频",
+        runs, title=f"Chart 4: Per-Run Alert Density / Timestamp Drift / Cost per Clip (Guardrail {MAX_MEAN_ALERT_DENSITY:.1f} findings/clip)",
+        domain_header="Run",
+        series=[("Mean Findings / Clip", "COLUMN", "LEFT_AXIS"), ("Mean Timestamp Drift (sec)", "COLUMN", "LEFT_AXIS"),
+                (GUARDRAIL_HEADER, "LINE", "LEFT_AXIS"), ("Mean Cost / Clip (USD)", "LINE", "RIGHT_AXIS")],
+        bottom_title="Round · Run", left_title="Findings/Clip · Seconds", right_title="USD / Clip",
         anchor_row=len(runs.rows) + 2,
         max_data_rows=MAX_CHART_RUNS))
     return reqs
@@ -664,7 +691,7 @@ def create_report_spreadsheet(spec: ReportSpec, folder_id: str, *, drive: Any, s
             spreadsheetId=sid, body={"requests": build_format_requests(spec) + spec.chart_requests}
         ).execute(num_retries=3)
     except Exception as exc:
-        raise SheetReportError(f"表格已创建但未写完（{url}）：{exc}") from exc
+        raise SheetReportError(f"Spreadsheet created but failed to complete writing ({url}): {exc}") from exc
     return sid, url
 
 
@@ -697,7 +724,7 @@ def update_report_spreadsheet(spec: ReportSpec, spreadsheet_id: str, *, sheets: 
             spreadsheetId=sid, body={"requests": build_format_requests(spec) + spec.chart_requests}
         ).execute(num_retries=3)
     except Exception as exc:
-        raise SheetReportError(f"表格原地刷新失败（{url}）：{exc}") from exc
+        raise SheetReportError(f"Failed to refresh spreadsheet in-place ({url}): {exc}") from exc
     return url
 
 
@@ -765,8 +792,8 @@ def publish_run_sheet_report_safely(
         outcome = SheetReportOutcome(
             status="skipped",
             status_line=(
-                f"Sheet report: SKIPPED — Terraform 变量 eval_results_folder_id 未设置（环境变量 "
-                f"{ENV_FOLDER_ID} 为空），本次不生成 Google Sheet 测评报告"
+                f"Sheet report: SKIPPED — Terraform variable eval_results_folder_id is not set (env "
+                f"{ENV_FOLDER_ID} is empty); skipping Google Sheet evaluation report generation"
             ),
         )
         logger.warning(outcome.status_line)
@@ -786,8 +813,8 @@ def publish_run_sheet_report_safely(
                      run_record.get("run_id"), folder, msg, exc_info=True)
         outcome = SheetReportOutcome(
             status="failed", title=title, error=msg,
-            status_line=(f"Sheet report: FAILED — {msg}（评测结果已保存在 score.json / GCS，本次评测不受影响；"
-                         f"可用 python -m eval.sheet_report 补生成）"),
+            status_line=(f"Sheet report: FAILED — {msg} (evaluation results are saved in score.json / GCS; "
+                         f"backfill with python -m eval.sheet_report)"),
         )
         _write_report_json(res_dir, outcome, folder, tz_name)
         return outcome
@@ -796,6 +823,9 @@ def publish_run_sheet_report_safely(
     logger.info("Sheet report created: %s (%s)", url, title)
     _write_report_json(res_dir, outcome, folder, tz_name)
     return outcome
+
+
+publish_eval_sheet = publish_run_sheet_report_safely
 
 
 # --------------------------------------------------------------------------------------- CLI

@@ -134,10 +134,10 @@ def test_engine_description_uses_configured_brand_only():
         display_name="stack-a-agent",
         gcp_location="europe-west4",
     )
-    assert deploy.build_reasoning_engine_body(**common)["description"].startswith("门店 CCTV AI 合规稽核 Agent")
+    assert deploy.build_reasoning_engine_body(**common)["description"].startswith("Store CCTV AI SOP Compliance Auditor")
     branded = deploy.build_reasoning_engine_body(**common, company_name="CHAGEE", tenant_label="霸王茶姬")
     # Byte-identical to the description the first environment's engine has always carried.
-    assert branded["description"].startswith("CHAGEE 霸王茶姬门店 CCTV AI 合规稽核 Agent（")
+    assert branded["description"].startswith("CHAGEE 霸王茶姬 Store CCTV AI SOP Compliance Auditor (")
 
 
 # --------------------------------------------------------------------------- Gemini Enterprise binding
@@ -267,7 +267,7 @@ def test_new_app_uses_configured_company_and_example_folder(monkeypatch):
     assert create["commonConfig"] == {"companyName": "ACME"}
     agent = next(b for m, u, b in fake.mutations() if u.endswith("/agents"))
     assert agent["displayName"] == "Stack A agent"
-    assert agent["starterPrompts"][0]["text"].endswith("https://drive.google.com/drive/folders/abc")
+    assert agent["starterPrompts"][0]["text"] == "[Full Daily Audit] Please audit store videos: "
     assert "Acme Tea" in agent["description"] and "霸王茶姬" not in agent["description"]
 
     fake_plain = _FakeDiscoveryEngine({})

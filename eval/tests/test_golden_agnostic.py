@@ -104,7 +104,7 @@ class ScorerIsGoldenAgnosticTest(unittest.TestCase):
         rep = sr.score([dict(i) for i in SYNTH_ITEMS], sr.flatten_findings(_jobs()), _judge)
         rep["judge_model"] = "injected"
         md = sr.render_markdown("synth", rep)
-        self.assertIn("全部 7 行", md)
+        self.assertIn("all 7 rows", md)
         self.assertNotIn("19", md)
 
     def test_temporal_mode_source_is_recorded(self):
@@ -221,14 +221,14 @@ class VersionSeparationTest(unittest.TestCase):
         spec = srp.build_report_spec(history=history + [synth], score_doc=rep, run_record=synth,
                                      golden_items=SYNTH_ITEMS, now_utc=NOW)
         overview = {r[0]: r[1] for r in spec.tables[0].rows}
-        self.assertIn("总体召回率 (7 题)", overview)
-        self.assertEqual(overview["黄金集版本 (golden_version)"], synth["golden_version"])
+        self.assertIn("Overall Recall (7 items)", overview)
+        self.assertEqual(overview["Golden Set Version (golden_version)"], synth["golden_version"])
         rounds, runs = spec.tables[2], spec.tables[3]
         self.assertEqual([r[0] for r in rounds.rows[1:]], ["r02 · v2.6_r02"])
         self.assertEqual([r[3] for r in runs.rows[1:]], ["synth_run1"])
         self.assertIn("D_FoodStorage", rounds.rows[0])
         self.assertIn(synth["golden_version"], rounds.note)
-        self.assertIn("其他版本 3 轮（5 次运行）未纳入", rounds.note)
+        self.assertIn("3 round(s) (5 run(s)) on other versions excluded", rounds.note)
         notes = [v for v in srp.build_value_ranges(spec) if v["values"] == [[rounds.note]]]
         self.assertEqual(len(notes), 2)  # rounds + runs tabs
 

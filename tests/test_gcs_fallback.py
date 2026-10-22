@@ -254,7 +254,7 @@ def test_reporter_and_auditor_fallback_links_use_storage_aware_url():
 )
 def test_internal_state_prefixes_blocked(target):
     gw = FakeGcs()
-    with pytest.raises(WorkspaceAccessError, match="内部暂存"):
+    with pytest.raises(WorkspaceAccessError, match="internal staging bucket"):
         asyncio.run(gw.probe_write_access(target))
     with pytest.raises(WorkspaceAccessError):
         asyncio.run(gw.list_folder_videos(target))
@@ -267,9 +267,9 @@ def test_whole_staging_bucket_blocked_customer_buckets_allowed():
     """The staging bucket has a 30-day auto-delete lifecycle rule: no customer data may live there."""
     gw = FakeGcs()
     for target in (f"gs://{STAGING}/stores/A", f"gs://{STAGING}/jobs_archive", f"gs://{STAGING}/sop"):
-        with pytest.raises(WorkspaceAccessError, match="30 天后自动删除"):
+        with pytest.raises(WorkspaceAccessError, match="auto-deleted after 30 days"):
             asyncio.run(gw.probe_write_access(target))
-        with pytest.raises(WorkspaceAccessError, match="内部暂存"):
+        with pytest.raises(WorkspaceAccessError, match="internal staging bucket"):
             asyncio.run(gw.list_folder_videos(target))
     assert gw.calls == []
     assert asyncio.run(gw.probe_write_access("gs://customer-cctv-bucket/stores/store_01")) == (
@@ -527,11 +527,11 @@ def test_server_done_and_confirm_messages_for_gcs_jobs(monkeypatch):
     monkeypatch.setattr(srv.audit_service, "get_status", _status)
     current = [done_job]
     msg = asyncio.run(srv._handle_conversation_turn("u@example.com", "s", "好了么"))
-    assert "📊 **稽核报告（Excel .xlsx）**：" in msg and done_job.report_sheet_url in msg
-    assert "[点击打开 Google Cloud Storage 目录](https://console.cloud.google.com/storage/browser/store-videos/stores/A/)" in msg
+    assert "📊 **Audit Report (Excel .xlsx)**:" in msg and done_job.report_sheet_url in msg
+    assert "[Open in Google Cloud Storage](https://console.cloud.google.com/storage/browser/store-videos/stores/A/)" in msg
     current = [drive_job]
     msg = asyncio.run(srv._handle_conversation_turn("u@example.com", "s", "好了么"))
-    assert "• 专属报告 Sheet：https://docs.google.com/x" in msg and "Excel" not in msg
+    assert "• 📊 **Audit Report Google Sheet**: https://docs.google.com/x" in msg and "Excel" not in msg
 
     async def _confirm(_text):
         return TurnDecision(action=TurnAction.CONFIRM)
@@ -542,7 +542,7 @@ def test_server_done_and_confirm_messages_for_gcs_jobs(monkeypatch):
     monkeypatch.setattr(srv, "classify_turn_with_llm", _confirm)
     monkeypatch.setattr(srv.audit_service, "start_audit", _start)
     msg = asyncio.run(srv._handle_conversation_turn("u@example.com", "s", "确认开始"))
-    assert "GCS 目录" in msg and ".xlsx" in msg and "Google Drive" not in msg
+    assert "generated inside `gs://store-videos/stores/A/`" in msg and ".xlsx" in msg and "Google Drive" not in msg
 
 
 # ---------------------------------------------------------------------------------------------
@@ -703,7 +703,7 @@ def test_init_script_upload_then_prompt_manager_reads_gcs_workbook(tmp_path, mon
 
     downloads_before = sum(1 for m, u in fake.calls if "alt=media" in u)
     cfg = asyncio.run(_load())
-    assert cfg.active_prompt_version == "Prompt_v2.5_V10全量17条标准版"
+    assert cfg.active_prompt_version == "Prompt_v2.5_Standard"
     assert cfg.active_model_version == "gemini-3.8-flash"
     assert len(cfg.rules) == 24 and cfg.rules[0].rule_id == "A1"
     assert sum(1 for m, u in fake.calls if "alt=media" in u) == downloads_before + 1  # Tab0 + rules: one download
@@ -711,10 +711,10 @@ def test_init_script_upload_then_prompt_manager_reads_gcs_workbook(tmp_path, mon
 
     # Customer edits in Excel: rewrite A1, drop (disable) the D2 row, switch the model pointer.
     def _edit(tabs):
-        rules = tabs["Prompt_v2.5_V10全量17条标准版"]
+        rules = tabs["Prompt_v2.5_Standard"]
         rules[1][6] = "【已修改】A1 新的检查要求"
-        tabs["Prompt_v2.5_V10全量17条标准版"] = [r for r in rules if not r or r[0] != "D2"]
-        for row in tabs["Tab0_版本总控与回滚开关"]:
+        tabs["Prompt_v2.5_Standard"] = [r for r in rules if not r or r[0] != "D2"]
+        for row in tabs["Tab0_Version_Control"]:
             if row and row[0] == "Active_Model_Version":
                 row[1] = "gemini-2.5-flash"
 
@@ -741,21 +741,21 @@ def test_json_snapshot_workbook_and_default_config_path(monkeypatch):
     monkeypatch.setattr(pm_module.config, "master_prompt_sheet_id", "gs://store-videos/sop/master_sheet.json")
     pm = PromptManager(sheet_client=GoogleSheetsConfigClient(gcs_gateway=fake), known_valid_models={"gemini-3.8-flash"})
     cfg = asyncio.run(pm.load_active_config())
-    assert cfg.active_prompt_version == "Prompt_v2.5_V10全量17条标准版" and len(cfg.rules) == 24
+    assert cfg.active_prompt_version == "Prompt_v2.5_Standard" and len(cfg.rules) == 24
 
 
 def test_gcs_sop_object_guardrails():
     gw = FakeGcs()
-    with pytest.raises(WorkspaceAccessError, match="具体的 .xlsx 或 .json"):
+    with pytest.raises(WorkspaceAccessError, match="specific .xlsx or .json"):
         gw.download_object_bytes("gs://store-videos")
-    with pytest.raises(WorkspaceAccessError, match="内部暂存"):
+    with pytest.raises(WorkspaceAccessError, match="internal staging bucket"):
         gw.download_object_bytes(f"gs://{STAGING}/jobs/master_sheet.xlsx")
-    with pytest.raises(WorkspaceAccessError, match="内部暂存"):
+    with pytest.raises(WorkspaceAccessError, match="internal staging bucket"):
         gw.upload_object_bytes(f"gs://{STAGING}/eval/x.xlsx", b"x", gg.XLSX_CONTENT_TYPE)
     # Even the staging bucket's sop/ prefix is refused (30-day auto-delete); customer buckets are fine.
-    with pytest.raises(WorkspaceAccessError, match="30 天后自动删除"):
+    with pytest.raises(WorkspaceAccessError, match="auto-deleted after 30 days"):
         gw.upload_object_bytes(f"gs://{STAGING}/sop/master_sheet.xlsx", b"x", gg.XLSX_CONTENT_TYPE)
-    with pytest.raises(WorkspaceAccessError, match="30 天后自动删除"):
+    with pytest.raises(WorkspaceAccessError, match="auto-deleted after 30 days"):
         gw.download_object_bytes(f"gs://{STAGING}/sop/master_sheet.xlsx")
     url = gw.upload_object_bytes("gs://customer-cctv-bucket/sop/master_sheet.xlsx", b"x", gg.XLSX_CONTENT_TYPE)
     assert url.endswith("/_details/customer-cctv-bucket/sop/master_sheet.xlsx")
@@ -793,12 +793,12 @@ def test_gcs_preflight_verifies_gcs_sop_workbook(tmp_path, monkeypatch):
     # 2. Workbook without the Tab0 pointer tab -> rejected.
     fake.put("store-videos", "sop/master_sheet.xlsx", gg.build_xlsx_bytes([{"name": "Sheet1", "rows": [["x"]]}]))
     job = asyncio.run(svc.preflight(user_id="u@example.com", drive_url="gs://store-videos/store1"))
-    assert job.state == JobState.REJECTED and "Tab0_版本总控与回滚开关" in job.preflight_report.message_to_user
+    assert job.state == JobState.REJECTED and "Tab0_Version_Control" in job.preflight_report.message_to_user
 
     # 3. Not a workbook at all -> rejected.
     fake.put("store-videos", "sop/master_sheet.xlsx", b"not a zip")
     job = asyncio.run(svc.preflight(user_id="u@example.com", drive_url="gs://store-videos/store1"))
-    assert job.state == JobState.REJECTED and "无法解析" in job.preflight_report.message_to_user
+    assert job.state == JobState.REJECTED and "Failed to parse" in job.preflight_report.message_to_user
 
     # 4. Proper workbook -> READY.
     fake.put("store-videos", "sop/master_sheet.xlsx", mod.build_xlsx_bytes(mod.load_snapshot(mod.DEFAULT_SNAPSHOT)))
@@ -875,7 +875,7 @@ def test_xml_entity_and_zip_bomb_guards():
     assert len(buf.getvalue()) < 1024 * 1024
     with pytest.raises(ValueError, match="uncompressed"):
         gg.read_xlsx_sheets(buf.getvalue())
-    with pytest.raises(ValueError, match="无法解析"):
+    with pytest.raises(ValueError, match="Failed to parse"):
         gg.load_gcs_sop_tabs(_billion_laughs_xlsx(), SOP_URI)
 
 
@@ -915,7 +915,7 @@ def test_download_size_cap_applies_when_metadata_size_missing():
 
     gw = _NoSizeMeta()
     gw.put("store-videos", "sop/master_sheet.xlsx", b"z" * 2048)
-    with pytest.raises(WorkspaceAccessError, match="上限"):
+    with pytest.raises(WorkspaceAccessError, match="exceeds the .* MiB limit"):
         gw.download_object_bytes(SOP_URI, max_bytes=1024)
 
 
@@ -969,7 +969,7 @@ def test_pinned_generation_download_and_prompt_manager(tmp_path):
     gen1 = fake.put("store-videos", "sop/master_sheet.xlsx", v1, ctype=gg.XLSX_CONTENT_TYPE)
 
     def _v2(tabs):
-        tabs["Prompt_v2.5_V10全量17条标准版"][1][6] = "【v2】A1 新规则"
+        tabs["Prompt_v2.5_Standard"][1][6] = "【v2】A1 新规则"
 
     gen2 = fake.put("store-videos", "sop/master_sheet.xlsx", _edit_workbook(v1, _v2), ctype=gg.XLSX_CONTENT_TYPE)
     assert gen1 != gen2
@@ -978,7 +978,7 @@ def test_pinned_generation_download_and_prompt_manager(tmp_path):
     assert fake.download_object_bytes(f"{SOP_URI}#{gen1}") == v1
     assert [u for _, u in fake.calls] and all(f"generation={gen1}" in u for _, u in fake.calls)
     assert "fields=size,generation" in fake.calls[0][1] and "alt=media" in fake.calls[1][1]
-    with pytest.raises(WorkspaceAccessError, match="历史版本"):
+    with pytest.raises(WorkspaceAccessError, match="Historical version"):
         fake.download_object_bytes(f"{SOP_URI}#999")
 
     pm = PromptManager(sheet_client=GoogleSheetsConfigClient(gcs_gateway=fake), known_valid_models={"gemini-3.8-flash"})
@@ -1026,7 +1026,7 @@ def test_init_script_continues_when_versioning_forbidden(monkeypatch, capsys):
     monkeypatch.setattr(mod, "make_gcs_gateway", lambda sa="": fake2)
     assert mod.main(["--gcs-uri", SOP_URI, "--no-enable-versioning"]) == 0
     assert not any(m == "PATCH" for m, _ in fake2.calls)
-    with pytest.raises(WorkspaceAccessError, match="30 天后自动删除"):
+    with pytest.raises(WorkspaceAccessError, match="auto-deleted after 30 days"):
         mod.main(["--gcs-uri", f"gs://{STAGING}/sop/master_sheet.xlsx"])
 
 
@@ -1195,20 +1195,20 @@ def test_multi_session_concurrent_gcs_and_drive_no_job_id_collision(tmp_path, mo
     by_session = {j.session_id: j for j in asyncio.run(svc.jobs.list_for_user(user, limit=10))}
     job_gcs, job_drive = by_session[s1], by_session[s2]
     assert job_gcs.job_id != job_drive.job_id
-    assert f"预检单号 `{job_gcs.job_id}`" in r1 and f"单号 `{job_gcs.job_id}`" in r1
-    assert f"预检单号 `{job_drive.job_id}`" in r2 and job_gcs.job_id not in r2
+    assert f"Preflight ID `{job_gcs.job_id}`" in r1 and f"Job ID `{job_gcs.job_id}`" in r1
+    assert f"Preflight ID `{job_drive.job_id}`" in r2 and job_gcs.job_id not in r2
     assert job_gcs.folder_id == gcs_url and job_drive.folder_id == "1ExampleStoreFolderId000000000000"
 
     # 2. CONFIRM in session 1 -> job_gcs RUNNING and now the most recently updated job of the user.
     c1 = turn(s1, "确认")
-    assert f"单号 `{job_gcs.job_id}`" in c1
+    assert f"Job ID `{job_gcs.job_id}`" in c1
     running_gcs = asyncio.run(svc.jobs.get(user, job_gcs.job_id))
     assert running_gcs.state == JobState.RUNNING
     assert running_gcs.updated_at >= asyncio.run(svc.jobs.get(user, job_drive.job_id)).updated_at
 
     # 3. "好了么" in session 2 answers with session 2's READY job, never session 1's running job.
     st2 = turn(s2, "好了么")
-    assert f"任务 `{job_drive.job_id}` 当前状态：`ready`（预检已通过，待确认启动）" in st2
+    assert f"Job `{job_drive.job_id}` Current Status: `ready` (Preflight passed, awaiting confirmation)" in st2
     assert job_gcs.job_id not in st2
 
     # A confirm in session 1 again is refused (its own job already runs) - never grabs session 2's job.
@@ -1218,13 +1218,13 @@ def test_multi_session_concurrent_gcs_and_drive_no_job_id_collision(tmp_path, mo
 
     # 4. CONFIRM in session 2 starts job_drive; STATUS stays pinned per session whoever heartbeats last.
     c2 = turn(s2, "确认")
-    assert f"单号 `{job_drive.job_id}`" in c2
+    assert f"Job ID `{job_drive.job_id}`" in c2
     assert asyncio.run(svc.jobs.get(user, job_drive.job_id)).state == JobState.RUNNING
     for bump in (job_gcs.job_id, job_drive.job_id, job_gcs.job_id):
         asyncio.run(svc.jobs.save(asyncio.run(svc.jobs.get(user, bump))))
         st1, st2 = turn(s1, "好了么"), turn(s2, "好了么")
-        assert f"任务 `{job_gcs.job_id}`" in st1 and job_drive.job_id not in st1
-        assert f"任务 `{job_drive.job_id}`" in st2 and job_gcs.job_id not in st2
+        assert f"Job `{job_gcs.job_id}`" in st1 and job_drive.job_id not in st1
+        assert f"Job `{job_drive.job_id}`" in st2 and job_gcs.job_id not in st2
 
 
 def test_placeholder_session_id_isolated_by_thread_history():
@@ -1295,7 +1295,7 @@ def test_context_job_id_never_restarts_a_done_job(tmp_path):
 
     async def _run():
         done = await svc.jobs.save(AuditJob(user_id="u@example.com", session_id="S", folder_id="A", state=JobState.DONE))
-        with pytest.raises(ValueError, match="无法重复启动"):
+        with pytest.raises(ValueError, match="cannot be started again"):
             await svc.start_audit(user_id="u@example.com", job_id=done.job_id, session_id="S", job_id_from_context=True)
 
     asyncio.run(_run())

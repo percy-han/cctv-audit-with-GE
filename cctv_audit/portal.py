@@ -39,7 +39,7 @@ from .gcs_gateway import (
 )
 from .jobs import AuditJob
 
-INITIAL_REVIEW_STATUS: str = "待复核"
+INITIAL_REVIEW_STATUS: str = "PENDING"
 
 logger = logging.getLogger("cctv_audit.portal")
 
@@ -58,12 +58,35 @@ def get_portal_ttl_sec() -> int:
             pass
     return DEFAULT_PORTAL_TTL_SEC
 
+
 PORTAL_STATUS_TO_SHEET_LABEL: Dict[str, str] = {
-    "CONFIRMED_VIOLATION": "✅ 确认违规 (CONFIRMED)",
-    "DISMISSED": "❌ 误报排除 (FALSE_POSITIVE)",
-    "FOLLOWUP": "⚠️ 待调取后续录像 (FOLLOWUP)",
-    "PENDING": INITIAL_REVIEW_STATUS,
+    "confirmed": "✅ CONFIRMED",
+    "false_pos": "❌ FALSE_POSITIVE",
+    "followup": "⚠️ FOLLOWUP",
+    "pending": "PENDING",
+    "CONFIRMED_VIOLATION": "✅ CONFIRMED",
+    "CONFIRMED": "✅ CONFIRMED",
+    "DISMISSED": "❌ FALSE_POSITIVE",
+    "FALSE_POSITIVE": "❌ FALSE_POSITIVE",
+    "FALSE_POS": "❌ FALSE_POSITIVE",
+    "FOLLOWUP": "⚠️ FOLLOWUP",
+    "PENDING": "PENDING",
 }
+
+_TAB1_CANDIDATE_TITLES: Tuple[str, ...] = (
+    "Tab1_Violation_Review",
+    "违规事件 3 秒复核台",
+    "Violation_Review",
+    "Findings",
+    "违规明细",
+)
+
+_TAB2_CANDIDATE_TITLES: Tuple[str, ...] = (
+    "Tab2_Token_Ledger",
+    "本次视频 Token 消耗与耗时账单",
+    "Token_Ledger",
+    "Token账单",
+)
 
 _DETECTED_BASE_URL: str = ""
 
@@ -131,12 +154,12 @@ def verify_portal_signature(
 ) -> Tuple[bool, str]:
     """Constant-time verification of the portal HMAC signature and expiration timestamp."""
     if not sig or not exp:
-        return False, "缺少访问签名参数（sig / exp），请从 Google Chat 通知卡片重新点击进入。"
+        return False, "Missing access signature parameters (sig / exp). Please click the link from Google Chat again. / 缺少访问签名参数（sig / exp），请从 Google Chat 通知卡片重新点击进入。"
     if not batch_id and not job_id:
-        return False, "缺少任务标识（job 或 batch 参数）。"
+        return False, "Missing job or batch identifier. / 缺少任务标识（job 或 batch 参数）。"
     now_ts = int(now if now is not None else time.time())
     if int(exp) < now_ts:
-        return False, "该督导复核工作台链接已过期（有效期 30 天），请从最新通知或报告进入。"
+        return False, "This supervisor workbench link has expired (30-day TTL). / 该督导复核工作台链接已过期（有效期 30 天），请从最新通知或报告进入。"
     expected = compute_portal_signature(
         job_id=job_id,
         user_id=user_id,
@@ -145,7 +168,7 @@ def verify_portal_signature(
     )
     cleaned_sig = sig.strip().rstrip(")*>]'\" ").lower()
     if not hmac.compare_digest(expected, cleaned_sig):
-        return False, "访问签名校验未通过（HMAC 签名不匹配）。"
+        return False, "Access signature verification failed (HMAC mismatch). / 访问签名校验未通过（HMAC 签名不匹配）。"
     return True, ""
 
 
@@ -185,54 +208,173 @@ def build_portal_url(
 
 
 def map_sheet_status_to_portal_code(raw_status: str) -> str:
-    """Maps Google Sheet Column J text back to the portal's 4 state codes."""
+    """Maps Google Sheet Column J text back to the portal's 4 state codes, supporting both English and legacy Chinese."""
     text = (raw_status or "").strip()
     upper = text.upper()
-    if not text or "PENDING_HUMAN_REVIEW" in upper or "待人工复核" in text:
+    if (
+        not text
+        or "PENDING_HUMAN_REVIEW" in upper
+        or upper == "PENDING"
+        or "待人工复核" in text
+        or "待复核" in text
+    ):
         return "PENDING"
-    if "FALSE_POSITIVE" in upper or "DISMISSED" in upper or "误报" in text or "排除" in text:
+    if (
+        "FALSE_POSITIVE" in upper
+        or "FALSE_POS" in upper
+        or "DISMISSED" in upper
+        or "误报" in text
+        or "排除" in text
+    ):
         return "DISMISSED"
-    if "FOLLOWUP" in upper or "后续录像" in text or "待调" in text:
+    if (
+        "FOLLOWUP" in upper
+        or "FOLLOW-UP" in upper
+        or "FOLLOW_UP" in upper
+        or "后续录像" in text
+        or "待调" in text
+        or "待跟进" in text
+    ):
         return "FOLLOWUP"
-    if "CONFIRMED" in upper or "确认违规" in text:
+    if "CONFIRMED" in upper or "确认违规" in text or "属实" in text:
         return "CONFIRMED_VIOLATION"
     return "PENDING"
 
 
 def map_portal_code_to_sheet_status(portal_code: str) -> str:
-    """Maps a portal decision code (`CONFIRMED_VIOLATION` / `DISMISSED` / `FOLLOWUP` / `PENDING`) to Sheet Column J."""
-    code = (portal_code or "").strip().upper()
-    return PORTAL_STATUS_TO_SHEET_LABEL.get(code, INITIAL_REVIEW_STATUS)
+    """Maps a portal decision code (`confirmed`/`false_pos`/`followup`/`pending` or `CONFIRMED_VIOLATION`/`DISMISSED`/`FOLLOWUP`/`PENDING`) to Sheet Column J."""
+    raw = (portal_code or "").strip()
+    for key in (raw, raw.lower(), raw.upper()):
+        if key in PORTAL_STATUS_TO_SHEET_LABEL:
+            return PORTAL_STATUS_TO_SHEET_LABEL[key]
+    mapped = map_sheet_status_to_portal_code(raw)
+    return PORTAL_STATUS_TO_SHEET_LABEL.get(mapped, INITIAL_REVIEW_STATUS)
+
+
+MODULE_META: Dict[str, Dict[str, Any]] = {
+    "A": {
+        "order": 1,
+        "kicker": "MODULE A",
+        "name": "Personal Hygiene & Handwashing",
+        "name_en": "Personal Hygiene & Handwashing",
+        "name_zh": "个人卫生与洗手池规范",
+        "title": "Personal Hygiene & Handwashing",
+        "title_en": "Personal Hygiene & Handwashing",
+        "title_zh": "洗手与手部卫生",
+        "desc": "Mandatory handwashing triggers (5-minute tracking window), 5-step handwashing verification, and disposable glove hygiene (APAC Parameters 1.5.1–1.5.5 & 1.6).",
+        "desc_en": "Mandatory handwashing triggers (5-minute tracking window), 5-step handwashing verification, and disposable glove hygiene (APAC Parameters 1.5.1–1.5.5 & 1.6).",
+        "desc_zh": "强制洗手触发场景、五步洗手法核对与一次性手套规范。对应 APAC 参数表 1.5.1–1.5.5 与 1.6，是污染链条的源头控制项。",
+    },
+    "B": {
+        "order": 2,
+        "kicker": "MODULE B",
+        "name": "Ice Maker Cleaning & Sanitizing",
+        "name_en": "Ice Maker Cleaning & Sanitizing",
+        "name_zh": "制冰机拆洗与消毒规范",
+        "title": "Ice Maker Cleaning & Sanitizing",
+        "title_en": "Ice Maker Cleaning & Sanitizing",
+        "title_zh": "制冰机与冰块管理",
+        "desc": "Weekly ice maker disassembly & sanitizing workflow, contact time lockouts (5min/10min), KAY-5 chemical verification, 3-color towel separation, and ice scoop storage (SOP 8 / SOP 21 & Parameters 3.1 / 4.1 / 4.5).",
+        "desc_en": "Weekly ice maker disassembly & sanitizing workflow, contact time lockouts (5min/10min), KAY-5 chemical verification, 3-color towel separation, and ice scoop storage (SOP 8 / SOP 21 & Parameters 3.1 / 4.1 / 4.5).",
+        "desc_zh": "制冰机周清洁流程、部件静置锁定期、化学品与三色毛巾专用，以及冰铲取冰与存放规范。对应 SOP 8 / SOP 21 与参数表 3.1 / 4.1 / 4.5。",
+    },
+    "C": {
+        "order": 3,
+        "kicker": "MODULE C",
+        "name": "Counter & Utensil Sanitation",
+        "name_en": "Counter & Utensil Sanitation",
+        "name_zh": "吧台器具与抹布消毒桶",
+        "title": "Counter & Utensil Sanitation",
+        "title_en": "Counter & Utensil Sanitation",
+        "title_zh": "常态红线 · 仪容 · 泡茶设备",
+        "desc": "Zero-tolerance cross-contamination scan, single-use cup & label rules, on-duty conduct, grooming & personal phone rules, waste bin closure, and automated tea maker icing (APAC Parameters 1.1–1.4, 4.x, 6.x–9.x & SOP 6.2).",
+        "desc_en": "Zero-tolerance cross-contamination scan, single-use cup & label rules, on-duty conduct, grooming & personal phone rules, waste bin closure, and automated tea maker icing (APAC Parameters 1.1–1.4, 4.x, 6.x–9.x & SOP 6.2).",
+        "desc_zh": "每周必跑的零容忍红线扫描：交叉污染、杯具、不当行为、仪容着装与私人手机，以及泡茶机出茶入冰时效。",
+    },
+    "D": {
+        "order": 4,
+        "kicker": "MODULE D",
+        "name": "Beverage Prep & Store Environment",
+        "name_en": "Beverage Prep & Store Environment",
+        "name_zh": "茶汤制备与门店环境",
+        "title": "Beverage Prep & Store Environment",
+        "title_en": "Beverage Prep & Store Environment",
+        "title_zh": "运营与人效 (IPLH)",
+        "desc": "4-station closed-loop cup output counting, store & individual IPLH calculation, peak/off-peak staffing deployment, and beverage recipe & jigger/shaker compliance.",
+        "desc_en": "4-station closed-loop cup output counting, store & individual IPLH calculation, peak/off-peak staffing deployment, and beverage recipe & jigger/shaker compliance.",
+        "desc_zh": "有效出杯计数、每工时出杯率核算、人力投放合理性与出品规范抽查。",
+    },
+    "OTHER": {
+        "order": 9,
+        "kicker": "MODULE OTHER",
+        "name": "General SOP Audit",
+        "name_en": "General SOP Audit",
+        "name_zh": "其他专项稽核",
+        "title": "General SOP Audit",
+        "title_en": "General SOP Audit",
+        "title_zh": "专项测试与扩展条款",
+        "desc": "Targeted spot-checks and extended SOP audit clauses.",
+        "desc_en": "Targeted spot-checks and extended SOP audit clauses.",
+        "desc_zh": "自定义专项抽检与扩展 SOP 条款。",
+    },
+}
 
 
 _DEFAULT_DOC_REF_BY_PREFIX: Dict[str, str] = {
-    "A1": "APAC Cloud Audit Parameters 2026 v1.0 · 参数表 1.5.5 & Reference Case 1",
-    "A2": "APAC Cloud Audit Parameters 2026 v1.0 · 参数表 1.5.3 / 1.5.5",
-    "A3": "APAC Cloud Audit Parameters 2026 v1.0 · 参数表 1.5.1–1.5.4",
-    "A4": "APAC Cloud Audit Parameters 2026 v1.0 · 参数表 1.6",
-    "A5": "APAC Cloud Audit Parameters 2026 v1.0 · 参数表 1.5.2 (2h 周期)",
+    "A1": "APAC Cloud Audit Parameters 2026 v1.0 · Table 1.5.5 & Reference Case 1",
+    "A2": "APAC Cloud Audit Parameters 2026 v1.0 · Table 1.5.3 / 1.5.5",
+    "A3": "APAC Cloud Audit Parameters 2026 v1.0 · Table 1.5.1–1.5.4",
+    "A4": "APAC Cloud Audit Parameters 2026 v1.0 · Table 1.6",
+    "A5": "APAC Cloud Audit Parameters 2026 v1.0 · Table 1.5.2 (2h Cycle)",
     "B0": "SOP 8 (Manitowoc) & SOP 21 (Langtuo)",
     "B1-1": "21. SOP Ice Maker Machine (Model: Langtuo) APAC 18082025",
     "B1-2": "8. SOP Manitowoc Ice Maker Machine APAC 06052026",
     "B2": "SOP 8 Step 7–12 & SOP 21 Step 7–19",
     "B3": "APAC Cloud Audit Parameters 2026 v1.0 · '0' Tolerance & SOP 8/21",
-    "B4": "APAC Cloud Audit Parameters 2026 v1.0 · 参数表 3.1 & SOP 8/21",
-    "B5": "APAC Cloud Audit Parameters 2026 v1.0 · 参数表 4.1 / 4.5",
-    "C1": "APAC Cloud Audit Parameters 2026 v1.0 · '0' Tolerance 交叉污染",
-    "C2": "APAC Cloud Audit Parameters 2026 v1.0 · '0' Tolerance 杯具规范",
-    "C3": "APAC Cloud Audit Parameters 2026 v1.0 · '0' Tolerance 不当行为",
-    "C4": "APAC Cloud Audit Parameters 2026 v1.0 · 参数表 1.1–1.4",
-    "C5": "APAC Cloud Audit Parameters 2026 v1.0 · 参数表 4.3 / 4.4",
-    "C6": "APAC Cloud Audit Parameters 2026 v1.0 · 参数表 6.x / 7.x / 8.x",
-    "C7": "APAC Cloud Audit Parameters 2026 v1.0 · 参数表 9.x",
+    "B4": "APAC Cloud Audit Parameters 2026 v1.0 · Table 3.1 & SOP 8/21",
+    "B5": "APAC Cloud Audit Parameters 2026 v1.0 · Table 4.1 / 4.5",
+    "C1": "APAC Cloud Audit Parameters 2026 v1.0 · '0' Tolerance Cross-Contamination",
+    "C2": "APAC Cloud Audit Parameters 2026 v1.0 · '0' Tolerance Cup Hygiene",
+    "C3": "APAC Cloud Audit Parameters 2026 v1.0 · '0' Tolerance Misconduct",
+    "C4": "APAC Cloud Audit Parameters 2026 v1.0 · Table 1.1–1.4",
+    "C5": "APAC Cloud Audit Parameters 2026 v1.0 · Table 4.3 / 4.4",
+    "C6": "APAC Cloud Audit Parameters 2026 v1.0 · Table 6.x / 7.x / 8.x",
+    "C7": "APAC Cloud Audit Parameters 2026 v1.0 · Table 9.x",
     "C8": "SOP 6.2 Automated Tea Maker Machine",
-    "D1": "APAC Cloud Audit Reference v2 · Week 3 人效模块",
-    "D2": "APAC Cloud Audit Reference v2 · Week 3 人效模块",
-    "D3": "APAC Cloud Audit Reference v2 · Week 3 人效模块",
-    "D4": "APAC Cloud Audit Parameters 2026 v1.0 · 参数表 8.4",
+    "D1": "APAC Cloud Audit Reference v2 · Week 3 IPLH Module",
+    "D2": "APAC Cloud Audit Reference v2 · Week 3 IPLH Module",
+    "D3": "APAC Cloud Audit Reference v2 · Week 3 IPLH Module",
+    "D4": "APAC Cloud Audit Parameters 2026 v1.0 · Table 8.4",
 }
 
 _CLEAN_SUBTITLE_BY_RULE: Dict[str, str] = {
+    "A1": "Mandatory Handwashing Triggers (5-Min Tracking Window)",
+    "A2": "Touching Food/Utensils or Donning Gloves After Contamination Without Handwashing",
+    "A3": "Standard 5-Step Handwashing Sequence (Wet -> Soap -> Scrub >=20s -> Rinse -> Paper Towel Dry)",
+    "A4": "Disposable Glove Wearing & Immediate Replacement After Contamination",
+    "A5": "Scheduled Every-2-Hour On-Duty Handwashing Compliance",
+    "B0": "Ice Maker Model Identification & 5 Detachable Core Parts Visual Verification",
+    "B1-1": "Langtuo Split Ice Maker 15-Step Weekly Cleaning & Sanitizing Procedure",
+    "B1-2": "Manitowoc Ice Maker 13-Step Weekly Cleaning & Self-Cleaning Cycle",
+    "B2": "Ice Maker 5-Part Sanitizer Contact Time (5min/10min) & Full Perimeter Edge Coverage",
+    "B3": "Ice Maker Chemical Bottle Verification (White/Clear KAY-5 Only; Yellow Bottle Prohibited)",
+    "B4": "3-Color Towel Separation, Sanitizer Bucket Origin & Perimeter Frame Wiping",
+    "B5": "Ice Scoop Dedicated Holder Storage & Sanitary Ice Scooping",
+    "C1": "Zero-Tolerance Cross-Contamination Red Line (Dedicated Sinks / No Bare-Hand Contact / Cup Interior)",
+    "C2": "Single-Use Customer Cups & Single-Label Compliance",
+    "C3": "Zero-Tolerance On-Duty Misconduct (No Smoking / Gaming / Sleeping / Eating in Prep Area)",
+    "C4": "Staff Grooming (Hairnet/Cap/Mask/Apron), Personal Items & No Personal Phone in Prep Area",
+    "C5": "Step-On Trash Bin Lid Closure & Floor Hygiene (No Overflow or Standing Water >15 Min)",
+    "C6": "Automated Tea Maker, Steamer, Blender & Chiller Door Operation & Maintenance",
+    "C7": "Customer Service Etiquette (Greeting Within 10s, Two-Handed Handover, Receipt Check & Sealing)",
+    "C8": "Tea Maker Dispensing Over Ice (Pre-Ice 2–3 Min Ahead) & Stirring Within 30s",
+    "D1": "4-Station Closed-Loop Valid Cup Output Count (Label/Scan -> Ice/Shake -> Pour -> Seal/Serve)",
+    "D2": "Store Total IPLH (Drinks Per Labor Hour) & Individual Hourly Output Calculation",
+    "D3": "Peak vs. Off-Peak Staffing Deployment Assessment",
+    "D4": "Beverage Recipe & Jigger/Shaker Compliance Spot-Check (Min 3 Cups)",
+}
+
+_CLEAN_SUBTITLE_ZH_BY_RULE: Dict[str, str] = {
     "A1": "强制洗手触发场景（5 分钟追踪监视窗）",
     "A2": "污染后未洗手直接戴手套或接触食品器具（三要素红线）",
     "A3": "标准五步洗手流程与首尾动作核对（湿手→皂液→搓洗≥20s→冲净→纸巾擦干）",
@@ -259,12 +401,94 @@ _CLEAN_SUBTITLE_BY_RULE: Dict[str, str] = {
     "D4": "出品制作配方与量杯/雪克杯规范抽查（至少 3 杯）",
 }
 
+_DEFAULT_PASS_EN_BY_RULE: Dict[str, str] = {
+    "A1": "Within 5 minutes of touching hair/face/mask/phone/trash bin/cleaning tools, staff must complete the full 5-step handwashing procedure at the dedicated hand sink.",
+    "A2": "After any contamination trigger, staff must wash hands at the handwashing sink before putting on new gloves or touching any food-contact utensils.",
+    "A3": "Follow all 5 handwashing steps in order: wet hands with running water -> apply soap -> scrub foam across palms/backs/fingers/thumbs/wrists for >=20s -> rinse thoroughly -> dry with single-use paper towel.",
+    "A4": "Wear disposable gloves throughout ready-to-eat food/ice handling and replace immediately after handwashing or any contamination.",
+    "A5": "All on-duty staff complete scheduled handwashing at least once every 2 hours.",
+    "B0": "Correctly identify ice maker model (Langtuo vs. Manitowoc) and visually verify all 5 core detachable parts during weekly cleaning.",
+    "B1-1": "Execute all 15 steps of SOP 21 for Langtuo ice makers: power off, remove parts, spray KAY-5 and soak >=10 min, pour 8L sanitizer, and close doors.",
+    "B1-2": "Execute all 13 steps of SOP 8 for Manitowoc ice makers: switch OFF, remove 3 internal parts, spray KAY-5 and soak >=5 min, pour 3L sanitizer, and run self-clean cycle.",
+    "B2": "Ensure sanitizer sits undisturbed on all disassembled ice maker parts for the full required duration (Manitowoc >=5 min / Langtuo >=10 min) and wipe all 4 perimeter edges.",
+    "B3": "Use only colorless KAY-5 sanitizer in the white/clear spray bottle for ice maker sanitizing; never use yellow multi-purpose cleaner bottles.",
+    "B4": "Use a clean red-trimmed towel taken directly from the labeled red sanitizer bucket to wipe ice maker interior, water distributor, curtain, and door frame edges.",
+    "B5": "Retrieve ice scoop from the covered dedicated holder, wear disposable gloves while scooping ice, and return the scoop to the holder immediately after use.",
+    "C1": "Strictly separate handwashing, food-prep, and mop sinks; never touch ice/fruit with bare hands or touch the inner wall/rim of customer cups.",
+    "C2": "Use each customer cup once only, apply a single order label cleanly, and never place receipts or pens inside food containers.",
+    "C3": "Maintain professional conduct in prep and service areas; no smoking, gaming, sleeping, eating/drinking in prep zones, or ignoring customers.",
+    "C4": "Wear hairnet, cap, mask covering nose and mouth, and clean apron properly (hang removed aprons in designated area); never use personal phones in prep/bar areas.",
+    "C5": "Keep step-on trash bin lids closed, tie temporary trash bags, and clear any floor spills or overflow within 15 minutes.",
+    "C6": "Wipe automated tea maker nozzles/latches with dedicated towel before and after brewing, purge steam wands, and close chiller doors promptly.",
+    "C7": "Greet arriving customers within 10 seconds, verify receipts, seal drinks properly, and hand over orders with both hands.",
+    "C8": "Prepare ice bucket 2–3 minutes before tea dispensing and stir brewed tea over ice within 30 seconds of completion.",
+    "D1": "Complete all 4 beverage station steps (label/scan -> ice/shake -> pour -> seal/handover) for each valid cup counted.",
+    "D2": "Achieve target store IPLH and individual hourly beverage output benchmarks.",
+    "D3": "Align on-duty staffing headcount and station assignments with peak and off-peak order volume.",
+    "D4": "Follow standard recipe cards using graduated jiggers and shaker cups across at least 3 spot-checked beverages.",
+}
+
+_DEFAULT_FAIL_EN_BY_RULE: Dict[str, str] = {
+    "A1": "Failing to wash hands within 5 minutes after touching hair/face/mask/phone/trash bin/cleaning tools, or resuming prep without handwashing.",
+    "A2": "Putting on gloves or touching food/utensils directly after a contamination event without first completing handwashing (Red Line).",
+    "A3": "Skipping wet-hands step (dry soap application), scrubbing foam for <20s, washing with gloves on, or drying hands on apron/clothes.",
+    "A4": "Handling ready-to-eat ingredients without gloves, reusing contaminated gloves, or failing to change gloves after touching non-food surfaces.",
+    "A5": "No scheduled handwashing observed for on-duty staff across a 2-hour continuous window.",
+    "B0": "Misidentifying ice maker model or failing to disassemble and show all required detachable parts.",
+    "B1-1": "Skipping power-off, failing to soak parts for >=10 minutes, omitting 8L sanitizer pour, or leaving Langtuo doors open during sanitizing.",
+    "B1-2": "Cleaning with power ON, soaking parts for <5 minutes, or skipping the 3L sanitizer self-cleaning cycle on Manitowoc ice makers.",
+    "B2": "Rinsing or wiping sprayed ice maker parts before the 5-min / 10-min sanitizer contact lock period expires, or missing the 4 side perimeter edges.",
+    "B3": "Spraying or cleaning the ice maker with a yellow bottle (multi-purpose detergent) or unapproved chemical container (Zero-Tolerance Red Line).",
+    "B4": "Wiping ice maker interior/parts with a yellow/blue towel, an un-sanitized towel from the counter, or missing perimeter frame wiping.",
+    "B5": "Leaving the ice scoop buried in the ice bin, laying it flat on top of the machine/counter, or scooping ice without gloves.",
+    "C1": "Washing mops/cleaning tools or hands in food/utensil sinks, grabbing ice/garnishes with bare hands, or fingers touching the inside of customer cups.",
+    "C2": "Reusing customer cups, stacking wet cups improperly, or placing receipts/pens inside cups or food containers.",
+    "C3": "Smoking, playing cards/games, sleeping, eating/drinking in the bar/prep zone, or leaving customers unattended.",
+    "C4": "Missing hairnet/cap, mask pulled below nose/chin, apron placed on food counter/equipment, or using a personal mobile phone in the work zone.",
+    "C5": "Trash bin lid left open, overflowing waste, or standing water on the floor for more than 15 minutes.",
+    "C6": "Failing to wipe tea maker outlet/latch, leaving chiller/freezer doors ajar, or improper blender/steamer sanitation.",
+    "C7": "Ignoring customers for >10 seconds at the front counter, single-handed drink handover, or unsealed packaging.",
+    "C8": "Dispensing hot tea without pre-prepared ice or failing to stir tea with ice within 30 seconds after dispensing.",
+    "D1": "Incomplete station loop or unverified cup output count.",
+    "D2": "Store or individual IPLH below benchmark threshold.",
+    "D3": "Under-staffing during peak queue buildup or idle over-staffing during off-peak hours.",
+    "D4": "Free-pouring ingredients without a jigger or deviating from standard shaker/recipe steps.",
+}
+
 _DEFAULT_RECTIFICATION_BY_RULE: Dict[str, str] = {
+    "A1": "[48h Rectification] Retrain involved staff on mandatory handwashing triggers (must complete 5-step handwashing within 5 minutes after touching hair/face/mask/phone/trash bin/cleaning tools).",
+    "A2": "[48h Red-Line Rectification] Strictly prohibit putting on gloves or touching food utensils after contamination without washing hands; store manager must supervise and sign off on 'Contamination Trigger -> 5-Step Handwash -> New Gloves'.",
+    "A3": "Require involved staff to strictly follow the 5-step handwashing procedure (wet hands -> apply soap -> scrub foam >=20s -> rinse -> dry with paper towel); never wash with gloves on or apply soap to dry hands.",
+    "A4": "Require staff to wear disposable gloves throughout ready-to-eat food handling and replace with new gloves immediately after handwashing or contamination.",
+    "A5": "Enforce the store's 2-hour scheduled handwashing reminder mechanism for all on-duty staff.",
+    "B0": "Verify ice maker model and ensure all 5 detachable core components are fully removed and visible during weekly sanitizing.",
+    "B1-1": "[48h Red-Line Rectification] Re-execute the full 15-step Langtuo weekly cleaning per SOP 21: power off, place disassembled parts on top, spray & soak >=10 min, pour 8L sanitizer, and close doors.",
+    "B1-2": "[48h Red-Line Rectification] Re-execute the full 13-step Manitowoc weekly cleaning per SOP 8: switch OFF, remove 3 internal parts, spray & soak >=5 min, pour 3L sanitizer, and run self-clean cycle.",
+    "B2": "[48h Red-Line Rectification] Ensure sprayed sanitizer sits undisturbed for the full required duration (Manitowoc >=5 min / Langtuo >=10 min) and wipe all 4 side perimeter edges of the cover and water curtain.",
+    "B3": "[48h Red-Line Rectification] Immediately remove and isolate the yellow multi-purpose cleaner bottle; reiterate that ice maker sanitizing must only use colorless KAY-5 sanitizer in the white/clear spray bottle.",
+    "B4": "[48h Red-Line Rectification] Wipe ice maker interior, water pipe, water curtain, and inner door walls strictly using a clean red-trimmed towel taken directly from the labeled sanitizer bucket.",
+    "B5": "Immediately wash and sanitize the ice scoop and return it to its covered dedicated holder; never leave the ice scoop inside the ice bin or flat on the counter.",
+    "C1": "[48h Red-Line Rectification] Immediately eliminate cross-contamination hazards; strictly prohibit washing mops/cleaning tools in food sinks or touching ready-to-eat ingredients with bare hands.",
+    "C2": "[48h Red-Line Rectification] Strictly prohibit reusing beverage cups or placing receipts/pens inside food containers.",
+    "C3": "[48h Red-Line Rectification] Conduct formal disciplinary review with involved staff and eliminate on-duty misconduct in work areas.",
+    "C4": "Ensure all staff properly wear hairnets, caps, masks, and clean aprons (hang removed aprons in the designated storage area); reiterate the zero-tolerance ban on personal mobile phones in kitchen/bar areas.",
+    "C5": "Clear trash bins and floor standing water promptly; keep step-on trash bin lids closed and temporary trash bags tied.",
+    "C6": "Strictly follow SOP to wipe automated tea maker hot water outlets and latches with a dedicated towel before and after brewing, and keep chiller doors tightly closed.",
+    "C7": "Strengthen front-bar greeting awareness: greet arriving customers within 10 seconds and hand over beverages with both hands.",
+    "C8": "Strictly enforce tea maker dispensing over ice (prepare ice 2–3 minutes ahead) and complete stirring within 30 seconds after dispensing.",
+    "D1": "Review 4-station beverage output loop and ensure standardized station handoffs.",
+    "D2": "Review store IPLH metrics and optimize station bottlenecks.",
+    "D3": "Adjust shift scheduling to match peak and off-peak customer traffic.",
+    "D4": "Reinforce standard recipe card and jigger measurement compliance during morning briefing.",
+}
+
+_DEFAULT_RECTIFICATION_ZH_BY_RULE: Dict[str, str] = {
     "A1": "【48h 整改】组织涉事员工复训强制洗手触发场景（触碰头面部/口罩/手机/垃圾桶/清洁工具后 5 分钟内必须完成五步洗手）。",
     "A2": "【48h 红线整改】严禁污染后未洗手直接戴手套或接触食品接触器具；店长现场督导考核「污染触发→五步洗手→换新手套」全流程。",
     "A3": "要求涉事员工严格执行标准五步洗手（先流水湿手→取皂液→纯泡沫对搓满 20 秒→冲净→抽取擦手纸彻底擦干），严禁戴手套冲水假洗手或干手按皂液。",
     "A4": "要求员工接触食品或即食原料全程规范佩戴一次性手套，洗手后及手套污染后立即更换新手套。",
     "A5": "落实门店在岗每 2 小时定时洗手提醒机制。",
+    "B0": "核对制冰机机型并在周清时完整拆出五大核心可拆部件备查。",
     "B1-1": "【48h 红线整改】按 SOP 21 重新执行 Langtuo 制冰机完整周清流程，确保断电、拆件置顶喷洒静置满 10 分钟、倒入 8L 消毒液并关好门板。",
     "B1-2": "【48h 红线整改】按 SOP 8 重新执行 Manitowoc 制冰机完整周清流程，确保拨 OFF 断电、拆内部三件套喷洒静置满 5 分钟、倒入 3L 消毒液启动自清洁。",
     "B2": "【48h 红线整改】制冰机各部件喷洒消毒液后必须静置满规定时长（Manitowoc ≥5 分钟 / Langtuo ≥10 分钟），且擦拭白色外盖门板与挡水帘时必须完整覆盖四周侧面边缘。",
@@ -279,12 +503,101 @@ _DEFAULT_RECTIFICATION_BY_RULE: Dict[str, str] = {
     "C6": "严格按 SOP 在自动泡茶机冲泡前后用专用毛巾擦拭热水口与卡扣，随手关严冷藏门。",
     "C7": "加强前吧台迎宾意识，顾客到店 10 秒内主动招呼并双手递交。",
     "C8": "严格执行泡茶机出茶入冰（提前 2–3 分钟备冰）并在出茶提示后 30 秒内完成搅拌。",
+    "D1": "复盘四工位闭环出杯流程，确保各工位动作衔接规范。",
+    "D2": "复盘门店总 IPLH 与个人出杯效率，优化高峰期工位瓶颈。",
+    "D3": "根据客流高低峰合理调配在岗排班人力。",
+    "D4": "晨会重申出品标准配方与量杯/雪克杯规范使用要求。",
 }
+
+
+def _has_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _build_bilingual_sop_entry(
+    *,
+    rid: str,
+    raw_name: str,
+    raw_category: str,
+    raw_severity: str,
+    doc_ref: str,
+    check_instruction: str,
+    raw_pass: str,
+    raw_fail: str,
+) -> Dict[str, str]:
+    m_code, m_name_en, m_name_zh = _module_code_and_names(rid)
+    stripped_raw = re.sub(r"^[A-Z0-9-]+\s*·\s*", "", raw_name)
+    if rid in _CLEAN_SUBTITLE_BY_RULE:
+        sub_en = _CLEAN_SUBTITLE_BY_RULE[rid]
+        name_en = f"{rid} · {sub_en}" if not raw_name or _has_cjk(raw_name) else raw_name
+    else:
+        sub_en = stripped_raw or f"{rid} · SOP Audit Clause"
+        name_en = raw_name or f"{rid} · {sub_en}"
+    sub_zh = _CLEAN_SUBTITLE_ZH_BY_RULE.get(
+        rid,
+        stripped_raw or raw_name or f"{rid} · SOP 稽核条款",
+    )
+    name_zh = raw_name if _has_cjk(raw_name) else f"{rid} · {sub_zh}"
+
+    pass_en = (
+        raw_pass
+        if raw_pass and not _has_cjk(raw_pass)
+        else _DEFAULT_PASS_EN_BY_RULE.get(rid, raw_pass or "Strictly follow official CHAGEE APAC SOP standards.")
+    )
+    pass_zh = (
+        raw_pass
+        if raw_pass and _has_cjk(raw_pass)
+        else (raw_pass or "严格按照 CHAGEE APAC 官方 SOP 标准执行。")
+    )
+    fail_en = (
+        raw_fail
+        if raw_fail and not _has_cjk(raw_fail)
+        else _DEFAULT_FAIL_EN_BY_RULE.get(rid, raw_fail or "Any deviation from official CHAGEE APAC SOP standards.")
+    )
+    fail_zh = (
+        raw_fail
+        if raw_fail and _has_cjk(raw_fail)
+        else (raw_fail or "违反 CHAGEE APAC 官方 SOP 标准。")
+    )
+    rect_en = _DEFAULT_RECTIFICATION_BY_RULE.get(
+        rid,
+        "Store manager must review the 20s evidence clip with on-duty staff and reinforce compliance in the morning briefing.",
+    )
+    rect_zh = _DEFAULT_RECTIFICATION_ZH_BY_RULE.get(
+        rid,
+        "请店长对照 20 秒证据视频组织当班员工复盘纠偏，并在晨会宣导。",
+    )
+    return {
+        "rule_id": rid,
+        "name": name_en,
+        "name_en": name_en,
+        "name_zh": name_zh,
+        "clean_subtitle": sub_en,
+        "clean_subtitle_en": sub_en,
+        "clean_subtitle_zh": sub_zh,
+        "category": raw_category or m_name_en,
+        "module_code": m_code,
+        "module_name": m_name_en,
+        "module_name_en": m_name_en,
+        "module_name_zh": m_name_zh,
+        "severity": raw_severity or "NORMAL",
+        "doc_ref": doc_ref,
+        "check_instruction": check_instruction,
+        "pass_criteria": pass_en,
+        "pass_criteria_en": pass_en,
+        "pass_criteria_zh": pass_zh,
+        "fail_criteria": fail_en,
+        "fail_criteria_en": fail_en,
+        "fail_criteria_zh": fail_zh,
+        "rectification": rect_en,
+        "rectification_en": rect_en,
+        "rectification_zh": rect_zh,
+    }
 
 
 def load_sop_catalog(extra_rules: Optional[Sequence[Any]] = None) -> List[Dict[str, str]]:
     """Loads the built-in 24-rule SOP catalog from `sop/master_sheet.json` or `DEFAULT_CHAGEE_V25_RULES`,
-    merging any custom/spot-check rules from `Tab4_专项测试表` or `extra_rules` by `rule_id`.
+    merging any custom/spot-check rules from `Tab4_Spot_Check` / `Tab4_专项测试表` or `extra_rules` by `rule_id`.
     """
     from .prompt_manager import DEFAULT_CHAGEE_V25_RULES, TAB4_SPOT_CHECK_TITLE
 
@@ -300,76 +613,56 @@ def load_sop_catalog(extra_rules: Optional[Sequence[Any]] = None) -> List[Dict[s
                     for row in values[1:]:
                         if len(row) >= 9 and str(row[0]).strip():
                             rid = str(row[0]).strip()
-                            r_name = str(row[1]).strip()
-                            m_code, m_name = _module_code_and_name(rid)
-                            rules_by_id[rid] = {
-                                "rule_id": rid,
-                                "name": r_name,
-                                "clean_subtitle": _CLEAN_SUBTITLE_BY_RULE.get(
-                                    rid, re.sub(r"^[A-Z0-9-]+\s*·\s*", "", r_name) or r_name
-                                ),
-                                "category": str(row[2]).strip(),
-                                "module_code": m_code,
-                                "module_name": m_name,
-                                "severity": str(row[3]).strip() or "NORMAL",
-                                "doc_ref": _DEFAULT_DOC_REF_BY_PREFIX.get(
+                            rules_by_id[rid] = _build_bilingual_sop_entry(
+                                rid=rid,
+                                raw_name=str(row[1]).strip(),
+                                raw_category=str(row[2]).strip(),
+                                raw_severity=str(row[3]).strip() or "NORMAL",
+                                doc_ref=_DEFAULT_DOC_REF_BY_PREFIX.get(
                                     rid, "APAC Cloud Audit Parameters 2026 v1.0"
                                 ),
-                                "check_instruction": str(row[6]).strip(),
-                                "pass_criteria": str(row[7]).strip(),
-                                "fail_criteria": str(row[8]).strip(),
-                            }
+                                check_instruction=str(row[6]).strip(),
+                                raw_pass=str(row[7]).strip(),
+                                raw_fail=str(row[8]).strip(),
+                            )
                     break
             for tab in tabs:
-                if str(tab.get("title") or "").strip() == TAB4_SPOT_CHECK_TITLE:
+                tab_title = str(tab.get("title") or "").strip()
+                if tab_title in (TAB4_SPOT_CHECK_TITLE, "Tab4_Spot_Check", "Tab4_专项测试表"):
                     values = tab.get("values") or []
                     for row in values[1:]:
                         if len(row) >= 9 and str(row[0]).strip():
                             rid = str(row[0]).strip()
                             if rid not in rules_by_id:
-                                r_name = str(row[1]).strip()
-                                m_code, m_name = _module_code_and_name(rid)
-                                rules_by_id[rid] = {
-                                    "rule_id": rid,
-                                    "name": r_name,
-                                    "clean_subtitle": _CLEAN_SUBTITLE_BY_RULE.get(
-                                        rid, re.sub(r"^[A-Z0-9-]+\s*·\s*", "", r_name) or r_name
+                                rules_by_id[rid] = _build_bilingual_sop_entry(
+                                    rid=rid,
+                                    raw_name=str(row[1]).strip(),
+                                    raw_category=str(row[2]).strip(),
+                                    raw_severity=str(row[3]).strip() or "NORMAL",
+                                    doc_ref=_DEFAULT_DOC_REF_BY_PREFIX.get(
+                                        rid, f"{TAB4_SPOT_CHECK_TITLE} · Spot-Check & New SOP Testing"
                                     ),
-                                    "category": str(row[2]).strip(),
-                                    "module_code": m_code,
-                                    "module_name": m_name,
-                                    "severity": str(row[3]).strip() or "NORMAL",
-                                    "doc_ref": _DEFAULT_DOC_REF_BY_PREFIX.get(
-                                        rid, f"{TAB4_SPOT_CHECK_TITLE} · 专项抽检与新 SOP 测试"
-                                    ),
-                                    "check_instruction": str(row[6]).strip(),
-                                    "pass_criteria": str(row[7]).strip(),
-                                    "fail_criteria": str(row[8]).strip(),
-                                }
+                                    check_instruction=str(row[6]).strip(),
+                                    raw_pass=str(row[7]).strip(),
+                                    raw_fail=str(row[8]).strip(),
+                                )
         except Exception as exc:
             logger.warning("Failed to read sop/master_sheet.json: %s", exc)
     if not rules_by_id:
         for item in DEFAULT_CHAGEE_V25_RULES:
             rid = str(item.rule_id).strip()
-            r_name = str(item.name).strip()
-            m_code, m_name = _module_code_and_name(rid)
-            rules_by_id[rid] = {
-                "rule_id": rid,
-                "name": r_name,
-                "clean_subtitle": _CLEAN_SUBTITLE_BY_RULE.get(
-                    rid, re.sub(r"^[A-Z0-9-]+\s*·\s*", "", r_name) or r_name
-                ),
-                "category": str(item.category).strip(),
-                "module_code": m_code,
-                "module_name": m_name,
-                "severity": str(item.severity).strip() or "NORMAL",
-                "doc_ref": _DEFAULT_DOC_REF_BY_PREFIX.get(
+            rules_by_id[rid] = _build_bilingual_sop_entry(
+                rid=rid,
+                raw_name=str(item.name).strip(),
+                raw_category=str(item.category).strip(),
+                raw_severity=str(item.severity).strip() or "NORMAL",
+                doc_ref=_DEFAULT_DOC_REF_BY_PREFIX.get(
                     rid, "APAC Cloud Audit Parameters 2026 v1.0"
                 ),
-                "check_instruction": str(item.check_instruction).strip(),
-                "pass_criteria": str(item.pass_criteria).strip(),
-                "fail_criteria": str(item.fail_criteria).strip(),
-            }
+                check_instruction=str(item.check_instruction).strip(),
+                raw_pass=str(item.pass_criteria).strip(),
+                raw_fail=str(item.fail_criteria).strip(),
+            )
     for extra in extra_rules or []:
         rid = str(
             extra.get("rule_id", "") if isinstance(extra, dict) else getattr(extra, "rule_id", "")
@@ -399,29 +692,23 @@ def load_sop_catalog(extra_rules: Optional[Sequence[Any]] = None) -> List[Dict[s
             if isinstance(extra, dict)
             else getattr(extra, "fail_criteria", "")
         ).strip()
-        r_name = name or f"{rid} · 专项测试规则"
-        m_code, m_name = _module_code_and_name(rid)
-        rules_by_id[rid] = {
-            "rule_id": rid,
-            "name": r_name,
-            "clean_subtitle": _CLEAN_SUBTITLE_BY_RULE.get(
-                rid, re.sub(r"^[A-Z0-9-]+\s*·\s*", "", r_name) or r_name
+        r_name = name or f"{rid} · Spot-Check Rule"
+        rules_by_id[rid] = _build_bilingual_sop_entry(
+            rid=rid,
+            raw_name=r_name,
+            raw_category=category or "Spot-Check",
+            raw_severity=sev_val,
+            doc_ref=_DEFAULT_DOC_REF_BY_PREFIX.get(
+                rid, f"{TAB4_SPOT_CHECK_TITLE} · Spot-Check & New SOP Testing"
             ),
-            "category": category or "专项测试",
-            "module_code": m_code,
-            "module_name": m_name,
-            "severity": sev_val,
-            "doc_ref": _DEFAULT_DOC_REF_BY_PREFIX.get(
-                rid, f"{TAB4_SPOT_CHECK_TITLE} · 专项抽检与新 SOP 测试"
-            ),
-            "check_instruction": check_inst,
-            "pass_criteria": pass_crit,
-            "fail_criteria": fail_crit,
-        }
+            check_instruction=check_inst,
+            raw_pass=pass_crit,
+            raw_fail=fail_crit,
+        )
     return list(rules_by_id.values())
 
 
-_STAFF_RE = re.compile(r"员工[A-Z0-9]+")
+_STAFF_RE = re.compile(r"(?:Staff|Employee|Partner|Worker|员工)\s*[A-Z0-9]+", re.IGNORECASE)
 _MMSS_RE = re.compile(r"\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b")
 _OSD_CLOCK_RE = re.compile(r"\b(\d{2}:\d{2}:\d{2})\b")
 _DRIVE_FILE_ID_RE = re.compile(r"/file/d/([a-zA-Z0-9_-]{10,})")
@@ -454,13 +741,25 @@ def _extract_drive_preview_url(drive_url: str) -> Tuple[str, str]:
 
 
 def _extract_staff_tags(description: str) -> Tuple[str, List[str]]:
-    found = sorted(set(_STAFF_RE.findall(description or "")))
+    raw_matches = _STAFF_RE.findall(description or "")
+    found: List[str] = []
+    seen = set()
+    for m in raw_matches:
+        norm = re.sub(r"\s+", " ", m.strip())
+        if norm.lower() not in seen:
+            seen.add(norm.lower())
+            found.append(norm)
+    found.sort()
     if not found:
-        if any(w in (description or "") for w in ("全员", "在岗员工", "多名员工", "两人", "多人")):
-            return "全员/多人", ["多人"]
-        return "在岗员工", ["在岗员工"]
+        lower_desc = (description or "").lower()
+        if any(
+            w in (description or "") or w in lower_desc
+            for w in ("全员", "在岗员工", "多名员工", "两人", "多人", "multiple staff", "all staff", "two staff")
+        ):
+            return "Multiple Staff", ["Multiple Staff"]
+        return "On-duty Staff", ["On-duty Staff"]
     if len(found) > 1:
-        return "、".join(found) + " (多人)", found
+        return ", ".join(found) + " (Multiple)", found
     return found[0], found
 
 
@@ -476,43 +775,96 @@ def _short_video_key(video_filename: str, idx: int) -> Tuple[str, str]:
     return short, display
 
 
-def _module_code_and_name(rule_id: str) -> Tuple[str, str]:
+def _module_code_and_names(rule_id: str) -> Tuple[str, str, str]:
     prefix = (rule_id or "C")[:1].upper()
-    if prefix == "A":
-        return "A", "【A】洗手与手部卫生"
-    if prefix == "B":
-        return "B", "【B】制冰机与冰块管理"
-    if prefix == "D":
-        return "D", "【D】运营与人效模块"
-    return "C", "【C】常态红线、仪容与泡茶设备"
+    if prefix in MODULE_META:
+        meta = MODULE_META[prefix]
+        return prefix, str(meta["name"]), str(meta["name_zh"])
+    meta = MODULE_META["OTHER"]
+    return "C", str(meta["name"]), str(meta["name_zh"])
 
 
-def _infer_sub_clause_title(rule_id: str, rule_name: str, description: str) -> str:
+def _module_code_and_name(rule_id: str) -> Tuple[str, str]:
+    code, name_en, _ = _module_code_and_names(rule_id)
+    return code, name_en
+
+
+def _infer_sub_clause_title_pair(rule_id: str, rule_name: str, description: str) -> Tuple[str, str]:
     desc = description or ""
+    lower = desc.lower()
     if rule_id == "C4":
-        if "手机" in desc:
-            return "1.4 在岗行为红线：工作区使用私人手机"
-        if "围裙" in desc:
-            return "1.2 工装围裙规范：围裙穿戴或存放不合规"
-        if "口罩" in desc:
-            return "1.1 个人仪容着装：口罩未规范遮挡口鼻"
-        if "帽" in desc or "发网" in desc or "头发" in desc:
-            return "1.1 个人仪容着装：未佩戴工作帽及发网"
-        if "倚靠" in desc:
-            return "1.4 在岗行为红线：等客时倚靠台面"
+        if "手机" in desc or "phone" in lower or "mobile" in lower:
+            return (
+                "1.4 On-Duty Red Line: Personal Mobile Phone Used in Work Zone",
+                "1.4 在岗行为红线：工作区使用私人手机",
+            )
+        if "围裙" in desc or "apron" in lower:
+            return (
+                "1.2 Apron Compliance: Improper Apron Wearing or Storage",
+                "1.2 工装围裙规范：围裙穿戴或存放不合规",
+            )
+        if "口罩" in desc or "mask" in lower:
+            return (
+                "1.1 Personal Grooming: Mask Not Properly Covering Nose & Mouth",
+                "1.1 个人仪容着装：口罩未规范遮挡口鼻",
+            )
+        if "帽" in desc or "发网" in desc or "头发" in desc or "hairnet" in lower or "cap" in lower or "hat" in lower or "hair" in lower:
+            return (
+                "1.1 Personal Grooming: Missing Work Cap or Hairnet",
+                "1.1 个人仪容着装：未佩戴工作帽及发网",
+            )
+        if "倚靠" in desc or "lean" in lower:
+            return (
+                "1.4 On-Duty Conduct: Leaning Against Counter While Waiting",
+                "1.4 在岗行为红线：等客时倚靠台面",
+            )
+    if rule_id == "A1":
+        return (
+            "1.5.5 Mandatory Handwashing Trigger: No 5-Step Handwash Within 5 Min of Contamination",
+            "1.5.5 强制洗手触发场景：触碰污染源后 5 分钟内未执行五步洗手",
+        )
     if rule_id == "A2":
-        return "1.5.3 / 1.5.5 强制洗手红线：污染后未洗手直接戴手套或接触食品器具"
+        return (
+            "1.5.3 / 1.5.5 Mandatory Handwashing Red Line: Donning Gloves or Touching Utensils Without Handwashing",
+            "1.5.3 / 1.5.5 强制洗手红线：污染后未洗手直接戴手套或接触食品器具",
+        )
     if rule_id == "A3":
-        return "1.5.1–1.5.4 洗手五步法核对：湿手/皂液/搓洗≥20s/冲净/擦手纸擦干"
+        return (
+            "1.5.1–1.5.4 5-Step Handwashing Check: Wet / Soap / Scrub >=20s / Rinse / Paper Towel Dry",
+            "1.5.1–1.5.4 洗手五步法核对：湿手/皂液/搓洗≥20s/冲净/擦手纸擦干",
+        )
     if rule_id == "B2":
-        return "SOP 8 / SOP 21 静置锁定期红线：消毒液静置时长不足或侧面边缘漏擦"
+        return (
+            "SOP 8 / SOP 21 Soak Lockout Red Line: Insufficient Sanitizer Contact Time or Missed Perimeter Edges",
+            "SOP 8 / SOP 21 静置锁定期红线：消毒液静置时长不足或侧面边缘漏擦",
+        )
     if rule_id == "B3":
-        return "0 Tolerance 化学品红线：使用黄色瓶身多功能清洁剂或混用化学品"
+        return (
+            "0-Tolerance Chemical Red Line: Yellow Multi-Purpose Cleaner Bottle or Chemical Mixing on Ice Maker",
+            "0 Tolerance 化学品红线：使用黄色瓶身多功能清洁剂或混用化学品",
+        )
     if rule_id == "B4":
-        return "3.1 三色毛巾规范：未从专用消毒桶取用干净红边毛巾或三色混用"
+        return (
+            "3.1 3-Color Towel Rule: Red-Trimmed Towel Not Taken From Dedicated Sanitizer Bucket or Mixed",
+            "3.1 三色毛巾规范：未从专用消毒桶取用干净红边毛巾或三色混用",
+        )
     if rule_id == "B5":
-        return "4.1 / 4.5 冰铲卫生规范：冰铲未放回专用收纳盒或取冰不规范"
-    return rule_name or f"SOP 条款 {rule_id}"
+        return (
+            "4.1 / 4.5 Ice Scoop Hygiene: Scoop Not Returned to Dedicated Holder or Improper Ice Scooping",
+            "4.1 / 4.5 冰铲卫生规范：冰铲未放回专用收纳盒或取冰不规范",
+        )
+    en_default = _CLEAN_SUBTITLE_BY_RULE.get(rule_id) or (
+        rule_name if rule_name and not _has_cjk(rule_name) else f"SOP Clause {rule_id}"
+    )
+    zh_default = _CLEAN_SUBTITLE_ZH_BY_RULE.get(rule_id) or (
+        rule_name if rule_name and _has_cjk(rule_name) else f"SOP 条款 {rule_id}"
+    )
+    return en_default, zh_default
+
+
+def _infer_sub_clause_title(rule_id: str, rule_name: str, description: str = "") -> str:
+    en_title, _ = _infer_sub_clause_title_pair(rule_id, rule_name, description)
+    return en_title
 
 
 def _build_findings_and_ledger_from_rows(
@@ -558,19 +910,26 @@ def _build_findings_and_ledger_from_rows(
         osd_clock = osd_m.group(1) if osd_m else ""
         file_id, preview_url = _extract_drive_preview_url(drive_url)
         staff_tag, staff_list = _extract_staff_tags(desc)
-        mod_code, mod_name = _module_code_and_name(rule_id)
+        mod_code, mod_name_en, mod_name_zh = _module_code_and_names(rule_id)
         sop_info = sop_by_id.get(rule_id, {})
-        rule_name = sop_info.get("name") or f"{rule_id} · SOP 稽核条款"
-        pass_crit = sop_info.get("pass_criteria") or "严格按照 CHAGEE APAC 官方 SOP 标准执行。"
-        fail_crit = sop_info.get("fail_criteria") or "违反 CHAGEE APAC 官方 SOP 标准。"
+        rule_name_en = sop_info.get("name_en") or sop_info.get("name") or f"{rule_id} · SOP Audit Clause"
+        rule_name_zh = sop_info.get("name_zh") or f"{rule_id} · SOP 稽核条款"
+        pass_crit_en = sop_info.get("pass_criteria_en") or sop_info.get("pass_criteria") or "Strictly follow official CHAGEE APAC SOP standards."
+        pass_crit_zh = sop_info.get("pass_criteria_zh") or "严格按照 CHAGEE APAC 官方 SOP 标准执行。"
+        fail_crit_en = sop_info.get("fail_criteria_en") or sop_info.get("fail_criteria") or "Any deviation from official CHAGEE APAC SOP standards."
+        fail_crit_zh = sop_info.get("fail_criteria_zh") or "违反 CHAGEE APAC 官方 SOP 标准。"
         doc_ref = sop_info.get("doc_ref") or _DEFAULT_DOC_REF_BY_PREFIX.get(
             rule_id, "APAC Cloud Audit Parameters 2026 v1.0"
         )
-        rect_advice = _DEFAULT_RECTIFICATION_BY_RULE.get(
+        rect_en = sop_info.get("rectification_en") or _DEFAULT_RECTIFICATION_BY_RULE.get(
+            rule_id, "Store manager must review the 20s evidence clip with on-duty staff and reinforce compliance in the morning briefing."
+        )
+        rect_zh = sop_info.get("rectification_zh") or _DEFAULT_RECTIFICATION_ZH_BY_RULE.get(
             rule_id, "请店长对照 20 秒证据视频组织当班员工复盘纠偏，并在晨会宣导。"
         )
-        sub_clause = _infer_sub_clause_title(rule_id, rule_name, desc)
-        clean_sub = sop_info.get("clean_subtitle") or _CLEAN_SUBTITLE_BY_RULE.get(rule_id) or sub_clause
+        sub_clause_en, sub_clause_zh = _infer_sub_clause_title_pair(rule_id, rule_name_en, desc)
+        clean_sub_en = sop_info.get("clean_subtitle_en") or sop_info.get("clean_subtitle") or _CLEAN_SUBTITLE_BY_RULE.get(rule_id) or sub_clause_en
+        clean_sub_zh = sop_info.get("clean_subtitle_zh") or _CLEAN_SUBTITLE_ZH_BY_RULE.get(rule_id) or sub_clause_zh
 
         findings.append(
             {
@@ -587,15 +946,34 @@ def _build_findings_and_ledger_from_rows(
                 "osd_clock": osd_clock,
                 "rule_id": rule_id,
                 "module_code": mod_code,
-                "module_name": mod_name,
-                "rule_name": rule_name,
-                "rule_subtitle": clean_sub,
+                "module_name": mod_name_en,
+                "module_name_en": mod_name_en,
+                "module_name_zh": mod_name_zh,
+                "rule_name": rule_name_en,
+                "rule_name_en": rule_name_en,
+                "rule_name_zh": rule_name_zh,
+                "rule_subtitle": clean_sub_en,
+                "rule_subtitle_en": clean_sub_en,
+                "rule_subtitle_zh": clean_sub_zh,
                 "doc_ref": doc_ref,
-                "sub_clause_title": sub_clause,
-                "specific_pass": pass_crit,
-                "sop_pass_criteria": pass_crit,
-                "sop_fail_criteria": fail_crit,
-                "rectification_advice": rect_advice,
+                "sub_clause_title": sub_clause_en,
+                "sub_clause_title_en": sub_clause_en,
+                "sub_clause_title_zh": sub_clause_zh,
+                "specific_pass": pass_crit_en,
+                "specific_pass_en": pass_crit_en,
+                "specific_pass_zh": pass_crit_zh,
+                "sop_pass_criteria": pass_crit_en,
+                "sop_pass_criteria_en": pass_crit_en,
+                "sop_pass_criteria_zh": pass_crit_zh,
+                "sop_fail_criteria": fail_crit_en,
+                "sop_fail_criteria_en": fail_crit_en,
+                "sop_fail_criteria_zh": fail_crit_zh,
+                "rectification_advice": rect_en,
+                "rectification_advice_en": rect_en,
+                "rectification_advice_zh": rect_zh,
+                "rectification": rect_en,
+                "rectification_en": rect_en,
+                "rectification_zh": rect_zh,
                 "disposition": disposition,
                 "severity": severity,
                 "confidence": round(confidence, 2),
@@ -613,7 +991,7 @@ def _build_findings_and_ledger_from_rows(
 
     ledger_list: List[Dict[str, Any]] = []
     for l_idx, r in enumerate(tab2_rows, start=1):
-        v_file = str(r[1] if len(r) > 1 else "").strip()
+        v_file = str(r[1] if len(r) > 1 else "").strip() or "Not recorded in Sheet (historical audit)"
         if v_file not in video_short_map:
             video_short_map[v_file] = _short_video_key(v_file, len(video_short_map) + 1)
         v_short, _ = video_short_map[v_file]
@@ -746,7 +1124,7 @@ async def load_portal_payload(
         b_key = state_store.batch_key(batch_id)
         raw_batch, _ = state_store.read_text_with_generation(b_key)
         if raw_batch is None:
-            raise LookupError(f"未找到定时巡检批次 `{batch_id}` 的状态记录。")
+            raise LookupError(f"Scheduled batch `{batch_id}` state record not found. / 未找到定时巡检批次 `{batch_id}` 的状态记录。")
         batch_rec = ScheduledBatchRecord.model_validate_json(raw_batch)
         sorted_tasks = sorted(
             batch_rec.store_tasks.values(),
@@ -819,7 +1197,7 @@ async def load_portal_payload(
         batch_meta = {
             "batch_id": batch_rec.batch_id,
             "rule_id": batch_rec.rule_id,
-            "rule_name": batch_rec.rule_name,
+            "rule_name": batch_rec.rule_name or "Scheduled Multi-Store Audit",
             "local_date": batch_rec.local_date,
             "supervisor_email": batch_rec.supervisor_email,
             "root_folder_url": batch_rec.root_folder_url,
@@ -846,10 +1224,10 @@ async def load_portal_payload(
     else:
         target_job = await job_store.get_by_job_id(job_id, user_id=user_id)
         if target_job is None:
-            raise LookupError(f"未找到稽核单号 `{job_id}` 的任务记录。")
+            raise LookupError(f"Audit job `{job_id}` not found. / 未找到稽核单号 `{job_id}` 的任务记录。")
 
     if target_job is None:
-        raise LookupError("未找到可展示的门店稽核任务。")
+        raise LookupError("No store audit job available to display. / 未找到可展示的门店稽核任务。")
 
     tab1_rows: List[List[Any]] = []
     tab2_rows: List[List[Any]] = []
@@ -881,8 +1259,9 @@ async def load_portal_payload(
         tab1_rows, tab2_rows = _fallback_rows_from_job(target_job)
 
     spot_tab = (getattr(target_job, "target_prompt_tab", "") or "").strip()
-    if not spot_tab and str(getattr(target_job, "active_prompt_version", "")).startswith("Tab4_专项测试表"):
-        spot_tab = "Tab4_专项测试表"
+    active_pv = str(getattr(target_job, "active_prompt_version", ""))
+    if not spot_tab and (active_pv.startswith("Tab4_专项测试表") or active_pv.startswith("Tab4_Spot_Check")):
+        spot_tab = active_pv.split(" ")[0]
     if spot_tab and audit_service is not None and getattr(audit_service, "prompt_manager", None) is not None:
         try:
             spot_cfg = await audit_service.prompt_manager.load_config_for_tab(
@@ -911,8 +1290,9 @@ async def load_portal_payload(
         or (
             target_job.folder_id.rstrip("/").split("/")[-1]
             if is_gcs_target(target_job.folder_id)
-            else f"门店文件夹 ({target_job.folder_id[:10]})"
+            else f"Store Audit ({target_job.folder_id[:10]})"
         )
+        or "Store Audit"
     )
     total_segs = (
         target_job.preflight_report.planned_segments_count
@@ -1004,12 +1384,12 @@ async def apply_portal_reviews(
         b_key = state_store.batch_key(batch_id)
         raw_batch, _ = state_store.read_text_with_generation(b_key)
         if raw_batch is None:
-            raise LookupError(f"未找到定时巡检批次 `{batch_id}`。")
+            raise LookupError(f"Scheduled batch `{batch_id}` not found. / 未找到定时巡检批次 `{batch_id}`。")
         batch_rec = ScheduledBatchRecord.model_validate_json(raw_batch)
         eff_store_job_id = store_job_id or next(iter(batch_rec.store_tasks.keys()), "")
         task = batch_rec.store_tasks.get(eff_store_job_id)
         if task is None:
-            raise LookupError(f"批次 `{batch_id}` 中未找到门店任务 `{eff_store_job_id}`。")
+            raise LookupError(f"Store job `{eff_store_job_id}` not found in batch `{batch_id}`. / 批次 `{batch_id}` 中未找到门店任务 `{eff_store_job_id}`。")
         target_job = await job_store.get(task.user_id, task.job_id)
         if target_job is None and task.report_sheet_url:
             target_job = AuditJob(
@@ -1024,7 +1404,7 @@ async def apply_portal_reviews(
         target_job = await job_store.get_by_job_id(job_id, user_id=user_id)
 
     if target_job is None:
-        raise LookupError("未找到对应的稽核任务记录。")
+        raise LookupError("Audit job record not found. / 未找到对应的稽核任务记录。")
     if not target_job.report_sheet_url or gateway is None:
         return {"ok": False, "updated_count": 0, "persisted_to_sheet": False}
 
@@ -1059,12 +1439,12 @@ async def apply_portal_reviews(
 
 
 _SUPERVISOR_PORTAL_HTML_TEMPLATE = r"""<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>CHAGEE 霸王茶姬 · 门店 AI 视频稽核督导工作台 — __PORTAL_STORE_NAME__ #__PORTAL_AUDIT_ID__</title>
-<meta name="description" content="CHAGEE 门店 CCTV AI 稽核结果复核工作台：按 SOP 模块分区的违规证据卡片、20 秒证据切片首帧预览与 48 小时整改通知单生成。" />
+<title>CHAGEE · Store AI Audit Supervisor Workbench — __PORTAL_STORE_NAME__ #__PORTAL_AUDIT_ID__</title>
+<meta name="description" content="CHAGEE · Store AI Audit Supervisor Workbench (CHAGEE 霸王茶姬 · 门店 AI 视频稽核督导工作台): SOP module evidence cards, 20-second video clip preview, and 48-hour rectification notice." />
 <style>
   /* ============================================================
      Design tokens — 克制的三色语义体系（红线 / 偏差 / 合规）
@@ -1799,31 +2179,33 @@ _SUPERVISOR_PORTAL_HTML_TEMPLATE = r"""<!DOCTYPE html>
 <header class="app-header">
   <div class="wrap">
     <div class="ident">
-      <div class="logo">茶</div>
+      <div class="logo">CH</div>
       <div>
-        <h1>门店 AI 视频稽核 · 督导复核台</h1>
+        <h1 id="hd-brand-title">Store AI Video Audit · Supervisor Workbench</h1>
         <div class="sub">
           <b id="hd-store">1-Cantavil D2</b>
           <span class="sep">/</span>
-          <span>稽核单 <b id="hd-audit">#39e851</b></span>
+          <span><span id="hd-audit-lbl">Audit</span> <b id="hd-audit">#39e851</b></span>
           <span class="sep">/</span>
-          <span id="hd-scope">3 段 1080P 后厨监控</span>
+          <span id="hd-scope">3 × 1080P Kitchen CCTV Clips</span>
           <span class="sep">/</span>
-          <a id="hd-folder" href="#" target="_blank" rel="noopener">门店文件夹 ↗</a>
-          <a id="hd-sheet" href="#" target="_blank" rel="noopener">源数据表 ↗</a>
+          <a id="hd-folder" href="#" target="_blank" rel="noopener">Store Folder ↗</a>
+          <a id="hd-sheet" href="#" target="_blank" rel="noopener">Source Sheet ↗</a>
         </div>
       </div>
     </div>
     <div class="head-actions">
-      <button class="btn btn-ghost-dark" onclick="batchConfirm()">一键确认实锤项</button>
-      <button class="btn btn-solid" onclick="openReport()">生成 48h 整改通知单</button>
+      <button class="btn btn-ghost-dark btn-sm" id="btn-lang-toggle" onclick="toggleLang()" title="Switch UI Language (EN / 中文)">🌐 EN | 中文</button>
+      <button class="btn btn-ghost-dark btn-sm" id="btn-sync-sheet" onclick="syncFromSheet()" title="Sync latest team review decisions from Google Sheet">🔄 Sync Sheet</button>
+      <button class="btn btn-ghost-dark" id="btn-batch-confirm" onclick="batchConfirm()">Confirm All AI Hits</button>
+      <button class="btn btn-solid" id="btn-open-report" onclick="openReport()">Generate 48h Notice</button>
     </div>
   </div>
 </header>
 
 <div class="batch-switcher-bar" id="batch-switcher-bar" hidden>
   <div class="wrap" id="batch-switcher-inner">
-    <span class="bs-label">🏪 批次门店切换：</span>
+    <span class="bs-label">🏪 Store Switcher:</span>
   </div>
 </div>
 
@@ -1832,28 +2214,26 @@ _SUPERVISOR_PORTAL_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="access-box">
       <span class="ai">⚠</span>
       <div class="atx">
-        <b id="access-title">证据切片当前无法预览</b>
+        <b id="access-title">Evidence video clips cannot be previewed</b>
         <p id="access-desc">—</p>
       </div>
       <div class="aa">
-        <select id="authuser-sel" onchange="setAuthUser(this.value)" title="切换 Google 账号序号">
-          <option value="">默认登录账号</option>
+        <select id="authuser-sel" onchange="setAuthUser(this.value)" title="Switch Google account index">
+          <option value="" id="opt-default-acct">Default Google Account</option>
           <option value="0">authuser=0</option>
           <option value="1">authuser=1</option>
           <option value="2">authuser=2</option>
           <option value="3">authuser=3</option>
         </select>
-        <a class="btn btn-sm" id="access-folder" href="#" target="_blank" rel="noopener">打开门店文件夹 ↗</a>
-        <button class="btn btn-sm" onclick="toggleAccessHelp()">修复方式</button>
+        <a class="btn btn-sm" id="access-folder" href="#" target="_blank" rel="noopener">Open Store Folder ↗</a>
+        <button class="btn btn-sm" id="btn-access-help" onclick="toggleAccessHelp()">How to Fix</button>
       </div>
       <div class="access-help" id="access-help" hidden>
-        <ol>
-          <li>用<b>有权限的那个 Google 账号</b>打开上方「门店文件夹」。</li>
-          <li>选中全部证据切片文件（或直接对父文件夹操作）→ <b>共享</b> → 常规访问权限改为
-              <code>知道链接的任何人 · 查看者</code>。</li>
-          <li>回到本页刷新。首帧缩略图与页内播放会同时恢复。</li>
-          <li>若文件已共享给你的<b>另一个</b> Google 账号，不必改权限，用左侧
-              <code>authuser</code> 下拉切换账号序号即可（0 为当前浏览器第一个登录账号）。</li>
+        <ol id="access-help-list">
+          <li>Open the <b>Store Folder</b> above using a Google account that has access.</li>
+          <li>Select the evidence clip files (or parent folder) → <b>Share</b> → set General Access to <code>Anyone with the link · Viewer</code>.</li>
+          <li>Refresh this page to restore both thumbnail previews and embedded video playback.</li>
+          <li>If the folder is shared with <b>another</b> signed-in Google account in your browser, select its <code>authuser</code> index on the left (`0` = primary browser account).</li>
         </ol>
       </div>
     </div>
@@ -1866,22 +2246,22 @@ _SUPERVISOR_PORTAL_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="hero-grid">
 
       <div class="panel verdict">
-        <div class="verdict-kicker">稽核裁决摘要 · APAC Cloud Audit Parameters 2026 v1.0</div>
+        <div class="verdict-kicker" id="v-kicker">AUDIT VERDICT SUMMARY · APAC Cloud Audit Parameters 2026 v1.0</div>
 
         <div class="verdict-main">
           <div class="figure">
             <span class="n red" id="v-red">—</span>
-            <span class="unit">项红线<br />零容忍违规</span>
+            <span class="unit" id="v-unit-red">Red-Line<br />Zero-Tolerance</span>
           </div>
           <div class="verdict-divider"></div>
           <div class="figure">
             <span class="n amber" id="v-normal">—</span>
-            <span class="unit">项一般<br />操作偏差</span>
+            <span class="unit" id="v-unit-normal">Standard<br />SOP Deviations</span>
           </div>
           <div class="verdict-divider"></div>
           <div class="figure">
             <span class="n" id="v-clause">—</span>
-            <span class="unit">条 SOP 条款<br />被命中 <span id="v-clause-total" class="mono"></span></span>
+            <span class="unit"><span id="v-unit-clause">SOP Clauses<br />Triggered</span> <span id="v-clause-total" class="mono"></span></span>
           </div>
         </div>
 
@@ -1890,8 +2270,8 @@ _SUPERVISOR_PORTAL_HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="modbars" id="v-modbars"></div>
 
         <div class="verdict-dl">
-          <button class="btn btn-solid" onclick="exportXLSX()">⤓ 下载统计明细（Excel）</button>
-          <button class="btn" onclick="exportCSV()">⤓ 复核明细 CSV</button>
+          <button class="btn btn-solid" id="btn-export-xlsx" onclick="exportXLSX()">⤓ Export Excel (.xlsx)</button>
+          <button class="btn" id="btn-export-csv" onclick="exportCSV()">⤓ Export Review CSV</button>
           <span class="hint" id="dl-hint">—</span>
         </div>
       </div>
@@ -1900,29 +2280,29 @@ _SUPERVISOR_PORTAL_HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="prog-top">
           <div class="ring" id="p-ring"><span id="p-pct">0%</span></div>
           <div>
-            <h3>督导人工复核进度</h3>
-            <p id="p-sub">尚未开始复核</p>
+            <h3 id="p-title">Supervisor Review Progress</h3>
+            <p id="p-sub">Not started yet</p>
           </div>
         </div>
         <div class="prog-rows">
           <div class="prog-row">
-            <span class="lb"><i class="dot dot-red"></i> 已确认违规</span>
+            <span class="lb"><i class="dot dot-red"></i> <span id="p-lbl-c">Confirmed Violations</span></span>
             <span class="vv" id="p-c">0</span>
           </div>
           <div class="prog-row">
-            <span class="lb"><i class="dot" style="background:var(--green)"></i> 已排除误报</span>
+            <span class="lb"><i class="dot" style="background:var(--green)"></i> <span id="p-lbl-d">False Positives Dismissed</span></span>
             <span class="vv" id="p-d">0</span>
           </div>
           <div class="prog-row">
-            <span class="lb"><i class="dot dot-amber"></i> 待调后续录像</span>
+            <span class="lb"><i class="dot dot-amber"></i> <span id="p-lbl-f">Follow-Up Footage Needed</span></span>
             <span class="vv" id="p-f">0</span>
           </div>
           <div class="prog-row">
-            <span class="lb"><i class="dot" style="background:var(--line-strong)"></i> 待复核</span>
+            <span class="lb"><i class="dot" style="background:var(--line-strong)"></i> <span id="p-lbl-p">Pending Review</span></span>
             <span class="vv" id="p-p">0</span>
           </div>
         </div>
-        <button class="btn btn-sm" onclick="resetReview()" style="align-self:flex-start">清空本地复核记录</button>
+        <button class="btn btn-sm" id="btn-reset-review" onclick="resetReview()" style="align-self:flex-start">Reset Local Reviews</button>
       </div>
 
     </div>
@@ -1933,31 +2313,31 @@ _SUPERVISOR_PORTAL_HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="wrap">
     <div class="toolbar">
       <div class="tb-row">
-        <div class="seg" role="group" aria-label="严重等级">
-          <button id="sev-ALL"      aria-pressed="true"  onclick="setFilter('sev','ALL')">全部事件 <span class="ct" id="ct-sev-ALL"></span></button>
-          <button id="sev-RED_LINE" aria-pressed="false" class="is-red" onclick="setFilter('sev','RED_LINE')"><i class="dot dot-red"></i> 红线 <span class="ct" id="ct-sev-RED_LINE"></span></button>
-          <button id="sev-NORMAL"   aria-pressed="false" onclick="setFilter('sev','NORMAL')"><i class="dot dot-amber"></i> 一般偏差 <span class="ct" id="ct-sev-NORMAL"></span></button>
-          <button id="sev-UNVERIFIED" aria-pressed="false" onclick="setFilter('sev','UNVERIFIED')">盲区待核 <span class="ct" id="ct-sev-UNVERIFIED"></span></button>
+        <div class="seg" role="group" aria-label="Severity Filter">
+          <button id="sev-ALL"      aria-pressed="true"  onclick="setFilter('sev','ALL')"><span id="lbl-sev-ALL">All Events</span> <span class="ct" id="ct-sev-ALL"></span></button>
+          <button id="sev-RED_LINE" aria-pressed="false" class="is-red" onclick="setFilter('sev','RED_LINE')"><i class="dot dot-red"></i> <span id="lbl-sev-RED">Red Line</span> <span class="ct" id="ct-sev-RED_LINE"></span></button>
+          <button id="sev-NORMAL"   aria-pressed="false" onclick="setFilter('sev','NORMAL')"><i class="dot dot-amber"></i> <span id="lbl-sev-NORMAL">Standard</span> <span class="ct" id="ct-sev-NORMAL"></span></button>
+          <button id="sev-UNVERIFIED" aria-pressed="false" onclick="setFilter('sev','UNVERIFIED')"><span id="lbl-sev-UNVERIFIED">Unverified</span> <span class="ct" id="ct-sev-UNVERIFIED"></span></button>
         </div>
 
-        <nav class="jump" id="jump-nav" aria-label="模块跳转"></nav>
+        <nav class="jump" id="jump-nav" aria-label="Module Navigation"></nav>
 
         <div class="spacer"></div>
 
         <div class="search" id="search-wrap">
           <span class="ic">⌕</span>
-          <input id="q" type="search" placeholder="搜索条款 A2 / 员工 / 手机 / 洗手 / 冰铲…" oninput="onSearch()" />
-          <button class="clr" onclick="clearSearch()" aria-label="清空搜索">×</button>
+          <input id="q" type="search" placeholder="Search clause A2 / staff / phone / handwash / scoop…" oninput="onSearch()" />
+          <button class="clr" onclick="clearSearch()" aria-label="Clear search">×</button>
         </div>
-        <button class="btn btn-sm" id="btn-more" onclick="toggleMore()">更多筛选</button>
+        <button class="btn btn-sm" id="btn-more" onclick="toggleMore()">More Filters</button>
       </div>
 
       <div class="tb-row" id="more-row" hidden>
-        <span class="flabel">监控原片</span>
+        <span class="flabel" id="flbl-video">Source Video</span>
         <div class="chips" id="chips-video"></div>
-        <span class="flabel" style="margin-left:10px">涉事人员</span>
+        <span class="flabel" id="flbl-staff" style="margin-left:10px">Staff</span>
         <div class="chips" id="chips-staff"></div>
-        <span class="flabel" style="margin-left:10px">复核状态</span>
+        <span class="flabel" id="flbl-review" style="margin-left:10px">Review Status</span>
         <div class="chips" id="chips-review"></div>
       </div>
     </div>
@@ -1970,14 +2350,14 @@ _SUPERVISOR_PORTAL_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     <section class="appendix">
       <div class="ap-head">
-        <h2>附录</h2>
+        <h2 id="ap-main-title">Appendix</h2>
         <span class="ln"></span>
-        <span class="muted" style="font-size:12.5px">规则字典与算力账单</span>
+        <span class="muted" id="ap-main-sub" style="font-size:12.5px">SOP Rule Catalog & Token Ledger</span>
       </div>
 
       <details class="ap">
         <summary>
-          <h3>全量 SOP 规则字典</h3>
+          <h3 id="ap-dict-title">Full SOP Rule Catalog</h3>
           <span class="hint" id="ap-dict-hint"></span>
         </summary>
         <div class="ap-body" id="ap-dict"></div>
@@ -1985,7 +2365,7 @@ _SUPERVISOR_PORTAL_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       <details class="ap">
         <summary>
-          <h3>视频 Token 消耗与算力账单</h3>
+          <h3 id="ap-ledger-title">Video Token Consumption & Cost Ledger</h3>
           <span class="hint" id="ap-ledger-hint"></span>
         </summary>
         <div class="ap-body" id="ap-ledger"></div>
@@ -1994,7 +2374,7 @@ _SUPERVISOR_PORTAL_HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 </main>
 
-<!-- 证据切片播放 -->
+<!-- Evidence Clip Player Modal -->
 <div class="scrim-modal" id="modal-video" onclick="if(event.target===this) closeVideo()">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mv-title">
     <div class="modal-head">
@@ -2003,28 +2383,28 @@ _SUPERVISOR_PORTAL_HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="l2" id="mv-title">—</div>
       </div>
       <div class="ma">
-        <button class="btn btn-ghost-dark btn-sm" id="mv-prev" onclick="stepVideo(-1)">← 上一条</button>
-        <button class="btn btn-ghost-dark btn-sm" id="mv-next" onclick="stepVideo(1)">下一条 →</button>
-        <a class="btn btn-ghost-dark btn-sm" id="mv-drive" href="#" target="_blank" rel="noopener">Drive 原片 ↗</a>
-        <button class="btn btn-ghost-dark btn-sm" onclick="closeVideo()">关闭 ESC</button>
+        <button class="btn btn-ghost-dark btn-sm" id="mv-prev" onclick="stepVideo(-1)">← Prev</button>
+        <button class="btn btn-ghost-dark btn-sm" id="mv-next" onclick="stepVideo(1)">Next →</button>
+        <a class="btn btn-ghost-dark btn-sm" id="mv-drive" href="#" target="_blank" rel="noopener">Open in Drive ↗</a>
+        <button class="btn btn-ghost-dark btn-sm" id="mv-close" onclick="closeVideo()">Close ESC</button>
       </div>
     </div>
     <div class="modal-body">
       <div class="vstage">
         <div class="vnotice" id="mv-notice" hidden>
-          <span>播放器里显示 Google <b>「You need access」</b>？该切片未开启链接共享，或当前登录账号无权限。</span>
+          <span id="mv-notice-txt">Seeing Google <b>"You need access"</b>? The clip isn't link-shared or your active browser account lacks access.</span>
           <span class="spacer"></span>
-          <select id="mv-authuser" onchange="setAuthUser(this.value)" title="切换 Google 账号序号">
-            <option value="">默认账号</option>
+          <select id="mv-authuser" onchange="setAuthUser(this.value)" title="Switch Google account index">
+            <option value="" id="mv-opt-default">Default Account</option>
             <option value="0">authuser=0</option>
             <option value="1">authuser=1</option>
             <option value="2">authuser=2</option>
             <option value="3">authuser=3</option>
           </select>
         </div>
-        <div class="frame"><iframe id="mv-iframe" src="" allow="autoplay; encrypted-media" allowfullscreen title="违规证据切片"></iframe></div>
+        <div class="frame"><iframe id="mv-iframe" src="" allow="autoplay; encrypted-media" allowfullscreen title="Violation Evidence Clip"></iframe></div>
         <div class="cap">
-          <span>证据切片覆盖违规发生前 2 秒至后 18 秒</span>
+          <span id="mv-cap-note">Evidence clip spans 2s before to 18s after the detected violation</span>
           <span id="mv-ts"></span>
         </div>
       </div>
@@ -2033,18 +2413,18 @@ _SUPERVISOR_PORTAL_HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<!-- 整改通知单 -->
+<!-- 48h Rectification Report Modal -->
 <div class="scrim-modal" id="modal-report" onclick="if(event.target===this) closeReport()">
   <div class="modal" style="max-width:920px" role="dialog" aria-modal="true">
     <div class="modal-head">
       <div class="mt">
-        <div class="l1">可直接粘贴至飞书 / 企微群</div>
-        <div class="l2">门店 AI 云稽核 48 小时整改通知单</div>
+        <div class="l1" id="mr-kicker">Ready to paste into Google Chat / Feishu / WeCom</div>
+        <div class="l2" id="mr-title">Store AI Cloud Audit — 48-Hour Rectification Notice</div>
       </div>
       <div class="ma">
-        <button class="btn btn-solid btn-sm" onclick="copyReport()">复制全文</button>
-        <button class="btn btn-ghost-dark btn-sm" onclick="printReport()">打印 / PDF</button>
-        <button class="btn btn-ghost-dark btn-sm" onclick="closeReport()">关闭 ESC</button>
+        <button class="btn btn-solid btn-sm" id="mr-btn-copy" onclick="copyReport()">Copy Full Text</button>
+        <button class="btn btn-ghost-dark btn-sm" id="mr-btn-print" onclick="printReport()">Print / PDF</button>
+        <button class="btn btn-ghost-dark btn-sm" id="mr-btn-close" onclick="closeReport()">Close ESC</button>
       </div>
     </div>
     <div class="report"><pre id="mr-text"></pre></div>
@@ -2059,38 +2439,89 @@ __PORTAL_JSON__
 
 <script>
 /* ==================================================================
-   CHAGEE AI 稽核复核台 — 应用逻辑
-   设计原则：所有统计数字一律由 findings 实时推导，页面不写死任何计数
+   CHAGEE AI Audit Supervisor Workbench — Application Logic
+   Bilingual (`EN | 中文`, default `en`) + Real-Time Team Sheet Sync
    ================================================================== */
 const DATA = JSON.parse(document.getElementById("portal-data").textContent);
 const F = DATA.findings || [];
 const RULES = {};
 (DATA.sop_rules || []).forEach(r => RULES[r.rule_id] = r);
 
+const LANG_KEY = "chagee_portal_lang";
+let lang = "en";
+try {
+  const qsLang = new URLSearchParams(window.location.search).get("lang");
+  const savedLang = localStorage.getItem(LANG_KEY);
+  if (qsLang === "zh" || qsLang === "en") lang = qsLang;
+  else if (savedLang === "zh" || savedLang === "en") lang = savedLang;
+} catch (e) {}
+
+const isZh = () => lang === "zh";
+const tr = (enStr, zhStr) => isZh() ? zhStr : enStr;
+
+const fSubTitle = f => isZh() ? (f.sub_clause_title_zh || f.sub_clause_title) : (f.sub_clause_title_en || f.sub_clause_title);
+const fPass = f => isZh() ? (f.specific_pass_zh || f.specific_pass) : (f.specific_pass_en || f.specific_pass);
+const fFail = f => isZh() ? (f.sop_fail_criteria_zh || f.sop_fail_criteria) : (f.sop_fail_criteria_en || f.sop_fail_criteria);
+const fAdvice = f => isZh() ? (f.rectification_advice_zh || f.rectification_advice) : (f.rectification_advice_en || f.rectification_advice);
+const rTitle = r => isZh()
+  ? (r.clean_subtitle_zh || r.name_zh || r.clean_subtitle || r.name || "")
+  : (r.clean_subtitle_en || r.name_en || r.clean_subtitle || r.name || "");
+const rPass = r => isZh() ? (r.pass_criteria_zh || r.pass_criteria || "—") : (r.pass_criteria_en || r.pass_criteria || "—");
+const rFail = r => isZh() ? (r.fail_criteria_zh || r.fail_criteria || "—") : (r.fail_criteria_en || r.fail_criteria || "—");
+
 const MODULE_META = {
-  A: { order: 1, kicker: "MODULE A", title: "洗手与手部卫生",
-       desc: "强制洗手触发场景、五步洗手法核对与一次性手套规范。对应 APAC 参数表 1.5.1–1.5.5 与 1.6，是污染链条的源头控制项。" },
-  B: { order: 2, kicker: "MODULE B", title: "制冰机与冰块管理",
-       desc: "制冰机周清洁流程、部件静置锁定期、化学品与三色毛巾专用，以及冰铲取冰与存放规范。对应 SOP 8 / SOP 21 与参数表 3.1 / 4.1 / 4.5。" },
-  C: { order: 3, kicker: "MODULE C", title: "常态红线 · 仪容 · 泡茶设备",
-       desc: "每周必跑的零容忍红线扫描：交叉污染、杯具、不当行为、仪容着装与私人手机，以及泡茶机出茶入冰时效。" },
-  D: { order: 4, kicker: "MODULE D", title: "运营与人效 (IPLH)",
-       desc: "有效出杯计数、每工时出杯率核算、人力投放合理性与出品规范抽查。" }
+  A: {
+    order: 1, kicker: "MODULE A",
+    title_en: "Handwashing & Personal Hygiene",
+    title_zh: "洗手与手部卫生",
+    desc_en: "Mandatory handwashing triggers, 5-step handwash verification, and disposable glove compliance (APAC Parameters 1.5.1–1.5.5 & 1.6).",
+    desc_zh: "强制洗手触发场景、五步洗手法核对与一次性手套规范。对应 APAC 参数表 1.5.1–1.5.5 与 1.6，是污染链条的源头控制项。"
+  },
+  B: {
+    order: 2, kicker: "MODULE B",
+    title_en: "Ice Maker & Ice Handling",
+    title_zh: "制冰机与冰块管理",
+    desc_en: "Weekly ice maker teardown cleaning, sanitizer dwell lockout window, chemical & 3-color towel separation, and ice scoop hygiene (SOP 8 / SOP 21 & 3.1 / 4.1 / 4.5).",
+    desc_zh: "制冰机周清洁流程、部件静置锁定期、化学品与三色毛巾专用，以及冰铲取冰与存放规范。对应 SOP 8 / SOP 21 与参数表 3.1 / 4.1 / 4.5。"
+  },
+  C: {
+    order: 3, kicker: "MODULE C",
+    title_en: "Red-Line Safety · Grooming · Tea Brewing",
+    title_zh: "常态红线 · 仪容 · 泡茶设备",
+    desc_en: "Zero-tolerance red-line scan: cross-contamination, cup handling, improper conduct, personal grooming & mobile phone use, and tea brewing / icing timeliness.",
+    desc_zh: "每周必跑的零容忍红线扫描：交叉污染、杯具、不当行为、仪容着装与私人手机，以及泡茶机出茶入冰时效。"
+  },
+  D: {
+    order: 4, kicker: "MODULE D",
+    title_en: "Store Operations & Throughput (IPLH)",
+    title_zh: "运营与人效 (IPLH)",
+    desc_en: "Valid cup output counting, IPLH productivity verification, staffing allocation, and beverage handover quality checks.",
+    desc_zh: "有效出杯计数、每工时出杯率核算、人力投放合理性与出品规范抽查。"
+  }
 };
 
 function metaOf(code) {
-  return MODULE_META[code] || {
+  const m = MODULE_META[code];
+  if (m) {
+    return {
+      order: m.order,
+      kicker: m.kicker,
+      title: isZh() ? m.title_zh : m.title_en,
+      desc: isZh() ? m.desc_zh : m.desc_en
+    };
+  }
+  return {
     order: 9,
     kicker: "MODULE " + code,
-    title: "专项测试与扩展条款",
-    desc: "自定义专项抽检与扩展 SOP 条款。"
+    title: tr("Spot-Check & Extended Clauses", "专项测试与扩展条款"),
+    desc: tr("Targeted SOP spot-checks and custom extended clauses.", "自定义专项抽检与扩展 SOP 条款。")
   };
 }
 
 const STORE_KEY = "chagee_review_" + DATA.audit_id + "_v2";
 const AUTH_KEY = "chagee_authuser";
 
-/* Drive 账号序号：文件共享给了浏览器第 N 个登录账号时用 */
+/* Drive account index for multi-account browser sessions */
 let authUser = null;
 try { authUser = localStorage.getItem(AUTH_KEY); } catch (e) {}
 if (authUser === "" || authUser === undefined) authUser = null;
@@ -2099,7 +2530,6 @@ const au = (url, sep) => authUser === null ? url : url + sep + "authuser=" + aut
 const THUMB = id => id ? au("https://drive.google.com/thumbnail?id=" + id + "&sz=w640", "&") : "";
 const PREVIEW = f => f.preview_url ? au(f.preview_url, f.preview_url.includes("?") ? "&" : "?") : "";
 
-/* 首帧加载失败的事件集合 —— 用于判断 Drive 共享是否正常 */
 const badThumbs = new Set();
 
 function noteThumbFail(img, id) {
@@ -2116,12 +2546,15 @@ function updateAccessBar() {
   if (!n) { bar.hidden = true; return; }
   bar.hidden = false;
   document.getElementById("access-title").textContent =
-    n >= total ? "全部 " + total + " 个证据切片当前无法预览"
-               : n + " / " + total + " 个证据切片首帧加载失败";
+    n >= total
+      ? tr("All " + total + " evidence clips cannot be previewed", "全部 " + total + " 个证据切片当前无法预览")
+      : tr(n + " / " + total + " evidence clip thumbnails failed to load", n + " / " + total + " 个证据切片首帧加载失败");
   document.getElementById("access-desc").textContent =
-    "Google Drive 对这些文件返回了无权限（匿名预览 401），首帧缩略图与页内播放都会被拦截。"
-    + "违规判定、SOP 对照、复核与报表导出不受影响。"
-    + (authUser === null ? "" : "（当前已指定 authuser=" + authUser + "）");
+    tr(
+      "Google Drive returned 401/403 for these clips, blocking thumbnail and embedded playback. Audit findings, SOP comparison, review sync, and Excel/CSV exports remain unaffected.",
+      "Google Drive 对这些文件返回了无权限（匿名预览 401），首帧缩略图与页内播放都会被拦截。违规判定、SOP 对照、复核与报表导出不受影响。"
+    )
+    + (authUser === null ? "" : tr(" (Active authuser=" + authUser + ")", "（当前已指定 authuser=" + authUser + "）"));
   document.getElementById("authuser-sel").value = authUser === null ? "" : authUser;
 }
 
@@ -2145,40 +2578,188 @@ function setAuthUser(v) {
     const f = F.find(x => x.id === activeId);
     if (f) document.getElementById("mv-iframe").src = PREVIEW(f);
   }
-  toast(authUser === null ? "已切回默认 Google 账号" : "已切换为 authuser=" + authUser + "，正在重载预览");
+  toast(authUser === null
+    ? tr("Switched back to default Google account", "已切回默认 Google 账号")
+    : tr("Switched to authuser=" + authUser + ", reloading previews...", "已切换为 authuser=" + authUser + "，正在重载预览"));
 }
 
 let review = {};
 try { review = JSON.parse(localStorage.getItem(STORE_KEY) || "{}") || {}; } catch (e) { review = {}; }
-/* Hydrate initial server-side review status/notes from Google Sheets Columns J & K */
-F.forEach(f => {
-  const cur = review[f.id] || {};
-  const srvStatus = f.initial_review_status || "PENDING";
-  const srvNote = f.initial_review_note || "";
-  if (srvStatus !== "PENDING" || srvNote) {
-    review[f.id] = {
-      status: srvStatus !== "PENDING" ? srvStatus : (cur.status || "PENDING"),
-      note: srvNote || cur.note || ""
-    };
-  }
-});
+
+function hydrateReviewsFromFindings(findingsList) {
+  (findingsList || []).forEach(f => {
+    const cur = review[f.id] || {};
+    const srvStatus = f.initial_review_status || "PENDING";
+    const srvNote = f.initial_review_note || "";
+    if (srvStatus !== "PENDING" || srvNote) {
+      review[f.id] = {
+        status: srvStatus !== "PENDING" ? srvStatus : (cur.status || "PENDING"),
+        note: srvNote || cur.note || ""
+      };
+    }
+  });
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(review)); } catch (e) {}
+}
+hydrateReviewsFromFindings(F);
 
 let filters = { sev: "ALL", video: "ALL", staff: "ALL", rev: "ALL" };
 let query = "";
-let visible = [];          // 当前筛选结果（供弹窗上一条/下一条使用）
+let visible = [];
 let activeId = null;
-const expanded = new Set(); // 证据描述已展开的卡片
+const expanded = new Set();
 
-/* ---------- 工具 ---------- */
+/* ---------- Utilities ---------- */
 const esc = s => String(s ?? "")
   .replace(/&/g, "&amp;").replace(/</g, "&lt;")
   .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
 const stateOf = id => review[id] || { status: "PENDING", note: "" };
-const staffKey = f => (f.staff_list && f.staff_list.length > 1) ? "多人" : f.staff_tag;
+const staffKey = f => (f.staff_list && f.staff_list.length > 1) ? tr("Multiple Staff", "多人") : f.staff_tag;
 
 function persist() {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(review)); } catch (e) {}
+}
+
+function applyLangUI() {
+  document.documentElement.lang = isZh() ? "zh-CN" : "en";
+  const setTxt = (id, enVal, zhVal) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = isZh() ? zhVal : enVal;
+  };
+  const setHtml = (id, enVal, zhVal) => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = isZh() ? zhVal : enVal;
+  };
+  setTxt("hd-brand-title", "Store AI Video Audit · Supervisor Workbench", "门店 AI 视频稽核 · 督导复核台");
+  setTxt("hd-audit-lbl", "Audit", "稽核单");
+  setTxt("hd-folder", "Store Folder ↗", "门店文件夹 ↗");
+  setTxt("hd-sheet", "Source Sheet ↗", "源数据表 ↗");
+  setTxt("btn-lang-toggle", isZh() ? "🌐 中文 | EN" : "🌐 EN | 中文", isZh() ? "🌐 中文 | EN" : "🌐 EN | 中文");
+  setTxt("btn-sync-sheet", "🔄 Sync Sheet", "🔄 同步复核");
+  setTxt("btn-batch-confirm", "Confirm All AI Hits", "一键确认实锤项");
+  setTxt("btn-open-report", "Generate 48h Notice", "生成 48h 整改通知单");
+  setTxt("opt-default-acct", "Default Google Account", "默认登录账号");
+  setTxt("access-folder", "Open Store Folder ↗", "打开门店文件夹 ↗");
+  setTxt("btn-access-help", "How to Fix", "修复方式");
+  setHtml(
+    "access-help-list",
+    '<li>Open the <b>Store Folder</b> above using a Google account that has access.</li>'
+    + '<li>Select the evidence clip files (or parent folder) → <b>Share</b> → set General Access to <code>Anyone with the link · Viewer</code>.</li>'
+    + '<li>Refresh this page to restore both thumbnail previews and embedded video playback.</li>'
+    + '<li>If the folder is shared with <b>another</b> signed-in Google account in your browser, select its <code>authuser</code> index on the left (`0` = primary browser account).</li>',
+    '<li>用<b>有权限的那个 Google 账号</b>打开上方「门店文件夹」。</li>'
+    + '<li>选中全部证据切片文件（或直接对父文件夹操作）→ <b>共享</b> → 常规访问权限改为 <code>知道链接的任何人 · 查看者</code>。</li>'
+    + '<li>回到本页刷新。首帧缩略图与页内播放会同时恢复。</li>'
+    + '<li>若文件已共享给你的<b>另一个</b> Google 账号，不必改权限，用左侧 <code>authuser</code> 下拉切换账号序号即可（0 为当前浏览器第一个登录账号）。</li>'
+  );
+  setTxt("v-kicker", "AUDIT VERDICT SUMMARY · APAC Cloud Audit Parameters 2026 v1.0", "稽核裁决摘要 · APAC Cloud Audit Parameters 2026 v1.0");
+  setHtml("v-unit-red", "Red-Line<br />Zero-Tolerance", "项红线<br />零容忍违规");
+  setHtml("v-unit-normal", "Standard<br />SOP Deviations", "项一般<br />操作偏差");
+  setHtml("v-unit-clause", "SOP Clauses<br />Triggered", "条 SOP 条款<br />被命中");
+  setTxt("btn-export-xlsx", "⤓ Export Excel (.xlsx)", "⤓ 下载统计明细（Excel）");
+  setTxt("btn-export-csv", "⤓ Export Review CSV", "⤓ 复核明细 CSV");
+  setTxt("p-title", "Supervisor Review Progress", "督导人工复核进度");
+  setTxt("p-lbl-c", "Confirmed Violations", "已确认违规");
+  setTxt("p-lbl-d", "False Positives Dismissed", "已排除误报");
+  setTxt("p-lbl-f", "Follow-Up Footage Needed", "待调后续录像");
+  setTxt("p-lbl-p", "Pending Review", "待复核");
+  setTxt("btn-reset-review", "Reset Local Reviews", "清空本地复核记录");
+  setTxt("lbl-sev-ALL", "All Events", "全部事件");
+  setTxt("lbl-sev-RED", "Red Line", "红线");
+  setTxt("lbl-sev-NORMAL", "Standard", "一般偏差");
+  setTxt("lbl-sev-UNVERIFIED", "Unverified", "盲区待核");
+  const qEl = document.getElementById("q");
+  if (qEl) qEl.placeholder = tr("Search clause A2 / staff / phone / handwash / scoop…", "搜索条款 A2 / 员工 / 手机 / 洗手 / 冰铲…");
+  const moreRow = document.getElementById("more-row");
+  const btnMore = document.getElementById("btn-more");
+  if (btnMore) btnMore.textContent = (moreRow && !moreRow.hidden) ? tr("Hide Filters", "收起筛选") : tr("More Filters", "更多筛选");
+  setTxt("flbl-video", "Source Video", "监控原片");
+  setTxt("flbl-staff", "Staff", "涉事人员");
+  setTxt("flbl-review", "Review Status", "复核状态");
+  setTxt("ap-main-title", "Appendix", "附录");
+  setTxt("ap-main-sub", "SOP Rule Catalog & Token Ledger", "规则字典与算力账单");
+  setTxt("ap-dict-title", "Full SOP Rule Catalog", "全量 SOP 规则字典");
+  setTxt("ap-ledger-title", "Video Token Consumption & Cost Ledger", "视频 Token 消耗与算力账单");
+  setTxt("mv-prev", "← Prev", "← 上一条");
+  setTxt("mv-next", "Next →", "下一条 →");
+  setTxt("mv-drive", "Open in Drive ↗", "Drive 原片 ↗");
+  setTxt("mv-close", "Close ESC", "关闭 ESC");
+  setHtml(
+    "mv-notice-txt",
+    'Seeing Google <b>"You need access"</b>? The clip isn\'t link-shared or your active browser account lacks access.',
+    '播放器里显示 Google <b>「You need access」</b>？该切片未开启链接共享，或当前登录账号无权限。'
+  );
+  setTxt("mv-opt-default", "Default Account", "默认账号");
+  setTxt("mv-cap-note", "Evidence clip spans 2s before to 18s after the detected violation", "证据切片覆盖违规发生前 2 秒至后 18 秒");
+  setTxt("mr-kicker", "Ready to paste into Google Chat / Feishu / WeCom", "可直接粘贴至 Google Chat / 飞书 / 企微群");
+  setTxt("mr-title", "Store AI Cloud Audit — 48-Hour Rectification Notice", "门店 AI 云稽核 48 小时整改通知单");
+  setTxt("mr-btn-copy", "Copy Full Text", "复制全文");
+  setTxt("mr-btn-print", "Print / PDF", "打印 / PDF");
+  setTxt("mr-btn-close", "Close ESC", "关闭 ESC");
+}
+
+function toggleLang() {
+  lang = isZh() ? "en" : "zh";
+  try { localStorage.setItem(LANG_KEY, lang); } catch (e) {}
+  applyLangUI();
+  renderHero();
+  renderProgress();
+  buildChips();
+  renderSections();
+  renderAppendix();
+  updateAccessBar();
+  if (activeId != null && document.getElementById("modal-video").classList.contains("open")) {
+    openVideo(activeId);
+  }
+  if (document.getElementById("modal-report").classList.contains("open")) {
+    openReport();
+  }
+  toast(tr("Switched language to English", "已切换为中文界面"));
+}
+
+async function syncFromSheet() {
+  const auth = DATA.auth || {};
+  const qs = new URLSearchParams();
+  if (auth.batch || DATA.batch_id) {
+    qs.set("batch", auth.batch || DATA.batch_id || "");
+    qs.set("store", auth.store || DATA.audit_id || "");
+  } else {
+    qs.set("job", auth.job || DATA.audit_id || "");
+    if (auth.user || DATA.user_id) qs.set("user", auth.user || DATA.user_id || "");
+  }
+  if (auth.exp || DATA.exp) qs.set("exp", String(auth.exp || DATA.exp || 0));
+  if (auth.sig || DATA.sig) qs.set("sig", auth.sig || DATA.sig || "");
+  try {
+    const resp = await fetch("/api/portal/data?" + qs.toString(), { cache: "no-store" });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const fresh = await resp.json();
+    if (fresh && Array.isArray(fresh.findings)) {
+      const freshByIncident = {};
+      fresh.findings.forEach(ff => {
+        if (ff.incident_id) freshByIncident[ff.incident_id] = ff;
+      });
+      F.forEach(f => {
+        const ff = freshByIncident[f.incident_id] || fresh.findings.find(x => x.id === f.id);
+        if (ff) {
+          f.initial_review_status = ff.initial_review_status || "PENDING";
+          f.initial_review_note = ff.initial_review_note || "";
+          review[f.id] = {
+            status: f.initial_review_status,
+            note: f.initial_review_note
+          };
+        }
+      });
+      persist();
+      renderHero();
+      renderProgress();
+      buildChips();
+      renderSections();
+      renderAppendix();
+      toast(tr("🔄 Synced latest team review status from Google Sheet", "🔄 已从 Google Sheet 同步团队最新复核状态"));
+      return;
+    }
+  } catch (e) {}
+  toast(tr("Unable to reach server sync endpoint (local preview mode)", "当前处于离线/静态预览模式，仅使用本地复核状态"));
 }
 
 let noteDebounceTimers = {};
@@ -2202,7 +2783,7 @@ async function persistReviewsToSheet(updatesList) {
     if (resp.ok) {
       const res = await resp.json();
       if (res && res.persisted_to_sheet) {
-        toast("☁️ 已实时同步回写至门店 Google Sheet 报告");
+        toast(tr("☁️ Synced review decision to Store Google Sheet", "☁️ 已实时同步回写至门店 Google Sheet 报告"));
       }
     }
   } catch (e) {
@@ -2270,7 +2851,6 @@ async function copyText(txt, okMsg) {
     return;
   }
 
-  /* Sandboxed preview iframe fallback: open the report modal with the text pre-selected so Ctrl+C / Cmd+C works immediately */
   const mrPre = document.getElementById("mr-text");
   const mrModal = document.getElementById("modal-report");
   if (mrPre && mrModal) {
@@ -2285,17 +2865,17 @@ async function copyText(txt, okMsg) {
       sel.addRange(range);
     } catch (e) {}
   }
-  toast("当前预览沙盒限制自动剪贴板，已为您全选文本，请按 Ctrl+C / ⌘+C 复制");
+  toast(tr("Clipboard blocked by preview sandbox — text selected, press Ctrl+C / ⌘+C to copy", "当前预览沙盒限制自动剪贴板，已为您全选文本，请按 Ctrl+C / ⌘+C 复制"));
 }
 
 function hl(text) {
   let s = esc(text);
-  s = s.replace(/(员工[A-Z])/g, '<span class="hl-s">$1</span>');
+  s = s.replace(/((?:Staff|Employee|Partner|Worker|员工)\s*[A-Z0-9]+)/gi, '<span class="hl-s">$1</span>');
   s = s.replace(/(\d{2}:\d{2}(?::\d{2})?(?:\s*[-–]\s*\d{2}:\d{2}(?::\d{2})?)?)/g, '<span class="hl-t">$1</span>');
   return s;
 }
 
-/* ---------- 筛选 ---------- */
+/* ---------- Filters ---------- */
 function matches(f) {
   if (filters.sev === "RED_LINE"   && f.severity !== "RED_LINE") return false;
   if (filters.sev === "NORMAL"     && f.severity !== "NORMAL") return false;
@@ -2304,16 +2884,16 @@ function matches(f) {
   if (filters.staff !== "ALL" && staffKey(f) !== filters.staff) return false;
   if (filters.rev   !== "ALL" && stateOf(f.id).status !== filters.rev) return false;
   if (query) {
-    const hay = [f.code, f.rule_id, f.rule_name, f.sub_clause_title, f.description,
-                 f.staff_tag, f.video_display, f.mmss, f.osd_clock].join(" ").toLowerCase();
+    const hay = [f.code, f.rule_id, f.rule_name, f.rule_name_zh, f.sub_clause_title, f.sub_clause_title_zh,
+                 f.description, f.staff_tag, f.video_display, f.mmss, f.osd_clock].join(" ").toLowerCase();
     if (!hay.includes(query)) return false;
   }
   return true;
 }
 
-/* ---------- 顶部裁决摘要 ---------- */
+/* ---------- Verdict Hero ---------- */
 function renderHero() {
-  document.getElementById("hd-store").textContent = DATA.store_name || "门店稽核";
+  document.getElementById("hd-store").textContent = DATA.store_name || tr("Store Audit", "门店稽核");
   document.getElementById("hd-audit").textContent = "#" + (DATA.audit_id || "");
   const folderLink = document.getElementById("hd-folder");
   const sheetLink = document.getElementById("hd-sheet");
@@ -2326,8 +2906,9 @@ function renderHero() {
   const resTag = (tk[0] && tk[0].resolution && tk[0].resolution.includes("x"))
     ? (tk[0].resolution.split("x")[1] + "P ")
     : "";
-  document.getElementById("hd-scope").textContent =
-    tk.length + " 段 " + resTag + "后厨监控";
+  document.getElementById("hd-scope").textContent = isZh()
+    ? (tk.length + " 段 " + resTag + "后厨监控")
+    : (tk.length + " × " + resTag + "Kitchen CCTV Clips");
 
   /* Multi-Store Batch Switcher Bar */
   const batchStores = DATA.batch_stores || [];
@@ -2337,7 +2918,7 @@ function renderHero() {
   if (batchStores.length > 0) {
     batchBar.hidden = false;
     const inner = document.getElementById("batch-switcher-inner");
-    inner.innerHTML = '<span class="bs-label">🏪 批次门店切换：</span>' + batchStores.map(st => {
+    inner.innerHTML = '<span class="bs-label">' + tr("🏪 Store Switcher:", "🏪 批次门店切换：") + '</span>' + batchStores.map(st => {
       const isCur = Boolean(st.active) || st.job_id === DATA.audit_id;
       const stIcon = st.state === "DONE" ? "✅" : (st.state === "RUNNING" ? "⏳" : "⚠️");
       const vCount = st.violations_found !== undefined ? st.violations_found : (st.findings_count || 0);
@@ -2346,7 +2927,7 @@ function renderHero() {
         + "&exp=" + encodeURIComponent(auth.exp || DATA.exp || 0)
         + "&sig=" + encodeURIComponent(auth.sig || DATA.sig || ""));
       return '<a class="batch-pill' + (isCur ? ' active' : '') + '" href="' + esc(href) + '" onclick="return onBatchPillClick(event, \'' + esc(st.job_id) + '\')">'
-        + stIcon + ' ' + esc(st.folder_name) + ' (' + vCount + '项)</a>';
+        + stIcon + ' ' + esc(st.folder_name) + ' (' + vCount + tr("", "项") + ')</a>';
     }).join("");
   } else {
     batchBar.hidden = true;
@@ -2357,12 +2938,15 @@ function renderHero() {
   if (DATA.job_state === "RUNNING") {
     bannerEl.hidden = false;
     bannerEl.className = "job-status-banner running";
-    bannerEl.textContent = "⏳ 当前门店视频正在后台并发稽核中，已产出部分切片结果，刷新页面可查看最新进度。";
+    bannerEl.textContent = tr(
+      "⏳ Store videos are currently being audited in the background. Partial slice findings are shown below; refresh or click Sync Sheet for updates.",
+      "⏳ 当前门店视频正在后台并发稽核中，已产出部分切片结果，刷新页面可查看最新进度。"
+    );
   } else if (DATA.job_state === "FAILED" || DATA.job_state === "REJECTED") {
     bannerEl.hidden = false;
     bannerEl.className = "job-status-banner failed";
-    bannerEl.textContent = "⚠️ 稽核任务未完成 (" + DATA.job_state + ")"
-      + (DATA.error_message ? "：" + DATA.error_message : "");
+    bannerEl.textContent = tr("⚠️ Audit task did not complete (", "⚠️ 稽核任务未完成 (") + DATA.job_state + ")"
+      + (DATA.error_message ? ": " + DATA.error_message : "");
   } else {
     bannerEl.hidden = true;
   }
@@ -2374,35 +2958,44 @@ function renderHero() {
   document.getElementById("v-red").textContent = red.length;
   document.getElementById("v-normal").textContent = nor.length;
   document.getElementById("v-clause").textContent = hitClauses.length;
-  document.getElementById("v-clause-total").textContent = "/ 共 " + (DATA.sop_rules || []).length + " 条";
+  document.getElementById("v-clause-total").textContent = isZh()
+    ? ("/ 共 " + (DATA.sop_rules || []).length + " 条")
+    : ("/ " + (DATA.sop_rules || []).length + " total");
 
   const noteEl = document.getElementById("v-note");
   if (F.length === 0) {
     noteEl.className = "verdict-note is-clean";
-    noteEl.innerHTML = "<b>✓ 本次稽核未检出任何 SOP 违规事件</b>，全部监控原片均符合 CHAGEE APAC 稽核标准。";
+    noteEl.innerHTML = tr(
+      "<b>✓ Zero SOP violations detected in this audit.</b> All inspected CCTV clips comply with CHAGEE APAC audit standards.",
+      "<b>✓ 本次稽核未检出任何 SOP 违规事件</b>，全部监控原片均符合 CHAGEE APAC 稽核标准。"
+    );
   } else if (red.length === 0) {
     noteEl.className = "verdict-note";
     const staffSet = [...new Set(F.flatMap(f => f.staff_list || [f.staff_tag]))];
-    noteEl.innerHTML = "本次稽核未触发红线零容忍违规，共检出 <b>" + nor.length + " 项一般操作偏差</b>，建议店长在晨会宣导纠偏。涉事人员："
-      + staffSet.map(esc).join(" / ") + "。";
+    noteEl.innerHTML = isZh()
+      ? ("本次稽核未触发红线零容忍违规，共检出 <b>" + nor.length + " 项一般操作偏差</b>，建议店长在晨会宣导纠偏。涉事人员：" + staffSet.map(esc).join(" / ") + "。")
+      : ("No zero-tolerance red-line violations triggered. Detected <b>" + nor.length + " standard SOP deviation(s)</b> for morning briefing coaching. Involved staff: " + staffSet.map(esc).join(" / ") + ".");
   } else {
     noteEl.className = "verdict-note";
     const byClause = {};
     red.forEach(f => {
       const k = f.rule_id;
-      byClause[k] = byClause[k] || { n: 0, label: f.sub_clause_title.replace(/^[\d.\s/–-]+/, "") };
+      byClause[k] = byClause[k] || { n: 0, label: fSubTitle(f).replace(/^[\d.\s/–-]+/, "") };
       byClause[k].n++;
     });
     const tops = Object.entries(byClause).sort((a, b) => b[1].n - a[1].n);
     const staffSet = [...new Set(red.flatMap(f => f.staff_list || [f.staff_tag]))];
-    noteEl.innerHTML =
-      "<b>" + red.length + " 项红线违规须在 48 小时内闭环整改</b>，集中在 " + tops.length + " 条 SOP 条款："
-      + tops.slice(0, 3).map(([rid, v]) => esc(rid) + " " + esc(v.label) + " <b>" + v.n + " 项</b>").join("、")
-      + (tops.length > 3 ? " 等" : "")
-      + "。涉事人员：" + staffSet.map(esc).join(" / ") + "。";
+    noteEl.innerHTML = isZh()
+      ? ("<b>" + red.length + " 项红线违规须在 48 小时内闭环整改</b>，集中在 " + tops.length + " 条 SOP 条款："
+        + tops.slice(0, 3).map(([rid, v]) => esc(rid) + " " + esc(v.label) + " <b>" + v.n + " 项</b>").join("、")
+        + (tops.length > 3 ? " 等" : "")
+        + "。涉事人员：" + staffSet.map(esc).join(" / ") + "。")
+      : ("<b>" + red.length + " Red-Line violation(s) require mandatory 48-hour rectification</b> across " + tops.length + " SOP clause(s): "
+        + tops.slice(0, 3).map(([rid, v]) => esc(rid) + " " + esc(v.label) + " (<b>" + v.n + "</b>)").join(", ")
+        + (tops.length > 3 ? ", etc." : "")
+        + ". Involved staff: " + staffSet.map(esc).join(" / ") + ".");
   }
 
-  // 模块分布条
   const mods = Object.keys(MODULE_META).sort((a, b) => MODULE_META[a].order - MODULE_META[b].order);
   const maxN = Math.max(...mods.map(m => F.filter(f => f.module_code === m).length), 1);
   document.getElementById("v-modbars").innerHTML = mods.map(m => {
@@ -2410,9 +3003,10 @@ function renderHero() {
     const r = list.filter(f => f.severity === "RED_LINE").length;
     const n = list.length - r;
     const scale = list.length / maxN * 100;
+    const mMeta = metaOf(m);
     return '<div class="modbar">'
-      + '<span class="nm"><b style="color:var(--red)">' + m + '</b> · ' + esc(MODULE_META[m].title) + '</span>'
-      + '<span class="track" title="红线 ' + r + ' / 一般 ' + n + '">'
+      + '<span class="nm"><b style="color:var(--red)">' + m + '</b> · ' + esc(mMeta.title) + '</span>'
+      + '<span class="track" title="' + tr("Red Line " + r + " / Standard " + n, "红线 " + r + " / 一般 " + n) + '">'
       +   (list.length ? '<i class="fill-red" style="width:' + (r / list.length * scale) + '%"></i>'
                        + '<i class="fill-amber" style="width:' + (n / list.length * scale) + '%"></i>' : '')
       + '</span>'
@@ -2433,8 +3027,9 @@ function renderProgress() {
   document.getElementById("p-pct").textContent = pct + "%";
   document.getElementById("p-ring").style.setProperty("--deg", (pct * 3.6) + "deg");
   document.getElementById("p-sub").textContent =
-    done === 0 ? "尚未开始复核 · 共 " + total + " 项待处置"
-               : done + " / " + total + " 项已处置";
+    done === 0
+      ? tr("Not started · " + total + " pending review", "尚未开始复核 · 共 " + total + " 项待处置")
+      : tr(done + " / " + total + " reviewed", done + " / " + total + " 项已处置");
   document.getElementById("p-c").textContent = c;
   document.getElementById("p-d").textContent = d;
   document.getElementById("p-f").textContent = fu;
@@ -2442,15 +3037,15 @@ function renderProgress() {
   renderDlHint();
 }
 
-/* ---------- 工具栏 ---------- */
+/* ---------- Toolbar ---------- */
 function renderToolbarCounts() {
   const base = f => {
     if (filters.video !== "ALL" && f.video_short !== filters.video) return false;
     if (filters.staff !== "ALL" && staffKey(f) !== filters.staff) return false;
     if (filters.rev !== "ALL" && stateOf(f.id).status !== filters.rev) return false;
     if (query) {
-      const hay = [f.code, f.rule_id, f.rule_name, f.sub_clause_title, f.description,
-                   f.staff_tag, f.video_display, f.mmss, f.osd_clock].join(" ").toLowerCase();
+      const hay = [f.code, f.rule_id, f.rule_name, f.rule_name_zh, f.sub_clause_title, f.sub_clause_title_zh,
+                   f.description, f.staff_tag, f.video_display, f.mmss, f.osd_clock].join(" ").toLowerCase();
       if (!hay.includes(query)) return false;
     }
     return true;
@@ -2469,21 +3064,21 @@ function buildChips() {
   const vids = [];
   F.forEach(f => { if (!vids.some(v => v.k === f.video_short)) vids.push({ k: f.video_short, label: f.video_display }); });
   document.getElementById("chips-video").innerHTML =
-    chipHtml("video", "ALL", "全部原片") +
+    chipHtml("video", "ALL", tr("All Clips", "全部原片")) +
     vids.map(v => chipHtml("video", v.k,
       v.label.replace(/^Footage\s*/, "F") + " · " + F.filter(x => x.video_short === v.k).length)).join("");
 
   const staffs = [...new Set(F.map(staffKey))];
   document.getElementById("chips-staff").innerHTML =
-    chipHtml("staff", "ALL", "全部人员") +
+    chipHtml("staff", "ALL", tr("All Staff", "全部人员")) +
     staffs.map(s => chipHtml("staff", s, s + " · " + F.filter(x => staffKey(x) === s).length)).join("");
 
   document.getElementById("chips-review").innerHTML =
-    chipHtml("rev", "ALL", "全部状态") +
-    chipHtml("rev", "PENDING", "待复核") +
-    chipHtml("rev", "CONFIRMED_VIOLATION", "已确认") +
-    chipHtml("rev", "DISMISSED", "已排除") +
-    chipHtml("rev", "FOLLOWUP", "待调录像");
+    chipHtml("rev", "ALL", tr("All Statuses", "全部状态")) +
+    chipHtml("rev", "PENDING", tr("Pending", "待复核")) +
+    chipHtml("rev", "CONFIRMED_VIOLATION", tr("Confirmed", "已确认")) +
+    chipHtml("rev", "DISMISSED", tr("False Positive", "已排除")) +
+    chipHtml("rev", "FOLLOWUP", tr("Follow-Up", "待调录像"));
 }
 
 function chipHtml(key, val, label) {
@@ -2504,30 +3099,40 @@ function renderJump(groups) {
     + ' <span class="n">' + g.items.length + '</span></a>').join("");
 }
 
-/* ---------- 复核处置按钮 ---------- */
-const DEC_LABELS = {
-  CONFIRMED_VIOLATION: { idle: "确认违规", done: "✓ 已确认违规", flag: "已确认违规" },
-  DISMISSED:           { idle: "排除误报", done: "✓ 已排除误报", flag: "已排除误报" },
-  FOLLOWUP:            { idle: "待调录像", done: "✓ 已标记待调", flag: "待调后续录像" }
-};
+/* ---------- Review Decision Buttons ---------- */
+function getDecLabels() {
+  if (isZh()) {
+    return {
+      CONFIRMED_VIOLATION: { idle: "确认违规", done: "✓ 已确认违规", flag: "已确认违规" },
+      DISMISSED:           { idle: "排除误报", done: "✓ 已排除误报", flag: "已排除误报" },
+      FOLLOWUP:            { idle: "待调录像", done: "✓ 已标记待调", flag: "待调后续录像" }
+    };
+  }
+  return {
+    CONFIRMED_VIOLATION: { idle: "Confirm", done: "✓ Confirmed", flag: "Confirmed" },
+    DISMISSED:           { idle: "False Positive", done: "✓ Dismissed", flag: "False Positive" },
+    FOLLOWUP:            { idle: "Follow-Up", done: "✓ Follow-Up", flag: "Follow-Up" }
+  };
+}
 
 function decBtn(id, cls, status, current) {
   const on = current === status;
-  const L = DEC_LABELS[status];
+  const L = getDecLabels()[status];
   return '<button class="' + cls + '" aria-pressed="' + on + '"'
-    + ' title="' + (on ? L.done.replace("✓ ", "") + "，点击可撤销" : L.idle) + '"'
+    + ' title="' + (on ? L.done.replace("✓ ", "") + tr(" (click to undo)", "，点击可撤销") : L.idle) + '"'
     + ' onclick="decide(' + id + ',\'' + status + '\')">'
     + (on ? L.done : L.idle) + '</button>';
 }
 
 function stateFlag(status) {
-  if (status === "PENDING" || !DEC_LABELS[status]) return "";
+  const labels = getDecLabels();
+  if (status === "PENDING" || !labels[status]) return "";
   const cls = status === "CONFIRMED_VIOLATION" ? "c" : (status === "DISMISSED" ? "d" : "f");
   return '<span class="bullet">|</span><span class="state-flag ' + cls + '">'
-    + DEC_LABELS[status].flag + '</span>';
+    + labels[status].flag + '</span>';
 }
 
-/* ---------- 证据卡片 ---------- */
+/* ---------- Evidence Card ---------- */
 function cardHtml(f) {
   const st = stateOf(f.id);
   const isRed = f.severity === "RED_LINE";
@@ -2536,22 +3141,24 @@ function cardHtml(f) {
 
   const hasFileId = Boolean(f.file_id);
   return '<article class="card ' + (st.status === "DISMISSED" ? "is-dismissed" : "") + '" id="card-' + f.id + '">'
-    + '<button class="thumb' + (hasFileId ? '' : ' no-img') + '" onclick="openVideo(' + f.id + ')" aria-label="播放 ' + esc(f.code) + ' 证据切片">'
+    + '<button class="thumb' + (hasFileId ? '' : ' no-img') + '" onclick="openVideo(' + f.id + ')" aria-label="' + tr("Play evidence clip ", "播放 ") + esc(f.code) + '">'
     +   (hasFileId
-          ? '<img src="' + esc(THUMB(f.file_id)) + '" alt="' + esc(f.code) + ' 违规瞬间首帧" loading="lazy" '
+          ? '<img src="' + esc(THUMB(f.file_id)) + '" alt="' + esc(f.code) + '" loading="lazy" '
             + 'referrerpolicy="no-referrer" onerror="noteThumbFail(this,' + f.id + ')" />'
           : '')
     +   '<div class="fallback"><span class="fb-ic">▣</span><span class="fb-code">' + esc(f.code) + ' · ' + esc(f.mmss) + '</span>'
-    +     '<span>' + (hasFileId ? '首帧不可用：Drive 无访问权限<br />点击查看修复方式' : '点击播放 20 秒证据视频切片') + '</span></div>'
+    +     '<span>' + (hasFileId
+            ? tr('Thumbnail blocked by Drive permissions<br />Click to view fix or play', '首帧不可用：Drive 无访问权限<br />点击查看修复方式')
+            : tr('Click to play 20s evidence clip', '点击播放 20 秒证据视频切片')) + '</span></div>'
     +   '<div class="scrim"></div>'
     +   '<div class="tl">'
-    +     (isRed ? '<span class="tag tag-solid-red">红线 · 48h 必改</span>'
-                 : '<span class="tag tag-solid-amber">一般偏差</span>')
-    +     (unv ? '<span class="tag tag-solid-dark">盲区待核</span>' : '')
+    +     (isRed ? '<span class="tag tag-solid-red">' + tr("RED LINE · 48h Fix", "红线 · 48h 必改") + '</span>'
+                 : '<span class="tag tag-solid-amber">' + tr("Standard Deviation", "一般偏差") + '</span>')
+    +     (unv ? '<span class="tag tag-solid-dark">' + tr("Unverified", "盲区待核") + '</span>' : '')
     +   '</div>'
     +   '<div class="tr"><span class="tag tag-solid-dark">' + esc(f.rule_id) + '</span></div>'
     +   '<div class="play">▶</div>'
-    +   '<div class="bl"><span class="tag tag-solid-dark">▶ 20s 证据切片</span></div>'
+    +   '<div class="bl"><span class="tag tag-solid-dark">' + tr("▶ 20s Evidence Clip", "▶ 20s 证据切片") + '</span></div>'
     +   '<div class="br"><span class="tag tag-solid-dark mono">' + esc(f.mmss)
     +     (f.osd_clock ? " · OSD " + esc(f.osd_clock) : "") + '</span></div>'
     + '</button>'
@@ -2561,36 +3168,36 @@ function cardHtml(f) {
     +     '<span class="code">' + esc(f.code) + '</span>'
     +     '<span class="bullet">|</span><span>' + esc(f.staff_tag) + '</span>'
     +     '<span class="bullet">|</span><span>' + esc(f.video_display) + '</span>'
-    +     '<span class="bullet">|</span><span class="mono">置信度 ' + esc(f.confidence_pct) + '</span>'
+    +     '<span class="bullet">|</span><span class="mono">' + tr("Conf ", "置信度 ") + esc(f.confidence_pct) + '</span>'
     +     stateFlag(st.status)
     +   '</div>'
-    +   '<h4>' + esc(f.sub_clause_title) + '</h4>'
+    +   '<h4>' + esc(fSubTitle(f)) + '</h4>'
     +   '<p class="evid ' + (open ? "" : "clamp") + '" id="evid-' + f.id + '">' + hl(f.description) + '</p>'
-    +   '<button class="more" onclick="toggleEvid(' + f.id + ')">' + (open ? "收起证据描述" : "展开完整证据描述") + '</button>'
+    +   '<button class="more" onclick="toggleEvid(' + f.id + ')">' + (open ? tr("Collapse evidence", "收起证据描述") : tr("Expand full evidence", "展开完整证据描述")) + '</button>'
 
-    +   '<details class="fold"' + (isRed ? "" : "") + '>'
-    +     '<summary>SOP 条款对照 · ' + esc(f.rule_id) + '</summary>'
+    +   '<details class="fold">'
+    +     '<summary>' + tr("SOP Criteria · ", "SOP 条款对照 · ") + esc(f.rule_id) + '</summary>'
     +     '<div class="fold-body">'
-    +       '<div class="fold-line"><span class="k">标准做法</span><br />' + esc(f.specific_pass) + '</div>'
-    +       '<div class="fold-line bad"><span class="k">判定红线</span><br />' + esc(f.sop_fail_criteria) + '</div>'
+    +       '<div class="fold-line"><span class="k">' + tr("Pass Standard", "标准做法") + '</span><br />' + esc(fPass(f)) + '</div>'
+    +       '<div class="fold-line bad"><span class="k">' + tr("Fail Red Line", "判定红线") + '</span><br />' + esc(fFail(f)) + '</div>'
     +       '<div class="fold-line muted" style="font-size:11.5px">' + esc(f.doc_ref) + '</div>'
     +     '</div>'
     +   '</details>'
 
-    +   '<div class="advice"><span class="k">整改建议</span> ' + esc(f.rectification_advice) + '</div>'
+    +   '<div class="advice"><span class="k">' + tr("Rectification Advice:", "整改建议") + '</span> ' + esc(fAdvice(f)) + '</div>'
     + '</div>'
 
     + '<div class="card-foot">'
     +   '<div class="dec-row">'
-    +     '<div class="dec' + (st.status !== "PENDING" ? " has-state" : "") + '" role="group" aria-label="复核处置">'
+    +     '<div class="dec' + (st.status !== "PENDING" ? " has-state" : "") + '" role="group" aria-label="Review decision">'
     +       decBtn(f.id, "c", "CONFIRMED_VIOLATION", st.status)
     +       decBtn(f.id, "d", "DISMISSED", st.status)
     +       decBtn(f.id, "f", "FOLLOWUP", st.status)
     +     '</div>'
-    +     '<button class="btn btn-sm" style="margin-left:auto" onclick="copyOne(' + f.id + ')">复制单条通知</button>'
+    +     '<button class="btn btn-sm" style="margin-left:auto" onclick="copyOne(' + f.id + ')">' + tr("Copy Notice", "复制单条通知") + '</button>'
     +   '</div>'
     +   '<div class="note-row">'
-    +     '<input type="text" placeholder="督导复核批注 / 店长整改要求（自动保存）" value="' + esc(st.note) + '" '
+    +     '<input type="text" placeholder="' + tr("Supervisor review note / manager instruction (auto-saved to Sheet)", "督导复核批注 / 店长整改要求（自动保存）") + '" value="' + esc(st.note) + '" '
     +       'oninput="setState(' + f.id + ', undefined, this.value, false)" />'
     +   '</div>'
     + '</div>'
@@ -2603,10 +3210,10 @@ function toggleEvid(id) {
   const open = p.classList.toggle("clamp") === false;
   if (open) expanded.add(id); else expanded.delete(id);
   const btn = p.nextElementSibling;
-  if (btn) btn.textContent = open ? "收起证据描述" : "展开完整证据描述";
+  if (btn) btn.textContent = open ? tr("Collapse evidence", "收起证据描述") : tr("Expand full evidence", "展开完整证据描述");
 }
 
-/* ---------- 模块 / 条款分区 ---------- */
+/* ---------- Module & Clause Sections ---------- */
 function groupData(list) {
   const allCodes = [...new Set([...Object.keys(MODULE_META), ...list.map(f => f.module_code || "C")])];
   const mods = allCodes.sort((a, b) => metaOf(a).order - metaOf(b).order);
@@ -2632,9 +3239,9 @@ function renderSections() {
   const host = document.getElementById("sections");
 
   if (!groups.length) {
-    host.innerHTML = '<div class="empty"><div class="ic">⌕</div><h3>当前筛选条件下没有事件</h3>'
-      + '<p>试着放宽严重等级，或清空搜索关键词。</p>'
-      + '<button class="btn" style="margin-top:16px" onclick="resetFilters()">重置全部筛选</button></div>';
+    host.innerHTML = '<div class="empty"><div class="ic">⌕</div><h3>' + tr("No findings match current filters", "当前筛选条件下没有事件") + '</h3>'
+      + '<p>' + tr("Try relaxing the severity filter or clearing the search box.", "试着放宽严重等级，或清空搜索关键词。") + '</p>'
+      + '<button class="btn" style="margin-top:16px" onclick="resetFilters()">' + tr("Reset All Filters", "重置全部筛选") + '</button></div>';
     return;
   }
 
@@ -2646,17 +3253,19 @@ function renderSections() {
     return '<section class="module" id="mod-' + g.code + '">'
       + '<div class="module-banner" data-letter="' + g.code + '">'
       +   '<div class="module-badge" aria-hidden="true">'
-      +     '<span class="ltr">' + g.code + '</span><span class="cap">类</span>'
+      +     '<span class="ltr">' + g.code + '</span><span class="cap">' + tr("MOD", "类") + '</span>'
       +   '</div>'
       +   '<div class="mtxt">'
-      +     '<div class="mk">' + m.kicker + ' · 违规大类</div>'
+      +     '<div class="mk">' + m.kicker + ' · ' + tr("SOP CATEGORY", "违规大类") + '</div>'
       +     '<h2><span class="pfx">' + g.code + '</span> · ' + esc(m.title) + '</h2>'
       +     '<p class="desc">' + esc(m.desc) + '</p>'
       +   '</div>'
       +   '<div class="counts">'
-      +     (red ? '<span class="tag tag-dark-red"><i class="dot"></i>红线 ' + red + '</span>' : '')
-      +     (nor ? '<span class="tag tag-dark-amber"><i class="dot"></i>一般 ' + nor + '</span>' : '')
-      +     '<span class="tag tag-dark-slate">共 ' + g.items.length + ' 项 / ' + g.clauses.length + ' 条条款</span>'
+      +     (red ? '<span class="tag tag-dark-red"><i class="dot"></i>' + tr("Red Line ", "红线 ") + red + '</span>' : '')
+      +     (nor ? '<span class="tag tag-dark-amber"><i class="dot"></i>' + tr("Standard ", "一般 ") + nor + '</span>' : '')
+      +     '<span class="tag tag-dark-slate">' + (isZh()
+              ? ('共 ' + g.items.length + ' 项 / ' + g.clauses.length + ' 条条款')
+              : (g.items.length + ' findings / ' + g.clauses.length + ' clauses')) + '</span>'
       +   '</div>'
       + '</div>'
       + g.clauses.map(c => clauseHtml(c)).join("")
@@ -2670,19 +3279,19 @@ function clauseHtml(c) {
     + '<div class="clause-head">'
     +   '<span class="clause-code ' + (c.hasRed ? "red" : "") + '">' + esc(c.rid) + '</span>'
     +   '<div class="clause-ttl">'
-    +     '<h3>' + esc(r.clean_subtitle || r.name || c.rid) + '</h3>'
+    +     '<h3>' + esc(rTitle(r) || c.rid) + '</h3>'
     +     '<div class="src">' + esc(r.doc_ref || "") + '</div>'
     +   '</div>'
     +   '<div class="clause-actions">'
-    +     '<span class="tag ' + (c.hasRed ? "tag-red" : "tag-amber") + '">本条检出 ' + c.items.length + ' 项</span>'
-    +     '<button class="btn btn-sm" onclick="toggleRaw(\'' + c.rid + '\', this)">核查细则原文</button>'
+    +     '<span class="tag ' + (c.hasRed ? "tag-red" : "tag-amber") + '">' + (isZh() ? ('本条检出 ' + c.items.length + ' 项') : (c.items.length + ' detected')) + '</span>'
+    +     '<button class="btn btn-sm" onclick="toggleRaw(\'' + c.rid + '\', this)">' + tr("View Audit Logic", "核查细则原文") + '</button>'
     +   '</div>'
     + '</div>'
     + '<div class="criteria">'
-    +   '<div class="crit pass"><div class="ct">✓ 合规基准</div><p>' + esc(r.pass_criteria || "—") + '</p></div>'
-    +   '<div class="crit fail"><div class="ct">✕ 违规判定</div><p>' + esc(r.fail_criteria || "—") + '</p></div>'
+    +   '<div class="crit pass"><div class="ct">' + tr("✓ PASS STANDARD", "✓ 合规基准") + '</div><p>' + esc(rPass(r)) + '</p></div>'
+    +   '<div class="crit fail"><div class="ct">' + tr("✕ FAIL CRITERIA", "✕ 违规判定") + '</div><p>' + esc(rFail(r)) + '</p></div>'
     + '</div>'
-    + '<div class="sop-raw" id="raw-' + esc(c.rid) + '"><pre>' + esc(r.check_instruction || "（该条款未附核查细则）") + '</pre></div>'
+    + '<div class="sop-raw" id="raw-' + esc(c.rid) + '"><pre>' + esc(r.check_instruction || tr("(No detailed check instructions attached)", "（该条款未附核查细则）")) + '</pre></div>'
     + '<div class="card-grid">' + c.items.map(cardHtml).join("") + '</div>'
     + '</div>';
 }
@@ -2691,10 +3300,10 @@ function toggleRaw(rid, btn) {
   const el = document.getElementById("raw-" + rid);
   if (!el) return;
   const open = el.classList.toggle("open");
-  btn.textContent = open ? "收起细则原文" : "核查细则原文";
+  btn.textContent = open ? tr("Hide Audit Logic", "收起细则原文") : tr("View Audit Logic", "核查细则原文");
 }
 
-/* ---------- 交互 ---------- */
+/* ---------- Interactions ---------- */
 function setFilter(key, val) {
   filters[key] = val;
   renderSections();
@@ -2721,7 +3330,7 @@ function toggleMore() {
   const row = document.getElementById("more-row");
   const btn = document.getElementById("btn-more");
   row.hidden = !row.hidden;
-  btn.textContent = row.hidden ? "更多筛选" : "收起筛选";
+  btn.textContent = row.hidden ? tr("More Filters", "更多筛选") : tr("Hide Filters", "收起筛选");
 }
 
 function decide(id, status) {
@@ -2733,7 +3342,7 @@ function decide(id, status) {
 
 function batchConfirm() {
   const targets = F.filter(f => stateOf(f.id).status === "PENDING" && f.disposition === "CONFIRMED");
-  if (!targets.length) { toast("没有待处置的 AI 实锤项"); return; }
+  if (!targets.length) { toast(tr("No pending AI-confirmed findings left to mark", "没有待处置的 AI 实锤项")); return; }
   const batchUpdates = [];
   targets.forEach(f => {
     const cur = stateOf(f.id);
@@ -2745,12 +3354,12 @@ function batchConfirm() {
   persist();
   renderProgress();
   renderSections();
-  toast("已将 " + targets.length + " 项 AI 实锤事件标记为确认违规");
+  toast(tr("Marked " + targets.length + " AI-confirmed finding(s) as Confirmed Violation", "已将 " + targets.length + " 项 AI 实锤事件标记为确认违规"));
   if (batchUpdates.length) persistReviewsToSheet(batchUpdates);
 }
 
 function resetReview() {
-  if (!Object.keys(review).length) { toast("本地没有复核记录"); return; }
+  if (!Object.keys(review).length) { toast(tr("No local review records to reset", "本地没有复核记录")); return; }
   const batchUpdates = F.filter(f => f.incident_id).map(f => ({
     incident_id: f.incident_id,
     status: "PENDING",
@@ -2760,11 +3369,11 @@ function resetReview() {
   persist();
   renderProgress();
   renderSections();
-  toast("已清空本地复核记录");
+  toast(tr("Cleared local review records", "已清空本地复核记录"));
   if (batchUpdates.length) persistReviewsToSheet(batchUpdates);
 }
 
-/* ---------- 证据切片弹窗 ---------- */
+/* ---------- Evidence Clip Modal ---------- */
 function openVideo(id) {
   const f = F.find(x => x.id === id);
   if (!f) return;
@@ -2774,16 +3383,15 @@ function openVideo(id) {
   const isRed = f.severity === "RED_LINE";
 
   document.getElementById("mv-kicker").textContent =
-    f.code + " · " + f.video_display + " · 条款 " + f.rule_id;
-  document.getElementById("mv-title").textContent = f.sub_clause_title;
+    f.code + " · " + f.video_display + " · " + tr("Clause ", "条款 ") + f.rule_id;
+  document.getElementById("mv-title").textContent = fSubTitle(f);
   document.getElementById("mv-drive").href = f.drive_url;
   document.getElementById("mv-iframe").src = PREVIEW(f);
-  // 首帧已确认取不到的，直接把权限提示摆在播放器上方
   const nt = document.getElementById("mv-notice");
   nt.hidden = !(badThumbs.has(f.id) || badThumbs.size >= F.length);
   document.getElementById("mv-authuser").value = authUser === null ? "" : authUser;
   document.getElementById("mv-ts").textContent =
-    "原片 " + f.mmss + (f.osd_clock ? " | OSD " + f.osd_clock : "");
+    tr("Clip ", "原片 ") + f.mmss + (f.osd_clock ? " | OSD " + f.osd_clock : "");
 
   const idx = visible.findIndex(x => x.id === id);
   document.getElementById("mv-prev").disabled = idx <= 0;
@@ -2793,27 +3401,27 @@ function openVideo(id) {
 
   document.getElementById("mv-side").innerHTML =
       '<div style="display:flex;gap:8px;flex-wrap:wrap">'
-    +   (isRed ? '<span class="tag tag-red"><i class="dot dot-red"></i>红线 · 48h 必改</span>'
-               : '<span class="tag tag-amber"><i class="dot dot-amber"></i>一般操作偏差</span>')
-    +   (f.disposition === "UNVERIFIED" ? '<span class="tag tag-slate">盲区待核</span>' : '')
+    +   (isRed ? '<span class="tag tag-red"><i class="dot dot-red"></i>' + tr("Red Line · 48h Fix", "红线 · 48h 必改") + '</span>'
+               : '<span class="tag tag-amber"><i class="dot dot-amber"></i>' + tr("Standard Deviation", "一般操作偏差") + '</span>')
+    +   (f.disposition === "UNVERIFIED" ? '<span class="tag tag-slate">' + tr("Unverified", "盲区待核") + '</span>' : '')
     +   '<span class="tag tag-slate">' + esc(f.staff_tag) + '</span>'
-    +   '<span class="tag tag-slate mono">置信度 ' + esc(f.confidence_pct) + '</span>'
+    +   '<span class="tag tag-slate mono">' + tr("Conf ", "置信度 ") + esc(f.confidence_pct) + '</span>'
     + '</div>'
-    + '<div><h5>AI 证据描述</h5><div class="blk"><div class="tx" style="margin-top:0">' + hl(f.description) + '</div></div></div>'
-    + '<div><h5>SOP 条款对照</h5><div class="blk">'
-    +   '<div style="font-size:13px;font-weight:700">' + esc(f.rule_id) + ' · ' + esc(r.clean_subtitle || r.name || "") + '</div>'
-    +   '<div class="tx"><b>标准做法 ·</b> ' + esc(f.specific_pass) + '</div>'
-    +   '<div class="tx" style="color:var(--red-deep)"><b>判定红线 ·</b> ' + esc(f.sop_fail_criteria) + '</div>'
+    + '<div><h5>' + tr("AI Evidence Observation", "AI 证据描述") + '</h5><div class="blk"><div class="tx" style="margin-top:0">' + hl(f.description) + '</div></div></div>'
+    + '<div><h5>' + tr("SOP Clause Criteria", "SOP 条款对照") + '</h5><div class="blk">'
+    +   '<div style="font-size:13px;font-weight:700">' + esc(f.rule_id) + ' · ' + esc(rTitle(r)) + '</div>'
+    +   '<div class="tx"><b>' + tr("Pass Standard ·", "标准做法 ·") + '</b> ' + esc(fPass(f)) + '</div>'
+    +   '<div class="tx" style="color:var(--red-deep)"><b>' + tr("Fail Red Line ·", "判定红线 ·") + '</b> ' + esc(fFail(f)) + '</div>'
     +   '<div class="tx muted" style="font-size:11.5px">' + esc(f.doc_ref) + '</div>'
     + '</div></div>'
-    + '<div><h5>整改建议</h5><div class="advice">' + esc(st.note || f.rectification_advice) + '</div></div>'
+    + '<div><h5>' + tr("Rectification Advice", "整改建议") + '</h5><div class="advice">' + esc(st.note || fAdvice(f)) + '</div></div>'
     + '<div class="foot-actions">'
     +   (st.status === "CONFIRMED_VIOLATION"
-          ? '<button class="btn" disabled style="opacity:.5;cursor:default">✓ 已确认违规</button>'
-          : '<button class="btn btn-solid" onclick="decide(' + f.id + ',\'CONFIRMED_VIOLATION\');closeVideo();toast(\'已确认违规 ' + f.code + '\')">确认违规</button>')
+          ? '<button class="btn" disabled style="opacity:.5;cursor:default">' + tr("✓ Confirmed Violation", "✓ 已确认违规") + '</button>'
+          : '<button class="btn btn-solid" onclick="decide(' + f.id + ',\'CONFIRMED_VIOLATION\');closeVideo();toast(\'' + tr("Confirmed violation ", "已确认违规 ") + f.code + '\')">' + tr("Confirm Violation", "确认违规") + '</button>')
     +   (st.status === "DISMISSED"
-          ? '<button class="btn" disabled style="opacity:.5;cursor:default">✓ 已排除误报</button>'
-          : '<button class="btn" onclick="decide(' + f.id + ',\'DISMISSED\');closeVideo();toast(\'已排除误报 ' + f.code + '\')">排除误报</button>')
+          ? '<button class="btn" disabled style="opacity:.5;cursor:default">' + tr("✓ Dismissed", "✓ 已排除误报") + '</button>'
+          : '<button class="btn" onclick="decide(' + f.id + ',\'DISMISSED\');closeVideo();toast(\'' + tr("Dismissed false positive ", "已排除误报 ") + f.code + '\')">' + tr("False Positive", "排除误报") + '</button>')
     + '</div>';
 
   document.getElementById("modal-video").classList.add("open");
@@ -2837,26 +3445,40 @@ function closeVideo() {
   }
 }
 
-/* ---------- 整改通知单 ---------- */
+/* ---------- Rectification Notice ---------- */
 function noticeOne(f) {
   const st = stateOf(f.id);
+  if (isZh()) {
+    return [
+      "【门店 AI 稽核整改项 " + f.code + "】",
+      "· 门店：" + DATA.store_name + "（稽核单 #" + DATA.audit_id + "）",
+      "· 等级：" + (f.severity === "RED_LINE" ? "红线零容忍违规，须 48 小时内闭环" : "一般操作偏差，晨会宣导纠偏"),
+      "· 时段：" + f.video_display + " @ " + f.mmss + (f.osd_clock ? "（OSD " + f.osd_clock + "）" : ""),
+      "· 人员：" + f.staff_tag,
+      "· 条款：" + f.rule_id + " " + fSubTitle(f) + "（" + f.doc_ref + "）",
+      "· 事实：" + f.description,
+      "· 标准：" + fPass(f),
+      "· 要求：" + (st.note || fAdvice(f)),
+      "· 证据：" + f.drive_url
+    ].join("\n");
+  }
   return [
-    "【门店 AI 稽核整改项 " + f.code + "】",
-    "· 门店：" + DATA.store_name + "（稽核单 #" + DATA.audit_id + "）",
-    "· 等级：" + (f.severity === "RED_LINE" ? "红线零容忍违规，须 48 小时内闭环" : "一般操作偏差，晨会宣导纠偏"),
-    "· 时段：" + f.video_display + " @ " + f.mmss + (f.osd_clock ? "（OSD " + f.osd_clock + "）" : ""),
-    "· 人员：" + f.staff_tag,
-    "· 条款：" + f.rule_id + " " + f.sub_clause_title + "（" + f.doc_ref + "）",
-    "· 事实：" + f.description,
-    "· 标准：" + f.specific_pass,
-    "· 要求：" + (st.note || f.rectification_advice),
-    "· 证据：" + f.drive_url
+    "【CHAGEE Store AI Audit - Rectification Item " + f.code + "】",
+    "· Store: " + DATA.store_name + " (Audit #" + DATA.audit_id + ")",
+    "· Severity: " + (f.severity === "RED_LINE" ? "RED LINE (Zero-Tolerance — Mandatory 48h Closure)" : "Standard SOP Deviation (Morning Briefing Coaching)"),
+    "· Timestamp: " + f.video_display + " @ " + f.mmss + (f.osd_clock ? " (OSD " + f.osd_clock + ")" : ""),
+    "· Staff: " + f.staff_tag,
+    "· SOP Clause: " + f.rule_id + " " + fSubTitle(f) + " (" + f.doc_ref + ")",
+    "· Observation: " + f.description,
+    "· SOP Standard: " + fPass(f),
+    "· Action Required: " + (st.note || fAdvice(f)),
+    "· Evidence Clip: " + f.drive_url
   ].join("\n");
 }
 
 function copyOne(id) {
   const f = F.find(x => x.id === id);
-  if (f) copyText(noticeOne(f), "已复制 " + f.code + " 整改通知");
+  if (f) copyText(noticeOne(f), tr("Copied rectification notice for " + f.code, "已复制 " + f.code + " 整改通知"));
 }
 
 function openReport() {
@@ -2870,41 +3492,79 @@ function openReport() {
     + " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
 
   const L = [];
-  L.push("CHAGEE 霸王茶姬 · 门店 AI 云稽核 48 小时整改通知单");
-  L.push("=".repeat(58));
-  L.push("门店名称：" + DATA.store_name);
-  L.push("稽核单号：#" + DATA.audit_id);
-  L.push("稽核范围：" + DATA.token_ledger.length + " 段后厨监控原片（早班 08:05–08:10 / 午间 12:00–12:10）");
-  L.push("判定依据：CHAGEE APAC Cloud Audit Parameters 2026 v1.0");
-  L.push("生成时间：" + stamp);
-  L.push("整改汇总：共 " + active.length + " 项（红线 " + red.length + " 项 · 一般偏差 " + nor.length + " 项）"
-    + (dismissed ? "；督导已排除误报 " + dismissed + " 项，不计入本单" : ""));
-  L.push("");
+  if (isZh()) {
+    L.push("CHAGEE 霸王茶姬 · 门店 AI 云稽核 48 小时整改通知单");
+    L.push("=".repeat(58));
+    L.push("门店名称：" + DATA.store_name);
+    L.push("稽核单号：#" + DATA.audit_id);
+    L.push("稽核范围：" + DATA.token_ledger.length + " 段后厨监控原片");
+    L.push("判定依据：CHAGEE APAC Cloud Audit Parameters 2026 v1.0");
+    L.push("生成时间：" + stamp);
+    L.push("整改汇总：共 " + active.length + " 项（红线 " + red.length + " 项 · 一般偏差 " + nor.length + " 项）"
+      + (dismissed ? "；督导已排除误报 " + dismissed + " 项，不计入本单" : ""));
+    L.push("");
 
-  const block = (title, list, note) => {
-    L.push("-".repeat(58));
-    L.push(title + "（共 " + list.length + " 项）" + note);
-    L.push("-".repeat(58));
-    if (!list.length) { L.push("（无）"); L.push(""); return; }
-    list.forEach((f, i) => {
-      const st = stateOf(f.id);
-      L.push((i + 1) + ". [" + f.code + "] " + f.rule_id + " · " + f.sub_clause_title);
-      L.push("   时段：" + f.video_display + " @ " + f.mmss + (f.osd_clock ? "（OSD " + f.osd_clock + "）" : "")
-        + "　人员：" + f.staff_tag + "　置信度：" + f.confidence_pct
-        + (f.disposition === "UNVERIFIED" ? "　【盲区待核，需调取后续录像】" : ""));
-      L.push("   事实：" + f.description);
-      L.push("   标准：" + f.specific_pass);
-      L.push("   要求：" + (st.note || f.rectification_advice));
-      L.push("   证据：" + f.drive_url);
-      L.push("");
-    });
-  };
+    const blockZh = (title, list, note) => {
+      L.push("-".repeat(58));
+      L.push(title + "（共 " + list.length + " 项）" + note);
+      L.push("-".repeat(58));
+      if (!list.length) { L.push("（无）"); L.push(""); return; }
+      list.forEach((f, i) => {
+        const st = stateOf(f.id);
+        L.push((i + 1) + ". [" + f.code + "] " + f.rule_id + " · " + fSubTitle(f));
+        L.push("   时段：" + f.video_display + " @ " + f.mmss + (f.osd_clock ? "（OSD " + f.osd_clock + "）" : "")
+          + "　人员：" + f.staff_tag + "　置信度：" + f.confidence_pct
+          + (f.disposition === "UNVERIFIED" ? "　【盲区待核，需调取后续录像】" : ""));
+        L.push("   事实：" + f.description);
+        L.push("   标准：" + fPass(f));
+        L.push("   要求：" + (st.note || fAdvice(f)));
+        L.push("   证据：" + f.drive_url);
+        L.push("");
+      });
+    };
 
-  block("一、红线零容忍违规", red, " · 48 小时内强制闭环并回传复训证明");
-  block("二、一般操作偏差", nor, " · 晨会宣导纠偏，一周内自查回传");
+    blockZh("一、红线零容忍违规", red, " · 48 小时内强制闭环并回传复训证明");
+    blockZh("二、一般操作偏差", nor, " · 晨会宣导纠偏，一周内自查回传");
 
-  L.push("=".repeat(58));
-  L.push("店长签收：____________　　日期：____________");
+    L.push("=".repeat(58));
+    L.push("店长签收：____________　　日期：____________");
+  } else {
+    L.push("CHAGEE · Store AI Cloud Audit — 48-Hour Rectification Notice");
+    L.push("=".repeat(64));
+    L.push("Store Name: " + DATA.store_name);
+    L.push("Audit ID: #" + DATA.audit_id);
+    L.push("Audit Scope: " + DATA.token_ledger.length + " Kitchen CCTV Clip(s)");
+    L.push("SOP Baseline: CHAGEE APAC Cloud Audit Parameters 2026 v1.0");
+    L.push("Generated At: " + stamp);
+    L.push("Summary: " + active.length + " active item(s) (" + red.length + " Red Line · " + nor.length + " Standard Deviation)"
+      + (dismissed ? "; " + dismissed + " false positive(s) dismissed by supervisor and excluded" : ""));
+    L.push("");
+
+    const blockEn = (title, list, note) => {
+      L.push("-".repeat(64));
+      L.push(title + " (" + list.length + " item(s))" + note);
+      L.push("-".repeat(64));
+      if (!list.length) { L.push("(None)"); L.push(""); return; }
+      list.forEach((f, i) => {
+        const st = stateOf(f.id);
+        L.push((i + 1) + ". [" + f.code + "] " + f.rule_id + " · " + fSubTitle(f));
+        L.push("   Time: " + f.video_display + " @ " + f.mmss + (f.osd_clock ? " (OSD " + f.osd_clock + ")" : "")
+          + " | Staff: " + f.staff_tag + " | Confidence: " + f.confidence_pct
+          + (f.disposition === "UNVERIFIED" ? " [UNVERIFIED — Check Follow-Up Footage]" : ""));
+        L.push("   Observation: " + f.description);
+        L.push("   SOP Standard: " + fPass(f));
+        L.push("   Action Required: " + (st.note || fAdvice(f)));
+        L.push("   Evidence Clip: " + f.drive_url);
+        L.push("");
+      });
+    };
+
+    blockEn("I. RED-LINE ZERO-TOLERANCE VIOLATIONS", red, " · Mandatory 48h Rectification & Retraining Proof");
+    blockEn("II. STANDARD SOP DEVIATIONS", nor, " · Morning Briefing Coaching & 7-Day Self-Check");
+
+    L.push("=".repeat(64));
+    L.push("Store Manager Signature: ________________    Date: ____________");
+  }
 
   document.getElementById("mr-text").textContent = L.join("\n");
   document.getElementById("modal-report").classList.add("open");
@@ -2917,7 +3577,7 @@ function closeReport() {
 }
 
 function copyReport() {
-  copyText(document.getElementById("mr-text").textContent, "已复制整改通知单全文");
+  copyText(document.getElementById("mr-text").textContent, tr("Copied full 48h rectification notice", "已复制整改通知单全文"));
 }
 
 function printReport() {
@@ -2927,12 +3587,18 @@ function printReport() {
     window.print();
     return;
   }
-  const printHtml = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>CHAGEE 48小时整改通知单 - '
-    + esc(DATA.store_name || "") + '</title><style>'
-    + 'body{font-family:"PingFang SC","Microsoft YaHei",sans-serif;padding:32px;color:#0F1115;}'
+  const docTitle = isZh()
+    ? ("CHAGEE 48小时整改通知单 - " + esc(DATA.store_name || ""))
+    : ("CHAGEE 48h Rectification Notice - " + esc(DATA.store_name || ""));
+  const h1Title = isZh()
+    ? "门店 AI 云稽核 48 小时整改通知单"
+    : "CHAGEE Store AI Cloud Audit — 48-Hour Rectification Notice";
+  const printHtml = '<!DOCTYPE html><html lang="' + (isZh() ? "zh-CN" : "en") + '"><head><meta charset="utf-8"><title>'
+    + docTitle + '</title><style>'
+    + 'body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;padding:32px;color:#0F1115;}'
     + 'h1{font-size:18px;margin:0 0 16px;padding-bottom:10px;border-bottom:2px solid #0F1115;}'
     + 'pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.75;white-space:pre-wrap;word-break:break-word;}'
-    + '</style></head><body><h1>门店 AI 云稽核 48 小时整改通知单</h1><pre>' + esc(txt)
+    + '</style></head><body><h1>' + h1Title + '</h1><pre>' + esc(txt)
     + '</pre><script>window.onload=function(){setTimeout(function(){window.print();},150);};<\/script></body></html>';
   try {
     const w = window.open("", "_blank");
@@ -2943,15 +3609,14 @@ function printReport() {
       return;
     }
   } catch (e) {}
-  /* Fallback when sandboxed iframe blocks both window.print() and window.open() */
   const blob = new Blob([printHtml], { type: "text/html;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = "48h整改通知单_" + (DATA.store_name || "门店") + "_" + (DATA.audit_id || "") + ".html";
+  a.download = (isZh() ? "48h整改通知单_" : "48h_Rectification_Notice_") + (DATA.store_name || "Store") + "_" + (DATA.audit_id || "") + ".html";
   a.click();
   URL.revokeObjectURL(url);
-  toast("当前预览窗沙盒拦截直接打印，已为您下载独立可打印通知单");
+  toast(tr("Direct print blocked by preview sandbox — downloaded printable notice HTML", "当前预览窗沙盒拦截直接打印，已为您下载独立可打印通知单"));
 }
 
 function onBatchPillClick(ev, jobId) {
@@ -2974,7 +3639,7 @@ function onBatchPillClick(ev, jobId) {
     buildChips();
     renderSections();
     renderAppendix();
-    toast("已切换至门店：" + DATA.store_name);
+    toast(tr("Switched to store: ", "已切换至门店：") + DATA.store_name);
     return false;
   }
   return true;
@@ -2982,29 +3647,33 @@ function onBatchPillClick(ev, jobId) {
 
 /* ---------- CSV ---------- */
 function exportCSV() {
-  const head = ["事件编号", "稽核单号", "门店", "监控原片", "时间点", "OSD", "SOP条款", "细分违规项",
-                "严重等级", "AI判定", "置信度", "证据描述", "SOP标准", "整改建议", "证据链接",
-                "复核状态", "督导批注"];
+  const head = isZh()
+    ? ["事件编号", "稽核单号", "门店", "监控原片", "时间点", "OSD", "SOP条款", "细分违规项",
+       "严重等级", "AI判定", "置信度", "证据描述", "SOP标准", "整改建议", "证据链接",
+       "复核状态", "督导批注"]
+    : ["Finding Code", "Audit ID", "Store", "Source Video", "Timestamp", "OSD Clock", "SOP Clause", "Sub-Clause Title",
+       "Severity", "AI Disposition", "Confidence", "Observation", "SOP Pass Standard", "Rectification Advice", "Evidence Link",
+       "Supervisor Review Status", "Supervisor Note"];
   const rows = [head];
   F.forEach(f => {
     const st = stateOf(f.id);
     rows.push([f.code, f.audit_id, DATA.store_name, f.video_filename, f.mmss, f.osd_clock,
-               f.rule_id, f.sub_clause_title, f.severity, f.disposition, f.confidence_pct,
-               f.description, f.specific_pass, f.rectification_advice, f.drive_url,
+               f.rule_id, fSubTitle(f), f.severity, f.disposition, f.confidence_pct,
+               f.description, fPass(f), fAdvice(f), f.drive_url,
                st.status, st.note]);
   });
   const csv = "\uFEFF" + rows.map(r => r.map(c => '"' + String(c ?? "").replace(/"/g, '""') + '"').join(",")).join("\r\n");
   const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8;" }));
   const a = document.createElement("a");
   a.href = url;
-  a.download = "AI稽核督导复核表_" + DATA.store_name + "_" + DATA.audit_id + ".csv";
+  a.download = (isZh() ? "AI稽核督导复核表_" : "AI_Audit_Review_") + DATA.store_name + "_" + DATA.audit_id + ".csv";
   a.click();
   URL.revokeObjectURL(url);
-  toast("已导出督导复核表 CSV");
+  toast(tr("Exported supervisor review CSV", "已导出督导复核表 CSV"));
 }
 
 /* ==================================================================
-   Excel (.xlsx) 导出 —— 零依赖：手写 OOXML + store 模式 ZIP
+   Excel (.xlsx) Export — Zero-Dependency OOXML + Store ZIP
    ================================================================== */
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);
@@ -3022,7 +3691,6 @@ function crc32(buf) {
   return (c ^ 0xFFFFFFFF) >>> 0;
 }
 
-/** 以 store(不压缩) 模式打包成合法 ZIP，Excel / WPS / Numbers 均可直接打开 */
 function zipStore(files) {
   const enc = new TextEncoder();
   const parts = [], central = [];
@@ -3037,8 +3705,8 @@ function zipStore(files) {
     const d1 = new DataView(lh.buffer);
     d1.setUint32(0, 0x04034B50, true);
     d1.setUint16(4, 20, true);
-    d1.setUint16(6, 0x0800, true);          // UTF-8 文件名
-    d1.setUint16(8, 0, true);               // method = store
+    d1.setUint16(6, 0x0800, true);
+    d1.setUint16(8, 0, true);
     d1.setUint32(14, crc, true);
     d1.setUint32(18, data.length, true);
     d1.setUint32(22, data.length, true);
@@ -3080,13 +3748,12 @@ const xe = s => String(s ?? "")
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
   .replace(/"/g, "&quot;").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
 
-function colRef(n) {              // 1 -> A, 27 -> AA
+function colRef(n) {
   let s = "";
   while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = (n - m - 1) / 26; }
   return s;
 }
 
-/** rows: 二维数组；第 0 行作表头。数字自动按 number 写入 */
 function sheetXml(rows, widths) {
   const body = rows.map((row, ri) => {
     const cells = row.map((v, ci) => {
@@ -3199,11 +3866,16 @@ function buildXlsx(sheets, fileName) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-/* ---------- 统计报表数据组装 ---------- */
+/* ---------- Excel Workbook Assembly ---------- */
 function statusLabel(s) {
-  return s === "CONFIRMED_VIOLATION" ? "已确认违规"
-    : s === "DISMISSED" ? "已排除误报"
-    : s === "FOLLOWUP" ? "待调后续录像" : "待复核";
+  if (isZh()) {
+    return s === "CONFIRMED_VIOLATION" ? "已确认违规"
+      : s === "DISMISSED" ? "已排除误报"
+      : s === "FOLLOWUP" ? "待调后续录像" : "待复核";
+  }
+  return s === "CONFIRMED_VIOLATION" ? "Confirmed Violation"
+    : s === "DISMISSED" ? "False Positive"
+    : s === "FOLLOWUP" ? "Follow-Up" : "Pending";
 }
 
 function exportXLSX() {
@@ -3221,11 +3893,10 @@ function exportXLSX() {
   const sum = k => tk.reduce((a, r) => a + r[k], 0);
   const done = cnt("CONFIRMED_VIOLATION") + cnt("DISMISSED") + cnt("FOLLOWUP");
 
-  /* ① 稽核总览 */
   const overview = {
-    name: "① 稽核总览",
-    widths: [26, 62],
-    rows: [
+    name: tr("1_Overview", "① 稽核总览"),
+    widths: [28, 62],
+    rows: isZh() ? [
       ["指标项", "数值"],
       ["门店名称", DATA.store_name],
       ["稽核单号", "#" + DATA.audit_id],
@@ -3252,45 +3923,77 @@ function exportXLSX() {
       ["算力 Token 合计", sum("total_tokens")],
       ["算力成本合计（USD）", Number(sum("cost_usd").toFixed(4))],
       ["处理总耗时（秒）", Math.round(sum("latency_sec"))]
+    ] : [
+      ["Metric", "Value"],
+      ["Store Name", DATA.store_name],
+      ["Audit ID", "#" + DATA.audit_id],
+      ["SOP Baseline", "CHAGEE APAC Cloud Audit Parameters 2026 v1.0"],
+      ["Vision Model", tk[0] ? tk[0].model_version + " (" + tk[0].prompt_version + ")" : ""],
+      ["Exported At", stampH],
+      ["", ""],
+      ["Source Video Clips", tk.length],
+      ["Total Video Duration (sec)", Math.round(sum("duration_sec"))],
+      ["Total Findings Detected", F.length],
+      ["Red-Line Zero-Tolerance Violations", red.length],
+      ["Standard SOP Deviations", nor.length],
+      ["Unverified Findings (UNVERIFIED)", F.filter(f => f.disposition === "UNVERIFIED").length],
+      ["Triggered SOP Clauses", hitIds.length],
+      ["Total SOP Clauses in Catalog", DATA.sop_rules.length],
+      ["Involved Staff Count", [...new Set(F.flatMap(f => f.staff_list || [f.staff_tag]))].length],
+      ["", ""],
+      ["Confirmed Violations", cnt("CONFIRMED_VIOLATION")],
+      ["Dismissed False Positives", cnt("DISMISSED")],
+      ["Follow-Up Footage Needed", cnt("FOLLOWUP")],
+      ["Pending Review", F.length - done],
+      ["Review Completion Rate", (F.length > 0 ? Math.round(done / F.length * 100) : 100) + "%"],
+      ["", ""],
+      ["Total Tokens Consumed", sum("total_tokens")],
+      ["Total Estimated Cost (USD)", Number(sum("cost_usd").toFixed(4))],
+      ["Total Processing Time (sec)", Math.round(sum("latency_sec"))]
     ]
   };
 
-  /* ② 违规明细 */
   const detail = {
-    name: "② 违规明细",
+    name: tr("2_Findings", "② 违规明细"),
     widths: [9, 7, 11, 30, 10, 10, 9, 30, 46, 11, 11, 10, 72, 60, 50, 14, 30, 46],
-    rows: [[
+    rows: [isZh() ? [
       "事件编号", "类别", "SOP 条款", "条款名称", "监控原片", "相对时间", "OSD 时钟",
       "细分违规项", "违规事实（AI 证据描述）", "严重等级", "AI 判定", "置信度",
       "SOP 标准做法", "SOP 判定红线", "整改建议", "督导复核状态", "督导批注", "证据切片链接"
+    ] : [
+      "Finding ID", "Module", "SOP Clause", "Clause Name", "Video Clip", "Timestamp", "OSD Clock",
+      "Sub-Clause Title", "Observation (AI Evidence)", "Severity", "AI Disposition", "Confidence",
+      "SOP Pass Standard", "SOP Fail Red Line", "Rectification Advice", "Review Status", "Supervisor Note", "Evidence Clip URL"
     ]].concat(F.map(f => {
       const st = stateOf(f.id);
       const r = RULES[f.rule_id] || {};
       return [
-        f.code, f.module_code, f.rule_id, r.clean_subtitle || r.name || "",
+        f.code, f.module_code, f.rule_id, rTitle(r),
         f.video_short, f.mmss, f.osd_clock || "",
-        f.sub_clause_title, f.description,
-        f.severity === "RED_LINE" ? "红线零容忍" : "一般偏差",
-        f.disposition === "UNVERIFIED" ? "盲区待核" : "实锤",
+        fSubTitle(f), f.description,
+        f.severity === "RED_LINE" ? tr("Red Line", "红线零容忍") : tr("Standard", "一般偏差"),
+        f.disposition === "UNVERIFIED" ? tr("Unverified", "盲区待核") : tr("Confirmed", "实锤"),
         f.confidence_pct,
-        f.specific_pass, f.sop_fail_criteria, f.rectification_advice,
+        fPass(f), fFail(f), fAdvice(f),
         statusLabel(st.status), st.note || "", f.drive_url
       ];
     }))
   };
 
-  /* ③ 按 SOP 条款统计（含未触发条款，便于看覆盖面） */
   const byClause = {
-    name: "③ 按SOP条款统计",
+    name: tr("3_By_Clause", "③ 按SOP条款统计"),
     widths: [10, 8, 44, 48, 11, 10, 10, 11, 11, 11, 11],
-    rows: [[
+    rows: [isZh() ? [
       "SOP 条款", "类别", "条款名称", "手册出处", "检出项数",
       "红线", "一般", "已确认违规", "已排除误报", "待调录像", "待复核"
+    ] : [
+      "SOP Clause", "Module", "Clause Name", "Manual Reference", "Detected",
+      "Red Line", "Standard", "Confirmed", "Dismissed", "Follow-Up", "Pending"
     ]].concat(DATA.sop_rules.map(r => {
       const list = F.filter(f => f.rule_id === r.rule_id);
       const by = s => list.filter(f => stateOf(f.id).status === s).length;
       return [
-        r.rule_id, r.module_code, r.clean_subtitle || r.name, r.doc_ref,
+        r.rule_id, r.module_code, rTitle(r), r.doc_ref,
         list.length,
         list.filter(f => f.severity === "RED_LINE").length,
         list.filter(f => f.severity === "NORMAL").length,
@@ -3299,13 +4002,15 @@ function exportXLSX() {
     }))
   };
 
-  /* ④ 按违规大类统计 */
   const byModule = {
-    name: "④ 按违规大类统计",
+    name: tr("4_By_Module", "④ 按违规大类统计"),
     widths: [8, 30, 11, 10, 10, 13, 26, 11, 11, 11],
-    rows: [[
+    rows: [isZh() ? [
       "类别编号", "违规大类", "检出项数", "红线", "一般", "命中条款数", "命中条款",
       "已确认违规", "已排除误报", "待复核"
+    ] : [
+      "Module", "Category Name", "Detected", "Red Line", "Standard", "Clauses Hit", "Clause IDs",
+      "Confirmed", "Dismissed", "Pending"
     ]].concat(Object.keys(MODULE_META)
       .sort((a, b) => MODULE_META[a].order - MODULE_META[b].order)
       .map(code => {
@@ -3313,7 +4018,7 @@ function exportXLSX() {
         const ids = [...new Set(list.map(f => f.rule_id))].sort();
         const by = s => list.filter(f => stateOf(f.id).status === s).length;
         return [
-          code, MODULE_META[code].title, list.length,
+          code, metaOf(code).title, list.length,
           list.filter(f => f.severity === "RED_LINE").length,
           list.filter(f => f.severity === "NORMAL").length,
           ids.length, ids.join(" / ") || "—",
@@ -3322,14 +4027,16 @@ function exportXLSX() {
       }))
   };
 
-  /* ⑤ 按涉事人员统计 */
   const staffs = [...new Set(F.map(staffKey))];
   const byStaff = {
-    name: "⑤ 按涉事人员统计",
+    name: tr("5_By_Staff", "⑤ 按涉事人员统计"),
     widths: [22, 11, 10, 10, 13, 30, 11, 11, 11],
-    rows: [[
+    rows: [isZh() ? [
       "涉事人员", "事件数", "红线", "一般", "命中条款数", "命中条款",
       "已确认违规", "已排除误报", "待复核"
+    ] : [
+      "Staff", "Findings", "Red Line", "Standard", "Clauses Hit", "Clause IDs",
+      "Confirmed", "Dismissed", "Pending"
     ]].concat(staffs.map(s => {
       const list = F.filter(f => staffKey(f) === s);
       const ids = [...new Set(list.map(f => f.rule_id))].sort();
@@ -3344,13 +4051,15 @@ function exportXLSX() {
     }))
   };
 
-  /* ⑥ 按监控原片统计 + 算力账单 */
   const byVideo = {
-    name: "⑥ 按原片与算力账单",
+    name: tr("6_Token_Ledger", "⑥ 按原片与算力账单"),
     widths: [60, 12, 22, 11, 11, 10, 10, 13, 13, 13, 14, 13, 11],
-    rows: [[
+    rows: [isZh() ? [
       "监控原片文件名", "原片编号", "时段", "时长(秒)", "分辨率", "事件数", "红线", "一般",
       "输入 Token", "思考 Token", "输出 Token", "合计 Token", "成本(USD)"
+    ] : [
+      "Video Filename", "Clip ID", "Segment", "Duration(s)", "Resolution", "Findings", "Red Line", "Standard",
+      "Input Tokens", "Thinking Tokens", "Output Tokens", "Total Tokens", "Cost(USD)"
     ]].concat(tk.map(l => {
       const list = F.filter(f => f.video_short === l.video_short);
       const seg = list[0] ? (list[0].video_display.match(/\(([^)]+)\)/) || [, ""])[1] : "";
@@ -3363,47 +4072,49 @@ function exportXLSX() {
         Number(l.cost_usd.toFixed(4))
       ];
     })).concat([[
-      "合计", "", "", Math.round(sum("duration_sec")), "", F.length, red.length, nor.length,
+      tr("Total", "合计"), "", "", Math.round(sum("duration_sec")), "", F.length, red.length, nor.length,
       sum("prompt_tokens"), sum("thoughts_tokens"), sum("output_tokens"), sum("total_tokens"),
       Number(sum("cost_usd").toFixed(4))
     ]])
   };
 
   buildXlsx([overview, detail, byClause, byModule, byStaff, byVideo],
-    "AI稽核统计报表_" + DATA.store_name + "_" + DATA.audit_id + "_" + stamp + ".xlsx");
+    (isZh() ? "AI稽核统计报表_" : "AI_Audit_Report_") + DATA.store_name + "_" + DATA.audit_id + "_" + stamp + ".xlsx");
 
-  toast("已下载统计报表（6 个工作表 · " + F.length + " 条明细）");
+  toast(tr("Downloaded Excel report (6 sheets · " + F.length + " findings)", "已下载统计报表（6 个工作表 · " + F.length + " 条明细）"));
 }
 
 function renderDlHint() {
   const done = F.filter(f => stateOf(f.id).status !== "PENDING").length;
-  document.getElementById("dl-hint").textContent =
-    "6 个工作表 · " + F.length + " 条违规明细 · 含当前复核状态（已处置 " + done + " 项）";
+  document.getElementById("dl-hint").textContent = isZh()
+    ? ("6 个工作表 · " + F.length + " 条违规明细 · 含当前复核状态（已处置 " + done + " 项）")
+    : ("6 worksheets · " + F.length + " findings · includes live review status (" + done + " reviewed)");
 }
 
-/* ---------- 附录 ---------- */
+/* ---------- Appendix ---------- */
 function renderAppendix() {
   const hits = {};
   F.forEach(f => hits[f.rule_id] = (hits[f.rule_id] || 0) + 1);
   const hitN = Object.keys(hits).length;
 
-  document.getElementById("ap-dict-hint").textContent =
-    "共 " + DATA.sop_rules.length + " 条，本次命中 " + hitN + " 条，未触发 " + (DATA.sop_rules.length - hitN) + " 条";
+  document.getElementById("ap-dict-hint").textContent = isZh()
+    ? ("共 " + DATA.sop_rules.length + " 条，本次命中 " + hitN + " 条，未触发 " + (DATA.sop_rules.length - hitN) + " 条")
+    : (DATA.sop_rules.length + " total rules · " + hitN + " triggered · " + (DATA.sop_rules.length - hitN) + " clear");
 
   document.getElementById("ap-dict").innerHTML =
-      '<table class="dt"><thead><tr><th>条款</th><th>规则名称与手册出处</th><th>本次结果</th>'
-    + '<th>✓ 合规标准</th><th>✕ 违规判定</th></tr></thead><tbody>'
+      '<table class="dt"><thead><tr><th>' + tr("Clause", "条款") + '</th><th>' + tr("Rule Name & Reference", "规则名称与手册出处") + '</th><th>' + tr("Status", "本次结果") + '</th>'
+    + '<th>' + tr("✓ Pass Standard", "✓ 合规标准") + '</th><th>' + tr("✕ Fail Criteria", "✕ 违规判定") + '</th></tr></thead><tbody>'
     + DATA.sop_rules.map(r => {
         const n = hits[r.rule_id] || 0;
         return '<tr class="' + (n ? "hit" : "") + '">'
           + '<td class="rid">' + esc(r.rule_id) + '</td>'
-          + '<td><div style="font-weight:700">' + esc(r.clean_subtitle || r.name) + '</div>'
+          + '<td><div style="font-weight:700">' + esc(rTitle(r)) + '</div>'
           +     '<div class="muted" style="font-size:11.5px;margin-top:2px">' + esc(r.doc_ref) + '</div></td>'
           + '<td>' + (n
-              ? '<button class="chip" style="border-color:var(--red-line);background:var(--red-soft);color:var(--red-deep)" onclick="gotoRule(\'' + r.rule_id + '\')">检出 ' + n + ' 项 →</button>'
-              : '<span class="tag tag-green">未见违规</span>') + '</td>'
-          + '<td style="color:var(--green);max-width:360px">' + esc(r.pass_criteria) + '</td>'
-          + '<td style="color:var(--red-deep);max-width:360px">' + esc(r.fail_criteria) + '</td>'
+              ? '<button class="chip" style="border-color:var(--red-line);background:var(--red-soft);color:var(--red-deep)" onclick="gotoRule(\'' + r.rule_id + '\')">' + (isZh() ? ('检出 ' + n + ' 项 →') : (n + ' hit(s) →')) + '</button>'
+              : '<span class="tag tag-green">' + tr("All Clear", "未见违规") + '</span>') + '</td>'
+          + '<td style="color:var(--green);max-width:360px">' + esc(rPass(r)) + '</td>'
+          + '<td style="color:var(--red-deep);max-width:360px">' + esc(rFail(r)) + '</td>'
           + '</tr>';
       }).join("")
     + '</tbody></table>';
@@ -3411,12 +4122,13 @@ function renderAppendix() {
   const tk = DATA.token_ledger;
   const sum = k => tk.reduce((s, r) => s + r[k], 0);
   const cost = sum("cost_usd");
-  document.getElementById("ap-ledger-hint").textContent =
-    tk.length + " 段原片合计 " + sum("total_tokens").toLocaleString() + " tokens · $" + cost.toFixed(4) + " USD";
+  document.getElementById("ap-ledger-hint").textContent = isZh()
+    ? (tk.length + " 段原片合计 " + sum("total_tokens").toLocaleString() + " tokens · $" + cost.toFixed(4) + " USD")
+    : (tk.length + " clip(s) · " + sum("total_tokens").toLocaleString() + " tokens · $" + cost.toFixed(4) + " USD");
 
   document.getElementById("ap-ledger").innerHTML =
-      '<table class="dt"><thead><tr><th>监控原片</th><th>模型</th><th>时长</th><th>分辨率</th>'
-    + '<th>输入</th><th>思考</th><th>输出</th><th>合计 Token</th><th>成本 USD</th><th>耗时</th><th>检出</th>'
+      '<table class="dt"><thead><tr><th>' + tr("Source Video", "监控原片") + '</th><th>' + tr("Model", "模型") + '</th><th>' + tr("Duration", "时长") + '</th><th>' + tr("Resolution", "分辨率") + '</th>'
+    + '<th>' + tr("Input", "输入") + '</th><th>' + tr("Thinking", "思考") + '</th><th>' + tr("Output", "输出") + '</th><th>' + tr("Total Tokens", "合计 Token") + '</th><th>' + tr("Cost USD", "成本 USD") + '</th><th>' + tr("Latency", "耗时") + '</th><th>' + tr("Findings", "检出") + '</th>'
     + '</tr></thead><tbody>'
     + tk.map(l => '<tr>'
         + '<td style="font-weight:600;max-width:300px;word-break:break-all">' + esc(l.video_filename) + '</td>'
@@ -3429,16 +4141,18 @@ function renderAppendix() {
         + '<td class="num" style="font-weight:700">' + l.total_tokens.toLocaleString() + '</td>'
         + '<td class="num" style="font-weight:700;color:var(--red-deep)">$' + l.cost_usd.toFixed(4) + '</td>'
         + '<td class="num">' + l.latency_sec + 's</td>'
-        + '<td class="num">' + l.flagged_events + ' 项</td>'
+        + '<td class="num">' + l.flagged_events + tr("", " 项") + '</td>'
       + '</tr>').join("")
-    + '</tbody><tfoot><tr><td colspan="4">合计（平均 $' + (tk.length > 0 ? (cost / tk.length).toFixed(2) : '0.00') + ' / 5 分钟原片）</td>'
+    + '</tbody><tfoot><tr><td colspan="4">' + (isZh()
+        ? ('合计（平均 $' + (tk.length > 0 ? (cost / tk.length).toFixed(2) : '0.00') + ' / 5 分钟原片）')
+        : ('Total (Avg $' + (tk.length > 0 ? (cost / tk.length).toFixed(2) : '0.00') + ' / 5-min clip)')) + '</td>'
     + '<td class="num">' + sum("prompt_tokens").toLocaleString() + '</td>'
     + '<td class="num">' + sum("thoughts_tokens").toLocaleString() + '</td>'
     + '<td class="num">' + sum("output_tokens").toLocaleString() + '</td>'
     + '<td class="num">' + sum("total_tokens").toLocaleString() + '</td>'
     + '<td class="num">$' + cost.toFixed(4) + '</td>'
     + '<td class="num">' + Math.round(sum("latency_sec")) + 's</td>'
-    + '<td class="num">' + sum("flagged_events") + ' 项</td>'
+    + '<td class="num">' + sum("flagged_events") + tr("", " 项") + '</td>'
     + '</tr></tfoot></table>';
 }
 
@@ -3453,7 +4167,7 @@ function gotoRule(rid) {
   }
 }
 
-/* ---------- 键盘 ---------- */
+/* ---------- Keyboard Shortcuts ---------- */
 document.addEventListener("keydown", e => {
   const vOpen = document.getElementById("modal-video").classList.contains("open");
   const rOpen = document.getElementById("modal-report").classList.contains("open");
@@ -3462,7 +4176,8 @@ document.addEventListener("keydown", e => {
   if (vOpen && e.key === "ArrowRight") stepVideo(1);
 });
 
-/* ---------- 启动 ---------- */
+/* ---------- Startup ---------- */
+applyLangUI();
 renderHero();
 renderProgress();
 buildChips();
@@ -3477,7 +4192,7 @@ updateAccessBar();
 
 def render_supervisor_portal_html(payload: Dict[str, Any]) -> str:
     """Renders the dynamic CHAGEE Supervisor Audit Workbench HTML (`REQ-015`)."""
-    store_name = html.escape(str(payload.get("store_name") or "门店稽核"))
+    store_name = html.escape(str(payload.get("store_name") or "Store Audit"))
     audit_id = html.escape(str(payload.get("audit_id") or ""))
     portal_json = json.dumps(payload, ensure_ascii=False).replace("</", r"<\/")
     return (

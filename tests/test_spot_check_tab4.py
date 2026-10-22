@@ -100,18 +100,18 @@ def test_classify_turn_populates_target_prompt_tab_and_anti_confusion_fallback()
 
         d_unclear = await classify_turn_with_llm("")
         assert d_unclear.action == TurnAction.UNCLEAR
-        assert "@CHAGEE 门店视频 AI 稽核专家" in d_unclear.reply_summary
-        assert "请帮忙稽核视频" in d_unclear.reply_summary
-        assert "Tab4_专项测试表" in d_unclear.reply_summary
+        assert f"@{config.agent_display_name}" in d_unclear.reply_summary
+        assert "Please audit store videos" in d_unclear.reply_summary
+        assert "Tab4_Spot_Check" in d_unclear.reply_summary
 
         d_missing_url = verify_url_verbatim(
             TurnDecision(action=TurnAction.INSPECT, drive_url=folder_url),
             "我忘了贴链接",
         )
         assert d_missing_url.action == TurnAction.UNCLEAR
-        assert "@CHAGEE 门店视频 AI 稽核专家" in d_missing_url.reply_summary
-        assert "请帮忙稽核视频" in d_missing_url.reply_summary
-        assert "Tab4_专项测试表" in d_missing_url.reply_summary
+        assert f"@{config.agent_display_name}" in d_missing_url.reply_summary
+        assert "Please audit store videos" in d_missing_url.reply_summary
+        assert "Tab4_Spot_Check" in d_missing_url.reply_summary
 
     asyncio.run(_run())
 
@@ -135,11 +135,11 @@ def test_prompt_manager_tab4_scope_lock_and_empty_guard(monkeypatch: pytest.Monk
             [custom_rule],
             is_spot_check=True,
         )
-        assert "## 原则一：宁可误报，绝不漏报" in sys_inst
-        assert "多人同屏注意力解耦（Anti-Attention-Masking）" in sys_inst
-        assert "【专项抽检 / 新 SOP 测试范围锁定（Scope Lock）】" in sys_inst
+        assert "## Principle 1: Prefer False Positives Over False Negatives" in sys_inst
+        assert "Multi-Person Attention Decoupling (Anti-Attention-Masking)" in sys_inst
+        assert "[Targeted Spot-Check / New SOP Test Scope Lock]" in sys_inst
         assert "`C9`" in sys_inst
-        assert "严禁上报不在本次专项清单（`C9`）内的其他任何 SOP 条款" in sys_inst
+        assert "Strictly DO NOT report any other SOP rules outside this targeted list (`C9`)" in sys_inst
 
         class _FakeSheetsClient:
             def __init__(self) -> None:
@@ -179,7 +179,7 @@ def test_prompt_manager_tab4_scope_lock_and_empty_guard(monkeypatch: pytest.Monk
         cfg1 = await pm.load_config_for_tab(TAB4_SPOT_CHECK_TITLE, probe_model=False)
         assert cfg1.active_model_version == "gemini-3.8-flash"
         assert [r.rule_id for r in cfg1.rules] == ["C9"]
-        assert "【专项抽检 / 新 SOP 测试范围锁定（Scope Lock）】" in cfg1.system_instruction
+        assert "[Targeted Spot-Check / New SOP Test Scope Lock]" in cfg1.system_instruction
 
         fake_client.tab4_rows.append(
             [
@@ -198,7 +198,7 @@ def test_prompt_manager_tab4_scope_lock_and_empty_guard(monkeypatch: pytest.Monk
         assert [r.rule_id for r in cfg2.rules] == ["C9", "B4"]
 
         fake_client.tab4_rows = [list(SHEET_RULE_HEADER)]
-        with pytest.raises(ValueError, match="Tab4_专项测试表.*当前为空"):
+        with pytest.raises(ValueError, match="Tab4_Spot_Check.*is currently empty"):
             await pm.load_config_for_tab(TAB4_SPOT_CHECK_TITLE, probe_model=False)
 
     asyncio.run(_run())
@@ -311,10 +311,10 @@ def test_two_step_spot_check_preflight_confirm_and_worker_execute(tmp_path: Path
         assert job_spot.state == JobState.READY
         assert job_spot.target_prompt_tab == TAB4_SPOT_CHECK_TITLE
         assert job_spot.audited_rule_ids == ["B4"]
-        assert job_spot.active_prompt_version == "Tab4_专项测试表[B4]"
+        assert job_spot.active_prompt_version == "Tab4_Spot_Check[B4]"
         assert job_spot.preflight_report is not None
-        assert "【当前为专项抽检 / 新 SOP 测试模式（非全量稽核）】" in job_spot.preflight_report.message_to_user
-        assert f"@{config.agent_display_name} 请帮忙稽核视频" in job_spot.preflight_report.message_to_user
+        assert "[Targeted Spot-Check / New SOP Test Mode (Non-Full Audit)]" in job_spot.preflight_report.message_to_user
+        assert f"@{config.agent_display_name} [Full Daily Audit] Please audit store videos" in job_spot.preflight_report.message_to_user
 
         monkeypatch.setattr(config, "agent_display_name", "Custom Tenant 稽核专家")
         custom_unclear = verify_url_verbatim(
@@ -334,7 +334,7 @@ def test_two_step_spot_check_preflight_confirm_and_worker_execute(tmp_path: Path
         assert job_full.target_prompt_tab == ""
         assert job_full.audited_rule_ids == []
         assert job_full.preflight_report is not None
-        assert "【日常全量稽核】" in job_full.preflight_report.message_to_user
+        assert "[Full Daily Audit]" in job_full.preflight_report.message_to_user
 
         svc_empty = AuditService(
             job_store=store,
@@ -352,7 +352,7 @@ def test_two_step_spot_check_preflight_confirm_and_worker_execute(tmp_path: Path
             target_prompt_tab=TAB4_SPOT_CHECK_TITLE,
         )
         assert job_rejected.state == JobState.REJECTED
-        assert "Tab4_专项测试表" in (job_rejected.error_message or "")
+        assert "Tab4_Spot_Check" in (job_rejected.error_message or "")
 
         captured_prompt_cfgs: List[Any] = []
 
@@ -368,7 +368,7 @@ def test_two_step_spot_check_preflight_confirm_and_worker_execute(tmp_path: Path
         assert res["completed"] is True
         assert len(captured_prompt_cfgs) == 1
         _, loaded_cfg = captured_prompt_cfgs[0]
-        assert loaded_cfg.active_prompt_version == "Tab4_专项测试表[B4]"
+        assert loaded_cfg.active_prompt_version == "Tab4_Spot_Check[B4]"
         assert [r.rule_id for r in loaded_cfg.rules] == ["B4"]
 
     asyncio.run(_run())
@@ -499,8 +499,8 @@ def test_rule_scoped_smart_append_preserves_other_rules_on_same_video() -> None:
         )
 
         sheets = read_xlsx_sheets(stored_objects["report.xlsx"])
-        t1_rows = sheets["违规事件 3 秒复核台"][1:]
-        t2_rows = sheets["本次视频 Token 消耗与耗时账单"][1:]
+        t1_rows = sheets["Tab1_Violation_Review"][1:]
+        t2_rows = sheets["Tab2_Token_Ledger"][1:]
 
         assert [(r[0], r[3], r[7]) for r in t1_rows] == [
             ("full01", "A2", "污染后未洗手直接戴手套"),
@@ -615,17 +615,21 @@ def test_engine_prompt_chips_canned_queries_sync(monkeypatch: pytest.MonkeyPatch
     chip_ids = [cid for cid, _ in chips]
     assert chip_ids == ["cctv-full-audit", "cctv-tab4-spot-check"]
     chip_map = dict(chips)
-    assert chip_map["cctv-full-audit"]["displayName"] == "门店视频日常全量稽核"
+    assert chip_map["cctv-full-audit"]["displayName"] == "Full Daily Store Video Audit"
     assert chip_map["cctv-full-audit"]["defaultTexts"]["suggestedPrompts"] == [
-        {"promptText": "请帮忙稽核视频：<门店监控 Google Drive 文件夹链接或 gs:// 目录>"}
+        {"promptText": "[Full Daily Audit] Please audit store videos: "},
+        {"promptText": "Confirm and start"},
+        {"promptText": "What is the current progress?"},
     ]
-    assert chip_map["cctv-tab4-spot-check"]["displayName"] == "专项抽检与新SOP测试"
+    assert chip_map["cctv-tab4-spot-check"]["displayName"] == "Spot-Check Tab4 & New SOP Test"
     assert chip_map["cctv-tab4-spot-check"]["defaultTexts"]["suggestedPrompts"] == [
-        {"promptText": "【仅测 Tab4_专项测试表（非全量）】请帮忙稽核视频：<门店监控 Google Drive 文件夹链接>"}
+        {"promptText": "[Spot-Check Tab4 Only (Non-Full)] Please audit store videos: "},
+        {"promptText": "Confirm and start"},
+        {"promptText": "What is the current progress?"},
     ]
     for _, body in chips:
         assert body["enabled"] is True
-        assert body["defaultTexts"]["prefix"] == "请根据你要稽核的内容选择如下的气泡"
+        assert body["defaultTexts"]["prefix"] == "Select a prompt chip below based on the audit mode you want to run"
 
     calls: list[tuple[str, str, dict | None]] = []
 

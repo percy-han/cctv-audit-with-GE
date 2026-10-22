@@ -106,22 +106,22 @@ class CompareReportTest(unittest.TestCase):
     def test_compare_messages(self):
         sheets = FakeSheets({"Sheet1": LABELS, gsh.CONFIG_TAB: gsh.render_config_rows(_cfg())})
         g = gsh.load_golden_from_sheet(SID, sheets=sheets, drive=FakeDrive(FOLDERS))
-        self.assertIn("评分标尺未变", gsh.compare_report(g, g.version))
-        self.assertIn("评分标尺已变化", gsh.compare_report(g, "golden_demo@0000000000"))
+        self.assertIn("scoring ruler unchanged", gsh.compare_report(g, g.version))
+        self.assertIn("scoring ruler changed", gsh.compare_report(g, "golden_demo@0000000000"))
         import tempfile
         from pathlib import Path
 
         with tempfile.TemporaryDirectory() as d:
             same = Path(d) / "same.json"
             same.write_text(json.dumps({"golden": g.summary()}), encoding="utf-8")
-            self.assertIn("完全相同", gsh.compare_report(g, str(same)))
+            self.assertIn("identical", gsh.compare_report(g, str(same)))
             note_only = Path(d) / "note.json"
             note_only.write_text(json.dumps({"golden": {**g.summary(), "manifest_sha256_full": "different"}}),
                                  encoding="utf-8")
-            self.assertIn("只有非评分字段变化", gsh.compare_report(g, str(note_only)))
+            self.assertIn("only non-scoring fields changed", gsh.compare_report(g, str(note_only)))
             legacy = Path(d) / "legacy.json"
             legacy.write_text(json.dumps({"golden": {"golden_version": "golden_demo@d931e914a7"}}), encoding="utf-8")
-            self.assertIn("旧的版本方案", gsh.compare_report(g, str(legacy)))
+            self.assertIn("older version scheme", gsh.compare_report(g, str(legacy)))
 
 
 if __name__ == "__main__":

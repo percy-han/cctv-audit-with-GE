@@ -36,9 +36,9 @@ from .portal import build_portal_url
 
 logger = logging.getLogger("cctv_audit.workspace_reporter")
 
-INITIAL_REVIEW_STATUS = "⏳ 待人工复核 (PENDING_HUMAN_REVIEW)"
-EVIDENCE_SUBFOLDER_NAME = "📁 违规证据切片_Evidence"
-REPORT_SHEET_TITLE = "📊 AI稽核报告与Token账单"
+INITIAL_REVIEW_STATUS = "PENDING"
+EVIDENCE_SUBFOLDER_NAME = "📁 Evidence_Clips"
+REPORT_SHEET_TITLE = "📊 AI_Audit_Report_and_Token_Ledger"
 _WEBHOOK_URI_CACHE: Dict[str, Tuple[float, str]] = {}
 _WEBHOOK_CACHE_TTL_SEC = 300.0
 
@@ -351,12 +351,12 @@ class WorkspaceReporter:
 
         buttons: List[dict] = [
             {
-                "text": "📁 打开门店视频目录",
+                "text": "📁 Open Store Video Folder",
                 "onClick": {"openLink": {"url": folder_url}},
             }
         ]
 
-        header_title = f"🚀 门店视频 AI 稽核已启动 (#{audit_id})"
+        header_title = f"🚀 Store CCTV AI Audit Started (#{audit_id})"
         payload: Dict[str, Any] = {
             **(
                 {"text": f"🔔 <users/{chat_user_id}> {header_title}"}
@@ -369,19 +369,19 @@ class WorkspaceReporter:
                     "card": {
                         "header": {
                             "title": header_title,
-                            "subtitle": f"门店：{store_label} · 共 {video_count} 支视频（约 {duration_min} 分钟）· 预计耗时约 {estimated_minutes:.1f} 分钟",
+                            "subtitle": f"Store: {store_label} · {video_count} videos (~{duration_min} min) · Est. runtime ~{estimated_minutes:.1f} min",
                         },
                         "sections": [
                             {
                                 "widgets": [
                                     {
                                         "decoratedText": {
-                                            "topLabel": "任务标识与生效配置",
+                                            "topLabel": "Job Identity & Active Configuration",
                                             "text": (
-                                                f"<b>发起督导</b>：{initiator_line}<br>"
-                                                f"<b>Job ID</b>：<code>{audit_id}</code><br>"
-                                                f"<b>模型</b>：<code>{model_version or 'gemini-3.8-flash'}</code> · "
-                                                f"<b>SOP</b>：<code>{prompt_version or 'APAC SOP'}</code>"
+                                                f"<b>Initiated By</b>: {initiator_line}<br>"
+                                                f"<b>Job ID</b>: <code>{audit_id}</code><br>"
+                                                f"<b>Model</b>: <code>{model_version or 'gemini-3.8-flash'}</code> · "
+                                                f"<b>SOP</b>: <code>{prompt_version or 'APAC SOP'}</code>"
                                             ),
                                         }
                                     },
@@ -432,19 +432,19 @@ class WorkspaceReporter:
         if portal_url.startswith("http"):
             buttons.append(
                 {
-                    "text": "🖥️ 打开 HTML 督导复核工作台",
+                    "text": "🖥️ Open HTML Supervisor Review Workbench",
                     "onClick": {"openLink": {"url": portal_url}},
                 }
             )
         if sheet_url:
             buttons.append(
                 {
-                    "text": "📊 打开原 Google Sheet 账单",
+                    "text": "📊 Open Original Google Sheet Report",
                     "onClick": {"openLink": {"url": sheet_url}},
                 }
             )
 
-        header_title = f"✅ 门店视频 AI 稽核已完成 (#{audit_id})"
+        header_title = f"✅ Store CCTV AI Audit Completed (#{audit_id})"
         payload: Dict[str, Any] = {
             **(
                 {"text": f"🔔 <users/{chat_user_id}> {header_title}"}
@@ -457,19 +457,19 @@ class WorkspaceReporter:
                     "card": {
                         "header": {
                             "title": header_title,
-                            "subtitle": f"共检出 {violations_count} 项待复核事件 · 消耗 {total_tokens:,} Tokens",
+                            "subtitle": f"Found {violations_count} violation(s) pending review · Used {total_tokens:,} Tokens",
                         },
                         "sections": [
                             {
-                                "header": "督导 3 秒复核入口（支持页内播放 20s 切片、一键生成 48h 整改单并实时回写 Sheet）",
+                                "header": "3-Second Supervisor Review Workbench (in-page 20s clip playback, 1-click 48h corrective action notice & live Sheet write-back)",
                                 "widgets": [
                                     {
                                         "decoratedText": {
                                             "topLabel": f"Job ID: {audit_id}",
                                             "text": (
-                                                f"<b>发起督导</b>：{initiator_line}<br>"
-                                                f"<b>待复核违规事件</b>：{violations_count} 项 | "
-                                                f"<b>总 Token</b>：{total_tokens:,}"
+                                                f"<b>Initiated By</b>: {initiator_line}<br>"
+                                                f"<b>Violations Pending Review</b>: {violations_count} | "
+                                                f"<b>Total Tokens</b>: {total_tokens:,}"
                                             ),
                                         }
                                     },
@@ -531,8 +531,8 @@ class WorkspaceReporter:
                 "decoratedText": {
                     "topLabel": f"Batch ID: {batch_id}",
                     "text": (
-                        f"<b>负责督导</b>：{initiator_line}<br>"
-                        f"<b>命中门店</b>：共 {total_stores} 家（已启动 {running_stores} 家 / 预检拦截 {failed_stores} 家）· 合计 {total_videos} 支新增视频"
+                        f"<b>Supervisor</b>: {initiator_line}<br>"
+                        f"<b>Matched Stores</b>: {total_stores} total ({running_stores} started / {failed_stores} blocked by preflight) · {total_videos} new video(s)"
                     ),
                 }
             }
@@ -543,7 +543,7 @@ class WorkspaceReporter:
                     "buttonList": {
                         "buttons": [
                             {
-                                "text": "📁 打开巡检根目录",
+                                "text": "📁 Open Root Audit Folder",
                                 "onClick": {"openLink": {"url": root_folder_url}},
                             }
                         ]
@@ -559,25 +559,25 @@ class WorkspaceReporter:
             err_msg = str(st.get("error_message") or "").replace("\n", " ")
             skipped_low_res = list(st.get("skipped_low_res_videos") or [])
             skipped_note = (
-                f"<br>⚠️ 已自动跳过 {len(skipped_low_res)} 支 &lt;720P 低清视频：{', '.join(skipped_low_res[:3])}"
+                f"<br>⚠️ Auto-skipped {len(skipped_low_res)} low-res (&lt;720P) video(s): {', '.join(skipped_low_res[:3])}"
                 if skipped_low_res and st_state == "RUNNING"
                 else ""
             )
             detail_txt = (
-                f"<b>{fname}</b> — 新增视频 {v_cnt} 支（后台稽核中）{skipped_note}"
+                f"<b>{fname}</b> — {v_cnt} new video(s) (auditing in background){skipped_note}"
                 if st_state == "RUNNING"
-                else f"<b>{fname}</b> — ❌ 预检拦截：{err_msg[:220] or '详见日志'}"
+                else f"<b>{fname}</b> — ❌ Blocked by Preflight: {err_msg[:220] or 'See logs for details'}"
             )
             widgets.append(
                 {
                     "decoratedText": {
-                        "topLabel": f"门店 #{idx} · Job ID: {st_job_id} ({st_state})",
+                        "topLabel": f"Store #{idx} · Job ID: {st_job_id} ({st_state})",
                         "text": detail_txt,
                     }
                 }
             )
 
-        header_title = f"🚀 定时自动巡检已启动：{rule_name} ({rule_id})"
+        header_title = f"🚀 Scheduled Auto-Audit Started: {rule_name} ({rule_id})"
         payload: Dict[str, Any] = {
             **(
                 {"text": f"🔔 <users/{chat_user_id}> {header_title}"}
@@ -590,11 +590,11 @@ class WorkspaceReporter:
                     "card": {
                         "header": {
                             "title": header_title,
-                            "subtitle": f"Batch ID: {batch_id} · 共 {total_stores} 家门店 / {total_videos} 支新增视频",
+                            "subtitle": f"Batch ID: {batch_id} · {total_stores} store(s) / {total_videos} new video(s)",
                         },
                         "sections": [
                             {
-                                "header": "本批次派发门店清单",
+                                "header": "Dispatched Stores in This Batch",
                                 "widgets": widgets[:30],
                             }
                         ],
@@ -650,9 +650,9 @@ class WorkspaceReporter:
                 "decoratedText": {
                     "topLabel": f"Batch ID: {batch_id}",
                     "text": (
-                        f"<b>负责督导</b>：{initiator_line}<br>"
-                        f"<b>覆盖门店</b>：共 {total_stores} 家（成功 {succeeded_stores} 家 / 失败 {failed_stores} 家）· {total_videos} 支视频<br>"
-                        f"<b>汇总检出</b>：{total_violations} 项待复核 | <b>总 Token</b>：{total_tokens:,}（约 ${total_cost_usd:.4f}）"
+                        f"<b>Supervisor</b>: {initiator_line}<br>"
+                        f"<b>Stores Covered</b>: {total_stores} total ({succeeded_stores} succeeded / {failed_stores} failed) · {total_videos} video(s)<br>"
+                        f"<b>Total Violations</b>: {total_violations} pending review | <b>Total Tokens</b>: {total_tokens:,} (~${total_cost_usd:.4f})"
                     ),
                 }
             }
@@ -661,14 +661,14 @@ class WorkspaceReporter:
         if batch_portal_url.startswith("http"):
             top_buttons.append(
                 {
-                    "text": "🌐 打开本批次多门店 HTML 复核工作台",
+                    "text": "🌐 Open Multi-Store HTML Review Workbench",
                     "onClick": {"openLink": {"url": batch_portal_url}},
                 }
             )
         if root_folder_url and root_folder_url.startswith("http"):
             top_buttons.append(
                 {
-                    "text": "📁 打开巡检根目录",
+                    "text": "📁 Open Root Audit Folder",
                     "onClick": {"openLink": {"url": root_folder_url}},
                 }
             )
@@ -686,7 +686,7 @@ class WorkspaceReporter:
             err_msg = str(st.get("error_message") or "").replace("\n", " ")
             skipped_low_res = list(st.get("skipped_low_res_videos") or [])
             skipped_note = (
-                f"<br>⚠️ 已自动跳过 {len(skipped_low_res)} 支 &lt;720P 低清视频：{', '.join(skipped_low_res[:3])}"
+                f"<br>⚠️ Auto-skipped {len(skipped_low_res)} low-res (&lt;720P) video(s): {', '.join(skipped_low_res[:3])}"
                 if skipped_low_res and st_state == "DONE"
                 else ""
             )
@@ -701,26 +701,26 @@ class WorkspaceReporter:
                 else s_url
             )
             btn_label = (
-                "🖥️ HTML 复核台"
+                "🖥️ HTML Workbench"
                 if store_portal_url.startswith("http")
-                else "📊 打开报告 Sheet"
+                else "📊 Open Report Sheet"
             )
             if st_state == "DONE":
                 row_text = (
-                    f"<b>{fname}</b> — 视频 {v_cnt} 支 | 待复核 {viol_cnt} 项 | {tok_cnt:,} Tokens{skipped_note}"
+                    f"<b>{fname}</b> — {v_cnt} video(s) | {viol_cnt} pending review | {tok_cnt:,} Tokens{skipped_note}"
                 )
             elif st_state == "REJECTED":
                 row_text = (
-                    f"<b>{fname}</b> — ❌ <b>预检未通过（0 Token 消耗）</b><br>{err_msg[:220] or '视频分辨率低于 720P 或目录缺少编辑权限'}"
+                    f"<b>{fname}</b> — ❌ <b>Preflight Rejected (0 Tokens Used)</b><br>{err_msg[:220] or 'Video resolution below 720P or missing folder write permission'}"
                 )
             else:
                 row_text = (
-                    f"<b>{fname}</b> — ❌ <b>执行异常中断</b><br>{err_msg[:220] or '详见日志'}"
+                    f"<b>{fname}</b> — ❌ <b>Execution Failed</b><br>{err_msg[:220] or 'See logs for details'}"
                 )
             widgets.append(
                 {
                     "decoratedText": {
-                        "topLabel": f"门店 #{idx} · Job ID: {st_job_id} ({st_state})",
+                        "topLabel": f"Store #{idx} · Job ID: {st_job_id} ({st_state})",
                         "text": row_text,
                         **(
                             {
@@ -737,11 +737,11 @@ class WorkspaceReporter:
             )
 
         if succeeded_stores == total_stores:
-            header_title = f"✅ 定时巡检已完成：{rule_name} ({rule_id})"
+            header_title = f"✅ Scheduled Auto-Audit Completed: {rule_name} ({rule_id})"
         elif succeeded_stores == 0:
-            header_title = f"⚠️ 定时巡检未通过预检/执行异常：{rule_name} ({rule_id})"
+            header_title = f"⚠️ Scheduled Auto-Audit Failed Preflight / Errored: {rule_name} ({rule_id})"
         else:
-            header_title = f"⚠️ 定时巡检部分完成（含预检拦截）：{rule_name} ({rule_id})"
+            header_title = f"⚠️ Scheduled Auto-Audit Partially Completed (With Preflight Blocks): {rule_name} ({rule_id})"
 
         payload: Dict[str, Any] = {
             **(
@@ -755,11 +755,11 @@ class WorkspaceReporter:
                     "card": {
                         "header": {
                             "title": header_title,
-                            "subtitle": f"Batch ID: {batch_id} · 覆盖 {total_stores} 家门店 / {total_videos} 支视频 · 待复核 {total_violations} 项",
+                            "subtitle": f"Batch ID: {batch_id} · {total_stores} store(s) / {total_videos} video(s) · {total_violations} pending review",
                         },
                         "sections": [
                             {
-                                "header": "门店巡检结果明细（支持顶部一键切换各门店 HTML 复核台）",
+                                "header": "Store Audit Breakdown (Switch Stores in the HTML Workbench Header)",
                                 "widgets": widgets[:30],
                             }
                         ],
@@ -789,7 +789,7 @@ class WorkspaceReporter:
         human_labels_sheet_url: str = "",
         results_folder_url: str = "",
     ) -> bool:
-        """Sends a Google Chat start card when a `Tab3_黄金集评测工作台` row transitions `START_EVAL -> RUNNING`."""
+        """Sends a Google Chat start card when a `Tab3_Golden_Eval` row transitions `START_EVAL -> RUNNING`."""
         enabled = self._is_notification_enabled()
         webhook_url = (
             await asyncio.to_thread(self._resolve_webhook_url_sync) if enabled else ""
@@ -803,19 +803,19 @@ class WorkspaceReporter:
             return False
 
         chat_user_id = await asyncio.to_thread(resolve_chat_user_id, supervisor_email)
-        initiator_line = f"<code>{supervisor_email or '督导'}</code>"
+        initiator_line = f"<code>{supervisor_email or 'Supervisor'}</code>"
 
         widgets: list[dict[str, Any]] = [
             {
                 "decoratedText": {
-                    "topLabel": "评测任务 / 负责人",
-                    "text": f"<b>{eval_name} ({eval_id})</b> · <b>负责督导</b>：{initiator_line}",
+                    "topLabel": "Evaluation Task / Owner",
+                    "text": f"<b>{eval_name} ({eval_id})</b> · <b>Supervisor</b>: {initiator_line}",
                 }
             },
             {
                 "decoratedText": {
-                    "topLabel": "待测 SOP 分表 / 模型版本",
-                    "text": f"SOP: <code>{prompt_tab_name}</code> · 模型: <code>{model_version}</code>",
+                    "topLabel": "Target SOP Tab / Model Version",
+                    "text": f"SOP: <code>{prompt_tab_name}</code> · Model: <code>{model_version}</code>",
                 }
             },
         ]
@@ -823,28 +823,28 @@ class WorkspaceReporter:
         if golden_videos_folder_url and golden_videos_folder_url.startswith("https://"):
             buttons.append(
                 {
-                    "text": "🎬 打开黄金集视频目录",
+                    "text": "🎬 Open Golden Videos Folder",
                     "onClick": {"openLink": {"url": golden_videos_folder_url}},
                 }
             )
         if human_labels_sheet_url and human_labels_sheet_url.startswith("https://"):
             buttons.append(
                 {
-                    "text": "📋 打开人工标注表",
+                    "text": "📋 Open Human Labels Sheet",
                     "onClick": {"openLink": {"url": human_labels_sheet_url}},
                 }
             )
         if results_folder_url and results_folder_url.startswith("https://"):
             buttons.append(
                 {
-                    "text": "📂 打开测评报告归档目录",
+                    "text": "📂 Open Eval Results Folder",
                     "onClick": {"openLink": {"url": results_folder_url}},
                 }
             )
         if buttons:
             widgets.append({"buttonList": {"buttons": buttons}})
 
-        header_title = f"🚀 黄金集评测已启动：{eval_name} ({eval_id})"
+        header_title = f"🚀 Golden-Set Evaluation Started: {eval_name} ({eval_id})"
         payload: Dict[str, Any] = {
             **(
                 {"text": f"🔔 <users/{chat_user_id}> {header_title}"}
@@ -857,11 +857,11 @@ class WorkspaceReporter:
                     "card": {
                         "header": {
                             "title": header_title,
-                            "subtitle": f"Run ID: {run_id} · SOP: {prompt_tab_name} · 模型: {model_version}",
+                            "subtitle": f"Run ID: {run_id} · SOP: {prompt_tab_name} · Model: {model_version}",
                         },
                         "sections": [
                             {
-                                "header": "⏳ 正在后台 24h Cloud Run Job 执行黄金集评测（完成后将自动推送召回率与 5-Tab 报告链接）",
+                                "header": "⏳ Running golden-set evaluation on 24h Cloud Run Job (Recall & 5-Tab Report link will be pushed upon completion)",
                                 "widgets": widgets,
                             }
                         ],
@@ -891,7 +891,7 @@ class WorkspaceReporter:
         summary: dict[str, Any] | None = None,
         error_message: str = "",
     ) -> bool:
-        """Sends a Google Chat card notification for a Sheet-triggered golden-set evaluation (`Tab3_黄金集评测工作台`)."""
+        """Sends a Google Chat card notification for a Sheet-triggered golden-set evaluation (`Tab3_Golden_Eval`)."""
         enabled = self._is_notification_enabled()
         webhook_url = (
             await asyncio.to_thread(self._resolve_webhook_url_sync) if enabled else ""
@@ -905,7 +905,7 @@ class WorkspaceReporter:
             return False
 
         chat_user_id = await asyncio.to_thread(resolve_chat_user_id, supervisor_email)
-        initiator_line = f"<code>{supervisor_email or '督导'}</code>"
+        initiator_line = f"<code>{supervisor_email or 'Supervisor'}</code>"
 
         is_done = str(status).upper() == "DONE"
         summary = summary or {}
@@ -919,15 +919,15 @@ class WorkspaceReporter:
         guardrails_ok = bool(summary.get("guardrails_passed", False))
         # Effective video mode of this run (`agentic` / `static`); absent for START / FAILED cards.
         media_mode = str(summary.get("media_mode") or "").strip()
-        model_line = f"模型: <code>{model_version}</code>"
+        model_line = f"Model: <code>{model_version}</code>"
         if media_mode:
-            model_line += f" · 模式: <code>{media_mode}</code>"
+            model_line += f" · Mode: <code>{media_mode}</code>"
 
         widgets: list[dict[str, Any]] = [
             {
                 "decoratedText": {
-                    "topLabel": "评测负责人 / 配方版本",
-                    "text": f"<b>负责督导</b>：{initiator_line} · SOP: <code>{prompt_tab_name}</code> · {model_line}",
+                    "topLabel": "Evaluation Owner / Recipe",
+                    "text": f"<b>Supervisor</b>: {initiator_line} · SOP: <code>{prompt_tab_name}</code> · {model_line}",
                 }
             },
         ]
@@ -935,10 +935,10 @@ class WorkspaceReporter:
             widgets.append(
                 {
                     "decoratedText": {
-                        "topLabel": "核心召回率指标 (Recall)",
+                        "topLabel": "Core Recall Metrics (Recall)",
                         "text": (
-                            f"总体召回率: <b>{overall_recall:.1f}%</b> | "
-                            f"仅 CONFIRMED 召回率: <b>{confirmed_only_recall:.1f}%</b>"
+                            f"Overall Recall: <b>{overall_recall:.1f}%</b> | "
+                            f"CONFIRMED-Only Recall: <b>{confirmed_only_recall:.1f}%</b>"
                         ),
                     }
                 }
@@ -946,17 +946,17 @@ class WorkspaceReporter:
             widgets.append(
                 {
                     "decoratedText": {
-                        "topLabel": "护栏与成本指标 (Guardrails & FinOps)",
+                        "topLabel": "Guardrails & Cost Metrics (Guardrails & FinOps)",
                         "text": (
-                            f"护栏状态: <b>{'✅ 通过' if guardrails_ok else '⚠️ 触发护栏'}</b> | "
-                            f"告警密度: <b>{findings_per_clip:.2f} 条/段</b> | "
-                            f"片段命中率: <b>{hit_rate:.1f}%</b> | "
-                            f"成本: <b>${total_cost_usd:.2f}</b> ({total_tokens:,} Tokens)"
+                            f"Guardrails: <b>{'✅ Passed' if guardrails_ok else '⚠️ Triggered'}</b> | "
+                            f"Alert Density: <b>{findings_per_clip:.2f} /clip</b> | "
+                            f"Clip Hit Rate: <b>{hit_rate:.1f}%</b> | "
+                            f"Cost: <b>${total_cost_usd:.2f}</b> ({total_tokens:,} Tokens)"
                         ),
                         **(
                             {
                                 "button": {
-                                    "text": "📊 打开 5-Tab 黄金集测评报告 Sheet",
+                                    "text": "📊 Open 5-Tab Golden-Set Evaluation Report Sheet",
                                     "onClick": {"openLink": {"url": sheet_url}},
                                 }
                             }
@@ -970,16 +970,16 @@ class WorkspaceReporter:
             widgets.append(
                 {
                     "decoratedText": {
-                        "topLabel": "失败原因 (Failure Details)",
-                        "text": f"❌ <b>{(error_message or '评测任务执行异常')[:260]}</b>",
+                        "topLabel": "Failure Details",
+                        "text": f"❌ <b>{(error_message or 'Evaluation task execution failed')[:260]}</b>",
                     }
                 }
             )
 
         header_title = (
-            f"✅ 黄金集评测已完成：{eval_name} ({eval_id})"
+            f"✅ Golden-Set Evaluation Completed: {eval_name} ({eval_id})"
             if is_done
-            else f"⚠️ 黄金集评测未通过/执行异常：{eval_name} ({eval_id})"
+            else f"⚠️ Golden-Set Evaluation Failed: {eval_name} ({eval_id})"
         )
         payload: Dict[str, Any] = {
             **(
@@ -993,11 +993,11 @@ class WorkspaceReporter:
                     "card": {
                         "header": {
                             "title": header_title,
-                            "subtitle": f"Run ID: {run_id} · SOP: {prompt_tab_name} · 模型: {model_version}",
+                            "subtitle": f"Run ID: {run_id} · SOP: {prompt_tab_name} · Model: {model_version}",
                         },
                         "sections": [
                             {
-                                "header": "黄金集评测结果摘要（零污染源视频目录，已归档至专属测评文件夹）",
+                                "header": "Golden-Set Evaluation Summary (Zero pollution of source video folder; archived to dedicated eval folder)",
                                 "widgets": widgets,
                             }
                         ],

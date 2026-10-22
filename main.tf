@@ -314,8 +314,8 @@ locals {
   # agent/app display name (the agent display name also identifies this stack's agent). Only an
   # explicit ge_*_display_name (e.g. prod's pinned legacy names) can drop it.
   ge_name_suffix        = local.ge_brand == var.name_prefix ? "" : " [${var.name_prefix}]"
-  ge_app_display_name   = var.ge_app_display_name != "" ? var.ge_app_display_name : "${local.ge_brand} 门店 CCTV AI 稽核工作台${local.ge_name_suffix}"
-  ge_agent_display_name = var.ge_agent_display_name != "" ? var.ge_agent_display_name : "${local.ge_brand} 门店监控 AI 稽核专家${local.ge_name_suffix}"
+  ge_app_display_name   = var.ge_app_display_name != "" ? var.ge_app_display_name : "${local.ge_brand} Store CCTV AI Audit Workbench${local.ge_name_suffix}"
+  ge_agent_display_name = var.ge_agent_display_name != "" ? var.ge_agent_display_name : "${local.ge_brand} Store CCTV AI Auditor${local.ge_name_suffix}"
 
   # --legacy-display-name / --extra-ge-engine-id flags for deploy/deploy_reasoning_engine.py.
   re_legacy_name_flags  = join(" ", [for n in var.legacy_reasoning_engine_display_names : "--legacy-display-name \"${n}\""])

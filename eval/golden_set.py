@@ -125,30 +125,30 @@ def compute_golden_version(stem: str, golden_sha: str, manifest_sha: str) -> str
 
 def validate_items(items: Sequence[Mapping[str, Any]]) -> None:
     if not items:
-        raise GoldenSetError("黄金集为空：至少需要 1 条标注")
+        raise GoldenSetError("Golden set is empty: at least 1 labelled item is required")
     seen_items: set[str] = set()
     seen_parts: set[str] = set()
     for n, it in enumerate(items, 1):
         missing = [f for f in REQUIRED_ITEM_FIELDS if f not in it or it[f] in (None, "", [])]
         if missing:
-            raise GoldenSetError(f"第 {n} 行 (item_id={it.get('item_id')!r}) 缺少必填字段 {missing}")
+            raise GoldenSetError(f"Row {n} (item_id={it.get('item_id')!r}) is missing required fields {missing}")
         iid = str(it["item_id"])
         if iid in seen_items:
-            raise GoldenSetError(f"item_id {iid!r} 重复")
+            raise GoldenSetError(f"Duplicate item_id {iid!r}")
         seen_items.add(iid)
         if len(it["video_filenames"]) != len(it["video_file_ids"]):
-            raise GoldenSetError(f"{iid}: video_filenames 与 video_file_ids 数量不一致")
+            raise GoldenSetError(f"{iid}: video_filenames and video_file_ids count mismatch")
         for p in it["parts"]:
             pmiss = [f for f in REQUIRED_PART_FIELDS if f not in p]
             if pmiss:
-                raise GoldenSetError(f"{iid}: part 缺少必填字段 {pmiss}")
+                raise GoldenSetError(f"{iid}: part is missing required fields {pmiss}")
             pid = str(p["part_id"])
             if pid in seen_parts:
-                raise GoldenSetError(f"part_id {pid!r} 重复")
+                raise GoldenSetError(f"Duplicate part_id {pid!r}")
             seen_parts.add(pid)
             mode = str(p.get("temporal_mode") or it.get("temporal_mode") or "").upper()
             if mode and mode not in TEMPORAL_MODES:
-                raise GoldenSetError(f"{pid}: temporal_mode 只能是 POINT / WINDOW，收到 {mode!r}")
+                raise GoldenSetError(f"{pid}: temporal_mode must be POINT / WINDOW, got {mode!r}")
 
 
 @dataclass
@@ -195,7 +195,7 @@ class GoldenSet:
         known = {str(it["item_id"]) for it in self.items}
         unknown = sorted(set(from_manifest) - known)
         if unknown:
-            raise GoldenSetError(f"manifest stable_baseline_items 含黄金集中不存在的 item_id: {unknown}")
+            raise GoldenSetError(f"manifest stable_baseline_items contains unknown item_id(s) not in golden set: {unknown}")
         ids = list(dict.fromkeys(from_golden + from_manifest))
         source = "+".join(s for s, v in (("golden_field", from_golden), ("manifest", from_manifest)) if v)
         return ids, (source or "none")
@@ -240,13 +240,13 @@ def _apply_overrides(items: list[dict[str, Any]], manifest: Mapping[str, Any]) -
     known = {str(it["item_id"]) for it in items}
     unknown = sorted(set(overrides) - known)
     if unknown:
-        raise GoldenSetError(f"manifest item_overrides 含黄金集中不存在的 item_id: {unknown}")
+        raise GoldenSetError(f"manifest item_overrides contains unknown item_id(s) not in golden set: {unknown}")
     allowed = set(RULER_OVERRIDE_KEYS)
     for it in items:
         ov = overrides.get(str(it["item_id"])) or {}
         bad = sorted(set(ov) - allowed)
         if bad:
-            raise GoldenSetError(f"item_overrides[{it['item_id']}] 只允许 {sorted(allowed)}，收到 {bad}")
+            raise GoldenSetError(f"item_overrides[{it['item_id']}] only allows {sorted(allowed)}, got {bad}")
         it.update(ov)
 
 
@@ -394,7 +394,7 @@ def load_golden(golden_uri: str | Path, manifest_uri: str | None = None) -> Gold
     src = str(golden_uri)
     raw = _read_bytes(src)
     if raw is None:
-        raise FileNotFoundError(f"黄金集文件不存在: {src}")
+        raise FileNotFoundError(f"Golden set file not found: {src}")
     m_src = manifest_uri or manifest_path_for(src)
     m_raw = _read_bytes(m_src)
     manifest = json.loads(m_raw.decode("utf-8")) if m_raw else {}
@@ -428,7 +428,7 @@ def materialize_golden(golden_uri: str, dest_dir: Path | None = None) -> Path:
     name = golden_uri.rstrip("/").split("/")[-1]
     raw = _read_bytes(golden_uri)
     if raw is None:
-        raise FileNotFoundError(f"黄金集文件不存在: {golden_uri}")
+        raise FileNotFoundError(f"Golden set file not found: {golden_uri}")
     (dest / name).write_bytes(raw)
     m_raw = _read_bytes(manifest_path_for(golden_uri))
     if m_raw is not None:
@@ -450,7 +450,7 @@ def derive_folder_specs(golden: GoldenSet) -> list[dict[str, Any]]:
         for f in golden.manifest["folders"]:
             videos = [dict(v) for v in f.get("videos") or []]
             if not f.get("group_id") or not videos:
-                raise GoldenSetError(f"manifest folder {f.get('label')!r} 需要 group_id 和至少 1 个 video")
+                raise GoldenSetError(f"manifest folder {f.get('label')!r} requires group_id and at least 1 video")
             specs.append({
                 "group_id": str(f["group_id"]),
                 "folder_id": str(f.get("folder_id") or ""),
@@ -474,10 +474,10 @@ def derive_folder_specs(golden: GoldenSet) -> list[dict[str, Any]]:
             specs.append(g)
     ids = [s["group_id"] for s in specs]
     if len(set(ids)) != len(ids):
-        raise GoldenSetError(f"folder group_id 重复: {ids}")
+        raise GoldenSetError(f"Duplicate folder group_id: {ids}")
     evaluated = {str(v["file_id"]) for s in specs for v in s["videos"]}
     labelled = {str(fid) for it in golden.items for fid in it["video_file_ids"]}
     missing = sorted(labelled - evaluated)
     if missing:
-        raise GoldenSetError(f"黄金集标注的视频不在评测文件夹清单中（无法计分）: {missing}")
+        raise GoldenSetError(f"Labelled video(s) missing from evaluation folder manifest (cannot be scored): {missing}")
     return specs

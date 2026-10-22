@@ -134,13 +134,13 @@ def test_preflight_rejects_below_720p_and_accepts_hd():
     # 1980s * (361s / 300s) / 60 = 39.71 -> 39.7 min (sequential carryover, not divided by gemini_concurrency)
     assert res_hd.estimated_minutes == 39.7
     assert "预估消耗" not in res_hd.message_to_user
-    assert "Tab 2 真实账单" in res_hd.message_to_user
-    assert "361 秒" in res_hd.message_to_user
-    # One 30-min video IS sliced -> "切片计划" names the long video count and the total slice count.
-    assert "**切片计划**" in res_hd.message_to_user
-    assert "`1` 段超过 10 分钟的长视频" in res_hd.message_to_user
-    assert "合计 **`4` 个无音分片**" in res_hd.message_to_user
-    assert "处理计划" not in res_hd.message_to_user
+    assert "Tab2_Token_Ledger" in res_hd.message_to_user
+    assert "361 sec" in res_hd.message_to_user
+    # One 30-min video IS sliced -> "Slicing Plan" names the long video count and the total slice count.
+    assert "**Slicing Plan**" in res_hd.message_to_user
+    assert "`1` long video(s) over 10 min" in res_hd.message_to_user
+    assert "**`4` audio-stripped slices**" in res_hd.message_to_user
+    assert "Processing Plan" not in res_hd.message_to_user
 
     # 5 x 5-min clips are NOT sliced -> must not claim 10-minute slicing.
     short_items = [
@@ -161,16 +161,16 @@ def test_preflight_rejects_below_720p_and_accepts_hd():
     )
     assert res_short.passed is True
     assert res_short.planned_segments_count == 5
-    assert "**处理计划**：共 `5` 段视频，单段均不超过 10 分钟，无需切分" in res_short.message_to_user
-    assert "切片计划" not in res_short.message_to_user
-    assert "分钟/段" not in res_short.message_to_user
+    assert "**Processing Plan**: `5` videos, each <= 10 min; no slicing needed" in res_short.message_to_user
+    assert "Slicing Plan" not in res_short.message_to_user
+    assert "min/slice" not in res_short.message_to_user
 
     from cctv_audit.video_ingestor import progress_unit_label
 
-    assert progress_unit_label(short_items) == "段视频"
-    assert progress_unit_label(hd_items) == "个分片"
-    assert progress_unit_label([]) == "个分片"
-    assert progress_unit_label(None) == "个分片"
+    assert progress_unit_label(short_items) == "videos"
+    assert progress_unit_label(hd_items) == "slices"
+    assert progress_unit_label([]) == "slices"
+    assert progress_unit_label(None) == "slices"
 
     # Regression (referee R58 P1): a 600.1s video (2 windows) + a 0s video (0 windows) sum to 2 == len,
     # which must NOT be reported as "no slicing".
@@ -178,7 +178,7 @@ def test_preflight_rejects_below_720p_and_accepts_hd():
         VideoMetadataItem(file_id="long", filename="a.mov", width=1920, height=1080, duration_sec=600.1),
         VideoMetadataItem(file_id="zero", filename="b.mov", width=1920, height=1080, duration_sec=0.0),
     ]
-    assert progress_unit_label(tricky_items) == "个分片"
+    assert progress_unit_label(tricky_items) == "slices"
     res_tricky = asyncio.run(
         ingestor.inspect_drive_videos(
             "https://drive.google.com/drive/folders/folder_tricky",
@@ -186,12 +186,12 @@ def test_preflight_rejects_below_720p_and_accepts_hd():
         )
     )
     assert res_tricky.planned_segments_count == len(tricky_items)
-    assert "**切片计划**" in res_tricky.message_to_user
-    assert "处理计划" not in res_tricky.message_to_user
+    assert "**Slicing Plan**" in res_tricky.message_to_user
+    assert "Processing Plan" not in res_tricky.message_to_user
     # Exactly 600s is not sliced.
     assert progress_unit_label(
         [VideoMetadataItem(file_id="e", filename="e.mov", width=1920, height=1080, duration_sec=600.0)]
-    ) == "段视频"
+    ) == "videos"
 
     from unittest import mock
     from cctv_audit.config import config as app_cfg
@@ -211,8 +211,8 @@ def test_preflight_rejects_below_720p_and_accepts_hd():
             )
         )
         assert res_static.estimated_minutes == 9.9
-        assert "90 秒" in res_static.message_to_user
-        assert "361 秒" not in res_static.message_to_user
+        assert "90 sec" in res_static.message_to_user
+        assert "361 sec" not in res_static.message_to_user
 
 
 def test_prompt_and_model_sheet_rollback_and_no_silent_autoswitch():
@@ -960,35 +960,35 @@ def test_full_v10_and_chagee_v2_yaml_prompt_loading() -> None:
     pm = PromptManager(sheet_client=None)
     cfg = asyncio.run(pm.load_active_config(sheet_id=""))
     assert len(cfg.rules) == 24
-    assert "疑似接触不再豁免" in cfg.system_instruction
+    assert "suspected contact is never exempted" in cfg.system_instruction
     assert "Partner enter work, on the switch" in cfg.system_instruction
-    assert "B1-1 · Langtuo 完整流程核对（15 项，SOP 21）" in cfg.system_instruction
-    assert "interior surface of ice maker machine grid" in cfg.system_instruction
+    assert "B1-1 · Langtuo Complete 15-Step Weekly Clean Verification (SOP 21)" in cfg.system_instruction
+    assert "evaporator cube grid" in cfg.system_instruction
     assert "side grid" in cfg.system_instruction
     assert "Pour sanitiser solution into water trough" in cfg.system_instruction
     assert "Close back ice maker machine" in cfg.system_instruction
-    assert "B1-2 · Manitowoc 完整流程核对（13 项，SOP 8）" in cfg.system_instruction
-    assert "官方 SOP 两大制冰机机型结构与可拆部件视觉锚定" in cfg.system_instruction
-    assert "可拆部件「四周边框与侧面厚度边缘」全覆盖原则（Wipe the sides and edges thoroughly）" in cfg.system_instruction
-    assert "毛巾取用起点逆向溯源原则" in cfg.system_instruction
-    assert "步骤先后时序与首尾 3 秒慢放核查" in cfg.system_instruction
-    assert "D2 · IPLH 计算（Week 3 必交）" in cfg.system_instruction
-    assert "跨切片/跨视频状态接力校准" in cfg.system_instruction
-    assert "多人同屏注意力解耦（Anti-Attention-Masking）" in cfg.system_instruction
-    assert "多人并发与同秒掩蔽回扫（关键）" in cfg.system_instruction
-    assert "原则六：一行为一记录与复合违规正交拆解（严禁高显著性事件吞并伴随违规）" in cfg.system_instruction
-    assert "单事件吸干与多维正交漏报回扫（关键）" in cfg.system_instruction
+    assert "B1-2 · Manitowoc Complete 13-Step Weekly Clean Verification (SOP 8)" in cfg.system_instruction
+    assert "Official SOP Visual Priors for Upright Modular Ice Makers" in cfg.system_instruction
+    assert "Removable Component 'All Four Sides & Thickness Edges' Full Coverage (`Wipe the sides and edges thoroughly`)" in cfg.system_instruction
+    assert "5-Second Reverse Traceback of Towel Retrieval Source" in cfg.system_instruction
+    assert "Step Sequence & First 3s / Last 5s Slow-Motion Check" in cfg.system_instruction
+    assert "D2 · IPLH Calculation (Week 3 Deliverable)" in cfg.system_instruction
+    assert "Cross-Slice / Cross-Video State Carryover Calibration" in cfg.system_instruction
+    assert "Multi-Person Attention Decoupling (Anti-Attention-Masking)" in cfg.system_instruction
+    assert "Concurrent Multi-Person & Same-Second Masking Rescan (Critical)" in cfg.system_instruction
+    assert "Principle 6: One-Action-One-Record & Orthogonal Decomposition of Compound Violations" in cfg.system_instruction
+    assert "Single-Event Absorption & Multi-Dimensional Orthogonal Rescan (Critical)" in cfg.system_instruction
     assert "spit guard" in cfg.system_instruction
     assert "apply soap before wet hand" in cfg.system_instruction
-    assert "top surface of the ice maker" in cfg.system_instruction
+    assert "on top of the ice maker" in cfg.system_instruction
     assert "water distribution tube" in cfg.system_instruction
     assert "yellow bottle" in cfg.system_instruction
     assert "apron not kept at designated storage area" in cfg.system_instruction
-    assert "步骤 4：漏检自查（强制执行，不可跳过）" in cfg.system_instruction
+    assert "Step 4: Missed-Detection Self-Audit (Mandatory, Cannot Skip)" in cfg.system_instruction
 
     # C8 = customer SOP 6.2 "Filter Tea into an Ice-Prepared Container" (the HC5 standard).
     c8 = next(r for r in rules if r.rule_id == "C8")
-    assert c8.category == next(r for r in rules if r.rule_id == "C7").category  # same 【C】 block, runs every week
+    assert c8.category == next(r for r in rules if r.rule_id == "C7").category  # same [C] block, runs every week
     assert c8.severity == "NORMAL"
     # The customer's two sentences, verbatim.
     assert (
@@ -1000,27 +1000,27 @@ def test_full_v10_and_chagee_v2_yaml_prompt_loading() -> None:
         "(30s from the machine prompt: “Tea is ready” / dripping stage)"
     ) in c8.check_instruction
     # Thresholds and the timer start point must survive into the rendered prompt.
-    assert "超过 3 分钟" in c8.check_instruction
-    assert "30 秒内搅拌" in c8.check_instruction
-    assert "滴滤（dripping）阶段" in c8.check_instruction
+    assert "More than 3 minutes" in c8.check_instruction
+    assert "Stir Within 30 Seconds" in c8.check_instruction
+    assert "dripping stage" in c8.check_instruction
     # The video is silent, so the start point must be tied to something visible, not the voice prompt.
-    assert "视频没有声音" in c8.check_instruction
-    assert "出茶口的茶汤从连续流出变成滴落" in c8.check_instruction
+    assert "Since video has no audio" in c8.check_instruction
+    assert "tea stream at the spout transitioning from continuous flow to dripping" in c8.check_instruction
     # Ice added / tea ready before the clip starts and not in the carryover: can't time it and can't see an
     # earlier stir, so it must be OUT_OF_SCOPE (not in the violation table), never a guessed violation.
-    assert c8.check_instruction.count("`OUT_OF_SCOPE`（不进违规表）") == 2
-    assert "已出茶还没搅拌）写进接力摘要" in c8.check_instruction
+    assert c8.check_instruction.count("mark `OUT_OF_SCOPE`") == 2
+    assert "tea ready awaiting stir) in `carryover_state_summary`" in c8.check_instruction
     assert c8.pass_criteria and c8.fail_criteria
 
     sys_text = cfg.system_instruction
-    c7_at = sys_text.index("### C7 · 顾客服务（9.x）")
-    c8_at = sys_text.index("### C8 · 泡茶机出茶入冰与 30 秒内搅拌（6.2 Automated Tea Maker Machine）")
-    d_block_at = sys_text.index("## 【D】运营与人效（Week 3 主模块）")
-    assert c7_at < c8_at < d_block_at, "C8 must render inside the 【C】 block (explicit status required)"
-    assert sys_text.count("## 【C】常态红线扫描（所有周次都跑）") == 1, "C8 must not open a second 【C】 heading"
+    c7_at = sys_text.index("### C7 · Customer Service Standards (9.x)")
+    c8_at = sys_text.index("### C8 · Automated Tea Maker Filtering into Ice & 30s Stirring (6.2 Automated Tea Maker Machine)")
+    d_block_at = sys_text.index("## [D] Operations & Labor Productivity (Week 3 Core Module)")
+    assert c7_at < c8_at < d_block_at, "C8 must render inside the [C] block (explicit status required)"
+    assert sys_text.count("## [C] Continuous Red-Line Scan (Active Every Week)") == 1, "C8 must not open a second [C] heading"
     # C6 still covers the tea maker in general but hands the timing checks to C8 (no double report).
     c6 = next(r for r in rules if r.rule_id == "C6")
-    assert "单独按 C8 核查，不在 C6 重复报" in c6.check_instruction
+    assert "checked separately under C8; do not double-report under C6" in c6.check_instruction
 
 
 def test_sop_sheet_url_extraction_and_hot_switch() -> None:
@@ -1119,7 +1119,7 @@ def test_ge_a2a_and_adk_wire_protocols_and_is_busy_probe() -> None:
             assert a2a_body["jsonrpc"] == "2.0"
             assert a2a_body["id"] == "req-ge-a2a-001"
             assert a2a_body["result"]["status"]["state"] == "completed"
-            assert "暂无正在运行或已完成的稽核任务" in a2a_body["result"]["status"]["message"]["parts"][0]["text"]
+            assert "You currently have no running or completed audit jobs." in a2a_body["result"]["status"]["message"]["parts"][0]["text"]
 
             # 3. POST /api/stream_reasoning_engine (double-encoded request_json used by GE Console Agents dropdown -> ReasoningEngine)
             adk_req = srv.StreamReasoningRequest(
@@ -1146,7 +1146,7 @@ def test_ge_a2a_and_adk_wire_protocols_and_is_busy_probe() -> None:
             adk_envelope = json.loads(b"".join(chunks).decode("utf-8").strip().splitlines()[0])
             assert adk_envelope["session_id"] == "sess-001"
             assert adk_envelope["events"][0]["content"]["role"] == "model"
-            assert "暂无正在运行或已完成的稽核任务" in adk_envelope["events"][0]["content"]["parts"][0]["text"]
+            assert "You currently have no running or completed audit jobs." in adk_envelope["events"][0]["content"]["parts"][0]["text"]
 
             # 4. GET /is_busy keepAliveProbe when idle
             idle_busy = await srv.is_busy()
@@ -1212,7 +1212,7 @@ def test_ge_a2a_and_adk_wire_protocols_and_is_busy_probe() -> None:
                 )
             )
             assert confirm_body["result"]["status"]["state"] == "completed"
-            assert "未找到待确认的预检任务" in confirm_body["result"]["status"]["message"]["parts"][0]["text"]
+            assert "No preflighted job awaiting confirmation" in confirm_body["result"]["status"]["message"]["parts"][0]["text"]
 
         # 9. TurnAction.STATUS ("好了么") when a job with preflight_report exists (RUNNING, FAILED, DONE)
         #    must never raise AttributeError on preflight_report.planned_segments_count / total_segments.
@@ -1236,7 +1236,7 @@ def test_ge_a2a_and_adk_wire_protocols_and_is_busy_probe() -> None:
             ],
         )
         assert preflight_rep.total_segments == 8
-        # 5 x 5-min clips: nothing is sliced, so the counter unit must be "段视频", never "分钟切片".
+        # 5 x 5-min clips: nothing is sliced, so the counter unit must be "videos", never "分钟切片".
         short_rep = preflight_rep.model_copy(
             update={
                 "total_videos": 5,
@@ -1249,12 +1249,12 @@ def test_ge_a2a_and_adk_wire_protocols_and_is_busy_probe() -> None:
             }
         )
         for job_state, rep, expected_marker in (
-            (JobState.RUNNING, preflight_rep, "已完成 `0/8` 个分片"),
-            (JobState.FAILED, preflight_rep, "执行遇到异常（已完成 `0/8` 个分片）"),
-            (JobState.DONE, preflight_rep, "任务 `275db5` 已完成！"),
-            (JobState.RUNNING, short_rep, "已完成 `0/5` 段视频"),
-            (JobState.FAILED, short_rep, "执行遇到异常（已完成 `0/5` 段视频）"),
-            (JobState.DONE, short_rep, "已完成：`0/5` 段视频"),
+            (JobState.RUNNING, preflight_rep, "`0/8` slices completed"),
+            (JobState.FAILED, preflight_rep, "Encountered an Error (`0/8` slices completed)"),
+            (JobState.DONE, preflight_rep, "Job `275db5` Completed!"),
+            (JobState.RUNNING, short_rep, "`0/5` videos completed"),
+            (JobState.FAILED, short_rep, "Encountered an Error (`0/5` videos completed)"),
+            (JobState.DONE, short_rep, "Completed: `0/5` videos"),
         ):
             fake_job = AuditJob(
                 job_id="275db5",
@@ -1716,7 +1716,7 @@ def test_tc013_cpuprobe_and_in_container_slice_watchdog() -> None:
                 label="Job w99 slice vid:0",
             )
         assert "Job w99 slice vid:0" in str(ctx.exception)
-        assert "已被容器内看门狗终止" in str(ctx.exception)
+        assert "terminated by the in-container watchdog" in str(ctx.exception)
 
         # Verify stale PROBING jobs (>60s) do not poison active_running_count()
         import time

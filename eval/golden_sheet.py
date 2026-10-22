@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Golden set straight from the customer's label Sheet + a ``测评配置`` (eval config) tab.
+"""Golden set straight from the customer's label Sheet + an ``Eval_Config`` (or legacy ``测评配置``) tab.
 
 The customer keeps maintaining their own "Manual Audit Result" label tab (never modified by code). One
-extra tab, ``测评配置``, in the same spreadsheet says how to turn it into a golden set: golden name,
+extra tab, ``Eval_Config``, in the same spreadsheet says how to turn it into a golden set: golden name,
 label range, the Drive folders holding the clips, the dev split, compound rows and optional per-item
 settings. Each eval run reads both tabs live, lists every video in the configured folders (including
 unlabelled clips, which count for alert density) and produces exactly the in-memory golden JSONL +
@@ -11,7 +11,8 @@ file. A config tab rendered from ``golden_v1.build.json`` + ``golden_v1.manifest
 unchanged label tab reproduces the file's ruler version (``golden_v1@9426fe9b52``, scheme ruler-v2).
 
 Config tab layout (see eval/data/README.md for a full example). Column A holds section markers
-``[基本设置]`` / ``[视频文件夹]`` / ``[开发集分组]`` / ``[复合题拆分]`` / ``[逐题设置]``; the row after a
+``[Basic Settings]`` / ``[Video Folders]`` / ``[Dev Split Groups]`` / ``[Compound Item Splits]`` /
+``[Per-Item Settings]`` (legacy Chinese markers ``[基本设置]`` etc. are also accepted); the row after a
 marker is that section's header row (checked); blank rows and rows whose column A starts with ``#``
 are ignored.
 
@@ -41,17 +42,86 @@ if str(CODE_ROOT) not in sys.path:
 from eval.build_dataset import GoldenBuildError, build_golden_records, records_to_jsonl  # noqa: E402
 from eval.golden_set import VERSION_SCHEME, GoldenSet, GoldenSetError, build_golden  # noqa: E402
 
-CONFIG_TAB = "测评配置"
-SEC_BASIC, SEC_FOLDERS, SEC_DEV, SEC_COMPOUND, SEC_ITEMS = "基本设置", "视频文件夹", "开发集分组", "复合题拆分", "逐题设置"
+CONFIG_TAB_TITLE = "Eval_Config"
+CONFIG_TAB = CONFIG_TAB_TITLE
+LEGACY_CONFIG_TAB_TITLES = ("Eval_Config", "测评配置")
+SEC_BASIC, SEC_FOLDERS, SEC_DEV, SEC_COMPOUND, SEC_ITEMS = (
+    "Basic Settings",
+    "Video Folders",
+    "Dev Split Groups",
+    "Compound Item Splits",
+    "Per-Item Settings",
+)
+_SECTION_ALIASES = {
+    SEC_BASIC: SEC_BASIC,
+    "1. Basic Info": SEC_BASIC,
+    "基本设置": SEC_BASIC,
+    "一、基础信息": SEC_BASIC,
+    SEC_FOLDERS: SEC_FOLDERS,
+    "2. Folder -> Store Mapping": SEC_FOLDERS,
+    "视频文件夹": SEC_FOLDERS,
+    "二、目录名 -> 门店映射": SEC_FOLDERS,
+    SEC_DEV: SEC_DEV,
+    "3. Filename -> Clip Mapping": SEC_DEV,
+    "开发集分组": SEC_DEV,
+    "三、文件名 -> 切片映射": SEC_DEV,
+    SEC_COMPOUND: SEC_COMPOUND,
+    "5. Sub-Part Splits": SEC_COMPOUND,
+    "复合题拆分": SEC_COMPOUND,
+    "五、复合题子项拆分": SEC_COMPOUND,
+    SEC_ITEMS: SEC_ITEMS,
+    "4. Temporal Mode Overrides": SEC_ITEMS,
+    "6. Excluded Rows": SEC_ITEMS,
+    "逐题设置": SEC_ITEMS,
+    "四、时间窗口模式覆盖": SEC_ITEMS,
+    "六、排除行号": SEC_ITEMS,
+}
 HEADERS = {
+    SEC_BASIC: ["Field", "Value"],
+    SEC_FOLDERS: ["Group ID", "Store", "Audit Focus", "Drive Folder ID", "Cache Job IDs (optional, comma-separated)"],
+    SEC_DEV: ["Audit Focus", "Store"],
+    SEC_COMPOUND: ["Sheet Row", "Split Description 1", "Split Description 2"],  # more description columns allowed
+    SEC_ITEMS: [
+        "Item ID",
+        "SOP Category (optional)",
+        "Temporal Mode (POINT/WINDOW, optional)",
+        "Stable Baseline (Yes/No, optional)",
+    ],
+}
+LEGACY_HEADERS = {
     SEC_BASIC: ["项目", "值"],
     SEC_FOLDERS: ["分组ID", "门店", "稽核重点", "Drive 文件夹 ID", "缓存任务 ID（可空，逗号分隔）"],
     SEC_DEV: ["稽核重点", "门店"],
-    SEC_COMPOUND: ["表格行号", "拆分描述 1", "拆分描述 2"],  # more description columns allowed
+    SEC_COMPOUND: ["表格行号", "拆分描述 1", "拆分描述 2"],
     SEC_ITEMS: ["题号", "SOP 大类（可空）", "时间判定模式（POINT/WINDOW，可空）", "稳定基线题（是/否，可空）"],
 }
-KEY_NAME, KEY_RANGE, KEY_EXPECTED, KEY_NOTE, KEY_SOURCE = "黄金集名称", "标注页范围", "期望题数", "备注", "来源表 ID"
+KEY_NAME, KEY_RANGE, KEY_EXPECTED, KEY_NOTE, KEY_SOURCE = (
+    "Golden Set Name",
+    "Label Range",
+    "Expected Item Count",
+    "Notes",
+    "Source Sheet ID",
+  )
 BASIC_KEYS = (KEY_NAME, KEY_RANGE, KEY_EXPECTED, KEY_NOTE, KEY_SOURCE)
+_BASIC_KEY_ALIASES = {
+    KEY_NAME: KEY_NAME,
+    "golden_version": KEY_NAME,
+    "黄金集名称": KEY_NAME,
+    "黄金集版本号": KEY_NAME,
+    KEY_RANGE: KEY_RANGE,
+    "label_range": KEY_RANGE,
+    "标注页范围": KEY_RANGE,
+    KEY_EXPECTED: KEY_EXPECTED,
+    "expected_rows": KEY_EXPECTED,
+    "期望题数": KEY_EXPECTED,
+    KEY_NOTE: KEY_NOTE,
+    "source_description": KEY_NOTE,
+    "备注": KEY_NOTE,
+    "黄金集来源说明": KEY_NOTE,
+    KEY_SOURCE: KEY_SOURCE,
+    "source_sheet_id": KEY_SOURCE,
+    "来源表 ID": KEY_SOURCE,
+}
 YES, NO = {"是", "yes", "y", "true", "1"}, {"否", "no", "n", "false", "0", ""}
 _DRIVE_ID = re.compile(r"^[A-Za-z0-9_-]{10,}$")
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
@@ -61,10 +131,19 @@ VIDEO_QUERY = ("'{folder}' in parents and trashed=false and "
 
 
 class GoldenSheetError(GoldenSetError):
-    """The label Sheet / config tab / Drive folders cannot produce a golden set (Chinese, names the cell)."""
+    """The label Sheet / config tab / Drive folders cannot produce a golden set (names the cell)."""
 
 
 # --------------------------------------------------------------------------------------- pure helpers
+
+
+def _resolve_config_tab_title(existing_titles: Sequence[str]) -> str:
+    """Returns the config tab title present in ``existing_titles`` (preferring ``Eval_Config``, falling
+    back to legacy ``测评配置``), or ``CONFIG_TAB_TITLE`` if neither exists yet."""
+    for candidate in LEGACY_CONFIG_TAB_TITLES:
+        if candidate in existing_titles:
+            return candidate
+    return CONFIG_TAB_TITLE
 
 
 def _col_index(letters: str) -> int:
@@ -85,7 +164,7 @@ def _col_letter(idx: int) -> str:
 def range_width(a1: str) -> int:
     m = _RANGE.match(a1.strip())
     if not m:
-        raise GoldenSheetError(f"标注页范围 {a1!r} 格式不对，应形如 Sheet1!A1:F40")
+        raise GoldenSheetError(f"Invalid label range format {a1!r}; expected e.g. Sheet1!A1:F40")
     return _col_index(m.group(5)) - _col_index(m.group(3)) + 1
 
 
@@ -143,7 +222,7 @@ def _cell(row: Sequence[Any], i: int) -> str:
 
 
 def parse_config(rows: Sequence[Sequence[Any]], tab: str = CONFIG_TAB) -> GoldenSheetConfig:
-    """Parses the ``测评配置`` tab; collects every problem and raises one GoldenSheetError naming the cells."""
+    """Parses the ``Eval_Config`` (or legacy ``测评配置``) tab; collects every problem and raises one GoldenSheetError naming the cells."""
     errors: list[str] = []
     sections: dict[str, list[tuple[int, list[str]]]] = {}
     current = ""
@@ -154,24 +233,29 @@ def parse_config(rows: Sequence[Sequence[Any]], tab: str = CONFIG_TAB) -> Golden
             continue
         marker = re.fullmatch(r"\[(.+)\]", row[0])
         if marker:
-            current = marker.group(1).strip()
-            if current not in HEADERS:
-                errors.append(f"{tab}!A{r}: 不认识的分区 [{current}]，可用：{', '.join(f'[{k}]' for k in HEADERS)}")
-                current = ""
+            raw_sec = marker.group(1).strip()
+            current = _SECTION_ALIASES.get(raw_sec, "")
+            if not current:
+                errors.append(
+                    f"{tab}!A{r}: Unknown section [{raw_sec}], available: {', '.join(f'[{k}]' for k in HEADERS)}"
+                )
             elif current in sections:
-                errors.append(f"{tab}!A{r}: 分区 [{current}] 出现了两次")
+                errors.append(f"{tab}!A{r}: Duplicate section [{raw_sec}]")
             else:
                 sections[current] = []
                 expect_header = True
             continue
         if not current:
-            errors.append(f"{tab}!A{r}: 这一行不在任何分区里（分区以 [基本设置] 这样的标记开头）")
+            errors.append(f"{tab}!A{r}: Row is outside any section (sections start with a marker like [{SEC_BASIC}])")
             continue
         if expect_header:
             want = HEADERS[current]
+            legacy_want = LEGACY_HEADERS[current]
             n = 2 if current == SEC_COMPOUND else len(want)
-            if [c for c in row[:n]] != want[:n]:
-                errors.append(f"{tab}!A{r}: [{current}] 的表头应为 {' | '.join(want)}，实际是 {' | '.join(row[:len(want)])}")
+            if [c for c in row[:n]] != want[:n] and [c for c in row[:n]] != legacy_want[:n]:
+                errors.append(
+                    f"{tab}!A{r}: [{current}] header should be {' | '.join(want)}, got {' | '.join(row[:len(want)])}"
+                )
             expect_header = False
             continue
         sections[current].append((r, row))
@@ -179,71 +263,74 @@ def parse_config(rows: Sequence[Sequence[Any]], tab: str = CONFIG_TAB) -> Golden
     cfg = GoldenSheetConfig(name="", label_range="")
     for sec in (SEC_BASIC, SEC_FOLDERS):
         if sec not in sections:
-            errors.append(f"{tab}: 缺少必填分区 [{sec}]")
+            errors.append(f"{tab}: Missing required section [{sec}]")
     basic: dict[str, tuple[int, str]] = {}
     for r, row in sections.get(SEC_BASIC, []):
-        key, val = _cell(row, 0), _cell(row, 1)
-        if key not in BASIC_KEYS:
-            errors.append(f"{tab}!A{r}: [基本设置] 不认识的项目 {key!r}，可用：{', '.join(BASIC_KEYS)}")
+        raw_key, val = _cell(row, 0), _cell(row, 1)
+        key = _BASIC_KEY_ALIASES.get(raw_key, "")
+        if not key:
+            errors.append(f"{tab}!A{r}: [{SEC_BASIC}] Unknown field {raw_key!r}, available: {', '.join(BASIC_KEYS)}")
         elif key in basic:
-            errors.append(f"{tab}!A{r}: [基本设置] 项目 {key} 重复")
+            errors.append(f"{tab}!A{r}: [{SEC_BASIC}] Duplicate field {raw_key}")
         else:
             basic[key] = (r, val)
     name_r, cfg.name = basic.get(KEY_NAME, (0, ""))
     if not cfg.name:
-        errors.append(f"{tab}: [基本设置] 缺少 {KEY_NAME}（例如 golden_v2）")
+        errors.append(f"{tab}: [{SEC_BASIC}] Missing {KEY_NAME} (e.g. golden_v2)")
     elif not _NAME.match(cfg.name):
-        errors.append(f"{tab}!B{name_r}: {KEY_NAME} 只能用字母、数字、点、下划线、横线（收到 {cfg.name!r}）")
+        errors.append(
+            f"{tab}!B{name_r}: {KEY_NAME} may only contain letters, digits, dots, underscores, and hyphens (got {cfg.name!r})"
+        )
     range_r, cfg.label_range = basic.get(KEY_RANGE, (0, ""))
     if not cfg.label_range:
-        errors.append(f"{tab}: [基本设置] 缺少 {KEY_RANGE}（例如 Sheet1!A1:F40）")
+        errors.append(f"{tab}: [{SEC_BASIC}] Missing {KEY_RANGE} (e.g. Sheet1!A1:F40)")
     elif not _RANGE.match(cfg.label_range):
-        errors.append(f"{tab}!B{range_r}: {KEY_RANGE} {cfg.label_range!r} 格式不对，应形如 Sheet1!A1:F40")
-    elif range_tab(cfg.label_range) == tab:
-        errors.append(f"{tab}!B{range_r}: {KEY_RANGE} 不能指向配置页本身")
+        errors.append(f"{tab}!B{range_r}: Invalid {KEY_RANGE} {cfg.label_range!r}; expected e.g. Sheet1!A1:F40")
+    elif range_tab(cfg.label_range) in ({tab} | set(LEGACY_CONFIG_TAB_TITLES)):
+        errors.append(f"{tab}!B{range_r}: {KEY_RANGE} cannot point to the config tab itself")
     exp_r, exp = basic.get(KEY_EXPECTED, (0, ""))
     if exp:
         if exp.isdigit() and int(exp) > 0:
             cfg.expected_rows = int(exp)
         else:
-            errors.append(f"{tab}!B{exp_r}: {KEY_EXPECTED} 应为正整数，收到 {exp!r}")
+            errors.append(f"{tab}!B{exp_r}: {KEY_EXPECTED} must be a positive integer, got {exp!r}")
     cfg.note = basic.get(KEY_NOTE, (0, ""))[1]
     src_r, cfg.source_sheet_id = basic.get(KEY_SOURCE, (0, ""))
     if cfg.source_sheet_id and not _DRIVE_ID.match(cfg.source_sheet_id):
-        errors.append(f"{tab}!B{src_r}: {KEY_SOURCE} 应为表格 ID（不是链接）")
+        errors.append(f"{tab}!B{src_r}: {KEY_SOURCE} must be a spreadsheet ID (not a URL)")
 
     seen_groups: set[str] = set()
     for r, row in sections.get(SEC_FOLDERS, []):
         gid, outlet, focus, fid, cache = (_cell(row, i) for i in range(5))
         missing = [h for h, v in zip(HEADERS[SEC_FOLDERS][:4], (gid, outlet, focus, fid)) if not v]
         if missing:
-            errors.append(f"{tab}!A{r}: [视频文件夹] 缺少 {', '.join(missing)}")
+            errors.append(f"{tab}!A{r}: [{SEC_FOLDERS}] Missing {', '.join(missing)}")
             continue
         if gid in seen_groups:
-            errors.append(f"{tab}!A{r}: [视频文件夹] 分组ID {gid} 重复")
+            errors.append(f"{tab}!A{r}: [{SEC_FOLDERS}] Duplicate Group ID {gid}")
         seen_groups.add(gid)
         if not _DRIVE_ID.match(fid):
-            errors.append(f"{tab}!D{r}: Drive 文件夹 ID {fid!r} 不合法（应为文件夹链接 /folders/ 后面那段 ID）")
+            errors.append(f"{tab}!D{r}: Invalid Drive Folder ID {fid!r} (expected the ID segment after /folders/)")
         cfg.folders.append(FolderConfig(gid, outlet, focus, fid,
                                         [c.strip() for c in cache.split(",") if c.strip()], r))
     if SEC_FOLDERS in sections and not cfg.folders:
-        errors.append(f"{tab}: [视频文件夹] 至少需要一行")
+        errors.append(f"{tab}: [{SEC_FOLDERS}] At least one folder row is required")
 
     for r, row in sections.get(SEC_DEV, []):
         focus, outlet = _cell(row, 0), _cell(row, 1)
         if not focus or not outlet:
-            errors.append(f"{tab}!A{r}: [开发集分组] 稽核重点和门店都要填")
+            errors.append(f"{tab}!A{r}: [{SEC_DEV}] Both Audit Focus and Store are required")
         else:
             cfg.dev_groups.append((focus, outlet))
 
     for r, row in sections.get(SEC_COMPOUND, []):
         num, descs = _cell(row, 0), [c for c in row[1:] if c]
         if not num.isdigit():
-            errors.append(f"{tab}!A{r}: [复合题拆分] 表格行号应为整数，收到 {num!r}")
+            errors.append(f"{tab}!A{r}: [{SEC_COMPOUND}] Sheet Row must be an integer, got {num!r}")
         elif len(descs) < 2:
-            errors.append(f"{tab}!B{r}: [复合题拆分] 第 {num} 行至少要拆成 2 个描述")
+            errors.append(f"{tab}!B{r}: [{SEC_COMPOUND}] Row {num} must split into at least 2 descriptions")
         elif int(num) in cfg.compound:
-            errors.append(f"{tab}!A{r}: [复合题拆分] 表格行号 {num} 重复")
+            errors.append(f"{tab}!A{r}: [{SEC_COMPOUND}] Duplicate Sheet Row {num}")
         else:
             cfg.compound[int(num)] = descs
 
@@ -251,28 +338,28 @@ def parse_config(rows: Sequence[Sequence[Any]], tab: str = CONFIG_TAB) -> Golden
     for r, row in sections.get(SEC_ITEMS, []):
         iid, cat, mode, stable = (_cell(row, i) for i in range(4))
         if not iid:
-            errors.append(f"{tab}!A{r}: [逐题设置] 缺少题号")
+            errors.append(f"{tab}!A{r}: [{SEC_ITEMS}] Missing Item ID")
             continue
         if iid in seen_items:
-            errors.append(f"{tab}!A{r}: [逐题设置] 题号 {iid} 重复")
+            errors.append(f"{tab}!A{r}: [{SEC_ITEMS}] Duplicate Item ID {iid}")
         seen_items.add(iid)
         mode_u = mode.upper()
         if mode_u not in ("", "POINT", "WINDOW"):
-            errors.append(f"{tab}!C{r}: 时间判定模式只能是 POINT、WINDOW 或留空，收到 {mode!r}")
+            errors.append(f"{tab}!C{r}: Temporal Mode must be POINT, WINDOW, or blank, got {mode!r}")
         if stable.lower() not in YES | NO:
-            errors.append(f"{tab}!D{r}: 稳定基线题只能填 是 / 否 或留空，收到 {stable!r}")
+            errors.append(f"{tab}!D{r}: Stable Baseline must be Yes / No or blank, got {stable!r}")
         cfg.items.append(ItemSetting(iid, cat, mode_u, stable.lower() in YES, r))
 
     if errors:
-        raise GoldenSheetError("测评配置页有问题：\n  - " + "\n  - ".join(errors))
+        raise GoldenSheetError("Eval config tab has errors:\n  - " + "\n  - ".join(errors))
     return cfg
 
 
 def render_config_rows(cfg: GoldenSheetConfig) -> list[list[str]]:
-    """The ``测评配置`` tab content for ``cfg`` (inverse of ``parse_config``)."""
+    """The ``Eval_Config`` tab content for ``cfg`` (inverse of ``parse_config``)."""
     rows: list[list[str]] = [
-        ["# 测评配置：评测程序据此把本表的人工标注页转成黄金集。改动标注页或本页后，下次评测自动使用新内容并生成新的黄金集版本。"],
-        ["# 格式说明见代码仓库 eval/data/README.md。空行和以 # 开头的行会被忽略。"],
+        ["# Eval Config: the evaluation harness reads this tab to convert the Manual Audit Result sheet into a golden set. Editing the label tab or this tab automatically generates a new golden version on the next eval run."],
+        ["# Format reference: eval/data/README.md. Blank rows and rows starting with # are ignored."],
         [],
         [f"[{SEC_BASIC}]"], HEADERS[SEC_BASIC],
         [KEY_NAME, cfg.name], [KEY_RANGE, cfg.label_range],
@@ -287,10 +374,10 @@ def render_config_rows(cfg: GoldenSheetConfig) -> list[list[str]]:
     rows += [[f.group_id, f.outlet, f.focus, f.folder_id, ",".join(f.cache_job_ids)] for f in cfg.folders]
     rows += [[], [f"[{SEC_DEV}]"], HEADERS[SEC_DEV]] + [[f, o] for f, o in cfg.dev_groups]
     width = max([len(v) for v in cfg.compound.values()] + [2])
-    rows += [[], [f"[{SEC_COMPOUND}]"], ["表格行号"] + [f"拆分描述 {i + 1}" for i in range(width)]]
+    rows += [[], [f"[{SEC_COMPOUND}]"], ["Sheet Row"] + [f"Split Description {i + 1}" for i in range(width)]]
     rows += [[str(k)] + v for k, v in sorted(cfg.compound.items())]
     rows += [[], [f"[{SEC_ITEMS}]"], HEADERS[SEC_ITEMS]]
-    rows += [[it.item_id, it.sop_category, it.temporal_mode, "是" if it.stable_baseline else "否"] for it in cfg.items]
+    rows += [[it.item_id, it.sop_category, it.temporal_mode, "Yes" if it.stable_baseline else "No"] for it in cfg.items]
     return rows
 
 
@@ -298,12 +385,12 @@ def config_from_files(build_cfg: Mapping[str, Any], manifest: Mapping[str, Any],
                       label_range: str, sheet_id: str) -> GoldenSheetConfig:
     """Renders a build config + manifest (the file-based golden definition) into a config-tab model."""
     if build_cfg.get("item_fields"):
-        raise GoldenSheetError("build config 里的 item_fields 请改写到 [逐题设置]（会进入 manifest，黄金集版本会变）")
+        raise GoldenSheetError(f"Move item_fields from build config into [{SEC_ITEMS}] (included in manifest and golden version)")
     folders = []
     for i, f in enumerate(manifest.get("folders") or [], 1):
         label = str(f.get("label") or "")
         if " | " not in label:
-            raise GoldenSheetError(f"manifest folder {f.get('group_id')!r} 的 label {label!r} 不是 '门店 | 稽核重点'")
+            raise GoldenSheetError(f"manifest folder {f.get('group_id')!r} label {label!r} is not formatted as 'Store | Audit Focus'")
         outlet, focus = label.split(" | ", 1)
         folders.append(FolderConfig(str(f["group_id"]), outlet, focus, str(f["folder_id"]),
                                     [str(x) for x in f.get("cache_job_ids") or []], i))
@@ -390,8 +477,8 @@ def list_folder_videos(drive: Any, folder_id: str) -> list[dict[str, Any]]:
 def _http_hint(exc: BaseException, what: str) -> str:
     status = getattr(getattr(exc, "resp", None), "status", None)
     if status in (403, 404):
-        return f"{what} 打不开（HTTP {status}）：请把它以「查看者」或以上权限共享给评测使用的 Workspace 身份"
-    return f"{what} 读取失败：{type(exc).__name__}: {exc}"
+        return f"Cannot open {what} (HTTP {status}): please share it with Viewer or higher access to the evaluation Workspace identity"
+    return f"Failed to read {what}: {type(exc).__name__}: {exc}"
 
 
 _FOOTAGE_PREFIX_RE = re.compile(r"(?i)^\s*footage\s*(\d+(?:\s*[&,]\s*\d+)*)\s*[:：]")
@@ -454,7 +541,7 @@ def discover_golden_video_folders(
     known_outlets: set[str] | None = None,
 ) -> tuple[list[FolderConfig], dict[str, list[dict[str, Any]]]]:
     """Recursively discovers all leaf video folders under ``root_folder_id`` (up to depth 4) and lists
-    their videos. Skips ``📁 违规证据切片`` evidence subfolders."""
+    their videos. Skips ``📁 Violation_Evidence_Clips`` / ``📁 违规证据切片`` evidence subfolders."""
     focuses_norm = {f.lower(): f for f in (known_focuses or set()) if f}
     outlets_norm = {o.lower(): o for o in (known_outlets or set()) if o}
 
@@ -483,7 +570,7 @@ def discover_golden_video_folders(
                 if mtype and mtype != "application/vnd.google-apps.folder":
                     continue
                 nm = str(item.get("name") or "").strip()
-                if nm.startswith("📁") or "违规证据切片" in nm:
+                if nm.startswith("📁") or "违规证据切片" in nm or "Violation_Evidence_Clips" in nm:
                     continue
                 subfolders.append({"id": str(item["id"]), "name": nm})
             token = page.get("nextPageToken")
@@ -499,7 +586,7 @@ def discover_golden_video_folders(
             .execute(num_retries=3)
         )
     except Exception as exc:  # noqa: BLE001
-        raise GoldenSheetError(_http_hint(exc, f"黄金集视频目录 {root_folder_id}")) from exc
+        raise GoldenSheetError(_http_hint(exc, f"Golden videos root folder {root_folder_id}")) from exc
 
     root_name = str(root_meta.get("name") or root_folder_id).strip()
     queue: list[tuple[str, list[str]]] = [(root_folder_id, [root_name])]
@@ -516,7 +603,7 @@ def discover_golden_video_folders(
         try:
             vids = list_folder_videos(drive, curr_id)
         except Exception as exc:  # noqa: BLE001
-            raise GoldenSheetError(_http_hint(exc, f"黄金集视频子目录 {curr_id}")) from exc
+            raise GoldenSheetError(_http_hint(exc, f"Golden videos subfolder {curr_id}")) from exc
 
         if vids:
             cleaned_ancestors = [_clean_hierarchy_segment(seg) for seg in path_names]
@@ -570,7 +657,7 @@ def _resolve_missing_filenames_in_rows(
     folders: Sequence[FolderConfig],
     listings: Mapping[str, list[dict[str, Any]]],
 ) -> list[list[str]]:
-    """Fills in Column F (``对应的视频文件名称``) when a human label sheet (such as ``CHAGEE_GolderSet``)
+    """Fills in Column F (``Video Filename``) when a human label sheet (such as ``CHAGEE_GolderSet``)
     has only 5 columns (`Focus`, `Outlet`, `Outlet Name`, `Audit Clause`, `Findings`) by matching
     `(Focus, Outlet Name)` + `Footage N` prefix against the discovered folder listings."""
     folder_by_pair: dict[tuple[str, str], str] = {
@@ -582,7 +669,7 @@ def _resolve_missing_filenames_in_rows(
         padded = list(row) + [""] * max(0, 6 - len(row))
         if idx == 0:
             if not padded[5].strip():
-                padded[5] = "对应的视频文件名称"
+                padded[5] = "Video Filename"
             out_rows.append(padded[:6])
             continue
         finding = padded[4].strip()
@@ -618,8 +705,8 @@ def _load_golden_from_sheet_and_folder(
     sheets: Any,
     drive: Any,
 ) -> GoldenSet:
-    """Builds a ``GoldenSet`` from a Human Labels Google Sheet (``sheet_id``, which does NOT need a
-    ``测评配置`` tab) and a dedicated ``golden_videos_folder_id`` in Google Drive."""
+    """Builds a ``GoldenSet`` from a Human Labels Google Sheet (``sheet_id``, which does NOT need an
+    ``Eval_Config`` tab) and a dedicated ``golden_videos_folder_id`` in Google Drive."""
     try:
         meta = (
             drive.files()
@@ -632,23 +719,24 @@ def _load_golden_from_sheet_and_folder(
             .execute(num_retries=3)
         )
     except Exception as exc:  # noqa: BLE001
-        raise GoldenSheetError(_http_hint(exc, f"人工标注表 {sheet_id}")) from exc
+        raise GoldenSheetError(_http_hint(exc, f"Human labels sheet {sheet_id}")) from exc
 
     tab_titles = [
         str((s.get("properties") or {}).get("title") or "")
         for s in (ss_meta.get("sheets") or [])
     ]
     optional_cfg: GoldenSheetConfig | None = None
-    if CONFIG_TAB in tab_titles:
+    active_config_tab = _resolve_config_tab_title(tab_titles)
+    if active_config_tab in tab_titles:
         try:
             config_rows = (
                 sheets.spreadsheets()
                 .values()
-                .get(spreadsheetId=sheet_id, range=f"'{CONFIG_TAB}'")
+                .get(spreadsheetId=sheet_id, range=f"'{active_config_tab}'")
                 .execute(num_retries=3)
                 .get("values", [])
             )
-            optional_cfg = parse_config(config_rows)
+            optional_cfg = parse_config(config_rows, tab=active_config_tab)
         except Exception:
             optional_cfg = None
 
@@ -668,7 +756,7 @@ def _load_golden_from_sheet_and_folder(
 
     if not label_values:
         for t_title in tab_titles:
-            if t_title == CONFIG_TAB:
+            if t_title in LEGACY_CONFIG_TAB_TITLES:
                 continue
             try:
                 cand_vals = (
@@ -687,7 +775,7 @@ def _load_golden_from_sheet_and_folder(
 
     if not label_values:
         raise GoldenSheetError(
-            f"人工标注表 {sheet_id} 中未找到包含 'Findings'（E列）的标注工作表，请检查表头格式"
+            f"No label worksheet containing 'Findings' in Column E was found in human labels sheet {sheet_id}; please verify the header row"
         )
 
     raw_padded = pad_rows(label_values, 6)
@@ -717,7 +805,7 @@ def _load_golden_from_sheet_and_folder(
     )
     if not discovered_folders:
         raise GoldenSheetError(
-            f"黄金集视频目录 {golden_videos_folder_id} 下未找到任何包含视频的子文件夹，请检查 Golden_Videos_Folder_URL"
+            f"No video subfolders found under golden videos folder {golden_videos_folder_id}; please verify Golden_Videos_Folder_URL"
         )
 
     # Preserve group_id and cache_job_ids from optional_cfg if matching (outlet, focus) exists
@@ -749,10 +837,10 @@ def _load_golden_from_sheet_and_folder(
             prev = filename_index.setdefault(v["filename"], v["file_id"])
             if prev != v["file_id"]:
                 problems.append(
-                    f"视频文件名 {v['filename']!r} 在黄金集视频目录里出现了不止一次（{prev} / {v['file_id']}），标注无法唯一对应"
+                    f"Video filename {v['filename']!r} appears more than once in the golden videos folders ({prev} / {v['file_id']}); labels cannot be uniquely mapped"
                 )
     if problems:
-        raise GoldenSheetError("黄金集视频目录有问题：\n  - " + "\n  - ".join(problems))
+        raise GoldenSheetError("Golden videos folder errors:\n  - " + "\n  - ".join(problems))
 
     dev_groups = (
         list(optional_cfg.dev_groups)
@@ -786,10 +874,10 @@ def _load_golden_from_sheet_and_folder(
         msg = str(exc)
         if "not found in the Drive listing" in msg:
             msg = (
-                "标注里的视频文件名在黄金集视频目录中找不到（必须完全一致，包括空格和括号）：\n  "
+                "Labelled video filename(s) not found in the golden videos folders (must match verbatim, including spaces and parentheses):\n  "
                 + msg.split(":", 1)[1].strip().replace("\n  ", "\n  ")
             )
-        raise GoldenSheetError(f"人工标注页 {label_range} 无法转成黄金集：{msg}") from exc
+        raise GoldenSheetError(f"Human label sheet {label_range} cannot be converted into a golden set: {msg}") from exc
 
     if optional_cfg and optional_cfg.items:
         item_settings = list(optional_cfg.items)
@@ -848,8 +936,8 @@ def load_golden_from_sheet(
     drive: Any,
     golden_videos_folder_id: str = "",
 ) -> GoldenSet:
-    """Reads the label tab (plus ``测评配置`` tab when ``golden_videos_folder_id`` is empty, or discovers
-    folders directly from ``golden_videos_folder_id`` when provided) and returns the GoldenSet."""
+    """Reads the label tab (plus ``Eval_Config`` / ``测评配置`` tab when ``golden_videos_folder_id`` is empty,
+    or discovers folders directly from ``golden_videos_folder_id`` when provided) and returns the GoldenSet."""
     if str(golden_videos_folder_id or "").strip():
         return _load_golden_from_sheet_and_folder(
             sheet_id,
@@ -857,24 +945,41 @@ def load_golden_from_sheet(
             sheets=sheets,
             drive=drive,
         )
+    active_tab = CONFIG_TAB
     try:
         meta = drive.files().get(fileId=sheet_id, fields="name, modifiedTime, version",
                                  supportsAllDrives=True).execute(num_retries=3)
-        config_rows = sheets.spreadsheets().values().get(
-            spreadsheetId=sheet_id, range=f"'{CONFIG_TAB}'").execute(num_retries=3).get("values", [])
+        try:
+            config_rows = sheets.spreadsheets().values().get(
+                spreadsheetId=sheet_id, range=f"'{active_tab}'").execute(num_retries=3).get("values", [])
+        except Exception as first_exc:
+            if "Unable to parse range" in str(first_exc):
+                legacy_tab = next((t for t in LEGACY_CONFIG_TAB_TITLES if t != active_tab), "")
+                if legacy_tab:
+                    try:
+                        config_rows = sheets.spreadsheets().values().get(
+                            spreadsheetId=sheet_id, range=f"'{legacy_tab}'"
+                        ).execute(num_retries=3).get("values", [])
+                        active_tab = legacy_tab
+                    except Exception:
+                        raise first_exc
+                else:
+                    raise
+            else:
+                raise
     except Exception as exc:  # noqa: BLE001 - mapped to an operator message
         text = str(exc)
         if "Unable to parse range" in text:
-            raise GoldenSheetError(f"表格 {sheet_id} 里没有「{CONFIG_TAB}」页：请先运行 "
-                                   f"python -m eval.golden_sheet init-config 或按 eval/data/README.md 手工添加") from exc
-        raise GoldenSheetError(_http_hint(exc, f"标注表 {sheet_id}")) from exc
-    cfg = parse_config(config_rows)
+            raise GoldenSheetError(f"Spreadsheet {sheet_id} does not have an '{CONFIG_TAB}' tab: please run "
+                                   f"python -m eval.golden_sheet init-config first or add it manually per eval/data/README.md") from exc
+        raise GoldenSheetError(_http_hint(exc, f"Label sheet {sheet_id}")) from exc
+    cfg = parse_config(config_rows, tab=active_tab)
     width = range_width(cfg.label_range)
     try:
         label_values = sheets.spreadsheets().values().get(
             spreadsheetId=sheet_id, range=cfg.label_range).execute(num_retries=3).get("values", [])
     except Exception as exc:  # noqa: BLE001
-        raise GoldenSheetError(_http_hint(exc, f"标注页 {cfg.label_range}")) from exc
+        raise GoldenSheetError(_http_hint(exc, f"Label range {cfg.label_range}")) from exc
     values = pad_rows(label_values, width)
 
     listings: dict[str, list[dict[str, Any]]] = {}
@@ -884,16 +989,16 @@ def load_golden_from_sheet(
         try:
             listings[f.folder_id] = list_folder_videos(drive, f.folder_id)
         except Exception as exc:  # noqa: BLE001
-            raise GoldenSheetError(_http_hint(exc, f"视频文件夹 {f.folder_id}（{CONFIG_TAB}!D{f.row}）")) from exc
+            raise GoldenSheetError(_http_hint(exc, f"Video folder {f.folder_id} ({active_tab}!D{f.row})")) from exc
         if not listings[f.folder_id]:
-            problems.append(f"{CONFIG_TAB}!D{f.row}: 文件夹 {f.folder_id} 里没有视频")
+            problems.append(f"{active_tab}!D{f.row}: Folder {f.folder_id} contains no videos")
         for v in listings[f.folder_id]:
             prev = filename_index.setdefault(v["filename"], v["file_id"])
             if prev != v["file_id"]:
-                problems.append(f"视频文件名 {v['filename']!r} 在配置的文件夹里出现了不止一次（{prev} / {v['file_id']}），"
-                                "标注无法唯一对应")
+                problems.append(f"Video filename {v['filename']!r} appears more than once across configured folders ({prev} / {v['file_id']}); "
+                                "labels cannot be uniquely mapped")
     if problems:
-        raise GoldenSheetError("视频文件夹有问题：\n  - " + "\n  - ".join(problems))
+        raise GoldenSheetError("Video folder errors:\n  - " + "\n  - ".join(problems))
 
     try:
         records = build_golden_records(
@@ -903,18 +1008,18 @@ def load_golden_from_sheet(
     except (GoldenBuildError, ValueError) as exc:
         msg = str(exc)
         if "not found in the Drive listing" in msg:
-            msg = ("标注里的视频文件名在配置的文件夹中找不到（必须完全一致，包括空格和括号）：\n  "
+            msg = ("Labelled video filename(s) not found in the configured folders (must match verbatim, including spaces and parentheses):\n  "
                    + msg.split(":", 1)[1].strip().replace("\n  ", "\n  "))
-        raise GoldenSheetError(f"标注页 {cfg.label_range} 无法转成黄金集：{msg}") from exc
+        raise GoldenSheetError(f"Label range {cfg.label_range} cannot be converted into a golden set: {msg}") from exc
     manifest = build_manifest(cfg, listings)
     origin = {
         "type": "google_sheet", "sheet_id": sheet_id, "sheet_name": str(meta.get("name") or ""),
         "sheet_modified_time": str(meta.get("modifiedTime") or ""), "sheet_version": str(meta.get("version") or ""),
-        "label_range": cfg.label_range, "config_tab": CONFIG_TAB,
+        "label_range": cfg.label_range, "config_tab": active_tab,
         "sheet_url": f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit",
     }
     return build_golden(records_to_jsonl(records).encode("utf-8"), manifest, stem=cfg.name,
-                        source=f"sheet:{sheet_id}", manifest_source=f"sheet:{sheet_id}#{CONFIG_TAB}", origin=origin)
+                        source=f"sheet:{sheet_id}", manifest_source=f"sheet:{sheet_id}#{active_tab}", origin=origin)
 
 
 def default_services() -> tuple[Any, Any]:
@@ -935,22 +1040,22 @@ def check_report(golden: GoldenSet) -> str:
     labelled = {fid for it in golden.items for fid in it["video_file_ids"]}
     stable, stable_src = golden.stable_baseline()
     lines = [
-        f"黄金集版本: {golden.version}（{VERSION_SCHEME}：只随评分标尺变化）",
-        f"评分标尺哈希: golden={golden.golden_sha256[:16]} manifest={golden.manifest_sha256[:16] or '-'}",
-        f"全文哈希（审计用）: golden={golden.golden_sha256_full[:16]} manifest={golden.manifest_sha256_full[:16] or '-'}",
-        f"来源: {golden.origin.get('sheet_name', '')} {golden.origin.get('sheet_url', golden.source)}"
-        f"（修改时间 {golden.origin.get('sheet_modified_time', '?')}）",
-        f"题数 {golden.item_count} / 标注点 {golden.part_count} / 划分 {golden.split_counts}",
-        f"稳定基线题: {', '.join(stable) or '未配置'}（{stable_src}）",
-        "视频文件夹:",
+        f"Golden Version: {golden.version} ({VERSION_SCHEME}: changes only with scoring ruler)",
+        f"Scoring Ruler Hash: golden={golden.golden_sha256[:16]} manifest={golden.manifest_sha256[:16] or '-'}",
+        f"Full-Content Hash (Audit): golden={golden.golden_sha256_full[:16]} manifest={golden.manifest_sha256_full[:16] or '-'}",
+        f"Source: {golden.origin.get('sheet_name', '')} {golden.origin.get('sheet_url', golden.source)}"
+        f" (modified {golden.origin.get('sheet_modified_time', '?')})",
+        f"Items {golden.item_count} / Parts {golden.part_count} / Splits {golden.split_counts}",
+        f"Stable Baseline Items: {', '.join(stable) or 'not configured'} ({stable_src})",
+        "Video Folders:",
     ]
     total = 0
     for s in derive_folder_specs(golden):
         n_lab = sum(1 for v in s["videos"] if v["file_id"] in labelled)
         total += len(s["videos"])
-        lines.append(f"  - {s['group_id']} {s['label']} ({s['folder_id']}): {len(s['videos'])} 段视频，"
-                     f"其中 {n_lab} 段有标注、{len(s['videos']) - n_lab} 段无标注；缓存任务 {s['cache_job_ids'] or '无'}")
-    lines.append(f"合计 {total} 段视频")
+        lines.append(f"  - {s['group_id']} {s['label']} ({s['folder_id']}): {len(s['videos'])} videos, "
+                     f"{n_lab} labelled, {len(s['videos']) - n_lab} unlabelled; cache jobs {s['cache_job_ids'] or 'none'}")
+    lines.append(f"Total: {total} videos")
     return "\n".join(lines)
 
 
@@ -965,29 +1070,30 @@ def compare_report(golden: GoldenSet, previous: str) -> str:
     else:
         prev_version, prev_scheme, prev_full = previous.strip(), VERSION_SCHEME, ("", "")
     if not prev_version:
-        return f"对比：{previous} 里没有 golden_version，无法对比"
+        return f"Compare: {previous} has no golden_version; cannot compare"
     if prev_scheme != VERSION_SCHEME:
-        return (f"对比：{previous} 使用旧的版本方案（{prev_scheme or 'legacy'}），版本号不可直接比较；"
-                "请用同一方案下的 score.json 或版本号对比")
+        return (f"Compare: {previous} uses an older version scheme ({prev_scheme or 'legacy'}), so versions are not directly comparable; "
+                "compare against a score.json or version under the same scheme")
     if prev_version != golden.version:
-        return f"对比：评分标尺已变化（{prev_version} → {golden.version}），召回率不能与之前直接比较"
+        return f"Compare: scoring ruler changed ({prev_version} -> {golden.version}); recall cannot be directly compared"
     if prev_full == ("", ""):
-        return f"对比：评分标尺未变（{golden.version}），召回率可比"
+        return f"Compare: scoring ruler unchanged ({golden.version}); recall is comparable"
     if prev_full == (golden.golden_sha256_full, golden.manifest_sha256_full):
-        return f"对比：完全相同（{golden.version}）"
-    return (f"对比：评分标尺未变（{golden.version}），只有非评分字段变化（备注、视频元数据、缓存任务、"
-            "Drive 文件夹 ID 或来源信息），召回率可比")
+        return f"Compare: identical ({golden.version})"
+    return (f"Compare: scoring ruler unchanged ({golden.version}), only non-scoring fields changed (notes, video metadata, cache jobs, "
+            "Drive folder IDs, or provenance); recall is comparable")
 
 
 def init_config_plan(*, existing_titles: Sequence[str], rows: list[list[str]], overwrite: bool) -> dict[str, Any]:
-    """What ``init-config`` will send: only the ``测评配置`` tab is ever created / cleared / written."""
-    exists = CONFIG_TAB in existing_titles
+    """What ``init-config`` will send: only the ``Eval_Config`` (or existing ``测评配置``) tab is ever created / cleared / written."""
+    target_tab = _resolve_config_tab_title(existing_titles)
+    exists = target_tab in existing_titles
     if exists and not overwrite:
-        raise GoldenSheetError(f"表格里已经有「{CONFIG_TAB}」页；确认要覆盖请加 --overwrite（只会改这一页）")
+        raise GoldenSheetError(f"Spreadsheet already has a '{target_tab}' tab; pass --overwrite to replace it (only this tab is modified)")
     return {
-        "add_sheet": None if exists else {"requests": [{"addSheet": {"properties": {"title": CONFIG_TAB}}}]},
-        "clear_range": f"'{CONFIG_TAB}'" if exists else None,
-        "update": {"range": f"'{CONFIG_TAB}'!A1", "valueInputOption": "RAW", "body": {"values": rows}},
+        "add_sheet": None if exists else {"requests": [{"addSheet": {"properties": {"title": target_tab}}}]},
+        "clear_range": f"'{target_tab}'" if exists else None,
+        "update": {"range": f"'{target_tab}'!A1", "valueInputOption": "RAW", "body": {"values": rows}},
     }
 
 
@@ -1036,7 +1142,7 @@ def main(argv: Sequence[str] | None = None, services: Callable[[], tuple[Any, An
                 print(json.dumps({"existing_tabs": titles, **plan}, ensure_ascii=False, indent=2))
                 return 0
             apply_init_config(sheets, args.sheet_id, plan)
-            print(f"已写入「{CONFIG_TAB}」页（{len(rows)} 行）；其他页未改动。下一步：python -m eval.golden_sheet check "
+            print(f"Wrote '{CONFIG_TAB}' tab ({len(rows)} rows); other tabs untouched. Next step: python -m eval.golden_sheet check "
                   f"--sheet-id {args.sheet_id}")
             return 0
         sheets, drive = (services or default_services)()
@@ -1046,7 +1152,7 @@ def main(argv: Sequence[str] | None = None, services: Callable[[], tuple[Any, An
             print(compare_report(golden, args.compare))
         return 0
     except GoldenSetError as exc:
-        print(f"问题：{exc}", file=sys.stderr)
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
 
 

@@ -232,9 +232,9 @@ class _RefreshFails:
         (
             "unauthorized_client: Client is unauthorized to retrieve access tokens using this method, "
             "or client not authorized for any of the scopes requested.",
-            "域级委派尚未生效",
+            "Domain-Wide Delegation (DWD) is not yet active",
         ),
-        ("invalid_grant: Invalid email or User ID", "无法使用"),
+        ("invalid_grant: Invalid email or User ID", "cannot be used"),
         (
             "Unable to acquire impersonated credentials {\"error\": {\"status\": \"PERMISSION_DENIED\", "
             "\"message\": \"Permission 'iam.serviceAccounts.signJwt' denied\"}}",
@@ -288,13 +288,13 @@ def test_write_errors_map_to_config_problems(monkeypatch):
 
     missing = gcp._classify_write_error(_http_error(404, "File not found: F1.", "notFound"), "F1")
     assert isinstance(missing, WorkspaceAccessError)
-    assert "F1" in str(missing) and BOT in str(missing) and "编辑者" in str(missing)
+    assert "F1" in str(missing) and BOT in str(missing) and "Editor" in str(missing)
 
     viewer = gcp._classify_write_error(
         _http_error(403, "The user does not have sufficient permissions for this file.", "insufficientFilePermissions"),
         "F1",
     )
-    assert isinstance(viewer, WorkspaceAccessError) and "只有查看权限" in str(viewer)
+    assert isinstance(viewer, WorkspaceAccessError) and "only has Viewer access" in str(viewer)
 
     transient = _http_error(503, "Backend Error", "backendError")
     assert gcp._classify_write_error(transient, "F1") is transient
@@ -303,9 +303,9 @@ def test_write_errors_map_to_config_problems(monkeypatch):
 @pytest.mark.parametrize(
     "meta, dwd, error_type, needle",
     [
-        ({**FOLDER_META_OK, "mimeType": "video/mp4"}, True, WorkspaceAccessError, "不是文件夹"),
-        ({**FOLDER_META_OK, "capabilities": {"canAddChildren": False}}, True, WorkspaceAccessError, "只有查看权限"),
-        (FOLDER_META_OK, False, WorkspaceStorageQuotaError, "服务账号没有云端硬盘空间"),
+        ({**FOLDER_META_OK, "mimeType": "video/mp4"}, True, WorkspaceAccessError, "not a folder"),
+        ({**FOLDER_META_OK, "capabilities": {"canAddChildren": False}}, True, WorkspaceAccessError, "only has Viewer access"),
+        (FOLDER_META_OK, False, WorkspaceStorageQuotaError, "do not have Google Drive storage quota"),
     ],
 )
 def test_folder_check_rejects_unusable_folders(monkeypatch, meta, dwd, error_type, needle):
@@ -366,7 +366,7 @@ def test_unshared_sop_sheet_is_reported_not_silently_ignored(monkeypatch):
     _dwd_mode(monkeypatch)
     drive = _FakeDrive()
     drive.api.handlers["get"] = lambda **kw: _Req(exc=_http_error(404, "File not found: SOP.", "notFound"))
-    with pytest.raises(WorkspaceAccessError, match="SOP 总控表"):
+    with pytest.raises(WorkspaceAccessError, match="Cannot read Master SOP Sheet"):
         asyncio.run(_gateway(drive).check_sheet_readable("SOP123"))
 
 
@@ -380,7 +380,7 @@ def test_xlsx_sop_sheet_is_rejected_with_save_as_google_sheets_hint(monkeypatch)
             "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         }
     )
-    with pytest.raises(WorkspaceAccessError, match="另存为 Google 表格"):
+    with pytest.raises(WorkspaceAccessError, match="Save as Google Sheets"):
         asyncio.run(_gateway(drive).check_sheet_readable("XLSX123"))
 
     drive.api.handlers["get"] = lambda **kw: _Req(
@@ -395,8 +395,8 @@ def test_xlsx_sop_sheet_is_rejected_with_save_as_google_sheets_hint(monkeypatch)
 
 # 3. Report Sheet ownership -------------------------------------------------------------------
 
-TAB1 = "违规事件 3 秒复核台"
-TAB2 = "本次视频 Token 消耗与耗时账单"
+TAB1 = "Tab1_Violation_Review"
+TAB2 = "Tab2_Token_Ledger"
 
 
 def test_report_sheet_reuses_only_this_audits_own_sheet():
@@ -444,8 +444,8 @@ def test_report_sheet_never_writes_into_an_unrelated_spreadsheet():
 def test_fixed_report_sheet_and_evidence_folder_names():
     from cctv_audit.workspace_reporter import EVIDENCE_SUBFOLDER_NAME, REPORT_SHEET_TITLE
 
-    assert EVIDENCE_SUBFOLDER_NAME == "📁 违规证据切片_Evidence"
-    assert REPORT_SHEET_TITLE == "📊 AI稽核报告与Token账单"
+    assert EVIDENCE_SUBFOLDER_NAME == "📁 Evidence_Clips"
+    assert REPORT_SHEET_TITLE == "📊 AI_Audit_Report_and_Token_Ledger"
 
     drive = _FakeDrive()
     drive.api.handlers["list"] = lambda **kw: _Req(
@@ -547,7 +547,7 @@ def test_preflight_rejects_setup_problem_with_zero_tokens(tmp_path):
     assert job.state == JobState.REJECTED
     assert job.preflight_report is not None and job.preflight_report.passed is False
     assert "0 Token" in job.preflight_report.message_to_user
-    assert "服务账号没有云端硬盘空间" in job.preflight_report.message_to_user
+    assert "do not have Google Drive storage quota" in job.preflight_report.message_to_user
     assert gateway.probed == ["FOLDER_A"]
 
 
@@ -632,7 +632,7 @@ def test_sop_sheet_client_reads_via_workspace_identity_with_ttl_cache(monkeypatc
 
         asyncio.run(client.append_available_models("SHEET1", ["gemini-4.0-flash"]))
         append_kw = next(kw for op, kw in fake.log if op == "values.append")
-        assert append_kw["range"] == "'Tab0_版本总控与回滚开关'!A1"
+        assert append_kw["range"] == "'Tab0_Version_Control'!A1"
         assert "gemini-4.0-flash" in append_kw["body"]["values"][0][1]
     finally:
         prompt_manager_module._SHEET_RANGE_CACHE.clear()
@@ -854,9 +854,9 @@ def test_resolve_chat_user_id_and_completion_notification_mention(monkeypatch):
             )
         )
         assert ok is True
-        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> ✅ 门店视频 AI 稽核已完成 (#42e5d3)"
+        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> ✅ Store CCTV AI Audit Completed (#42e5d3)"
         p1_cards_str = json.dumps(posted[-1][1]["cardsV2"], ensure_ascii=False)
-        assert "<b>发起督导</b>：<code>test-1@example.com</code>" in p1_cards_str
+        assert "<b>Initiated By</b>: <code>test-1@example.com</code>" in p1_cards_str
         assert "<users/" not in p1_cards_str
 
         # Verify the remaining 5 notification methods also emit top-level payload["text"] <users/{sub}>
@@ -869,7 +869,7 @@ def test_resolve_chat_user_id_and_completion_notification_mention(monkeypatch):
                 video_count=2,
             )
         ) is True
-        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> 🚀 门店视频 AI 稽核已启动 (#42e5d3)"
+        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> 🚀 Store CCTV AI Audit Started (#42e5d3)"
 
         assert asyncio.run(
             reporter.send_batch_start_notification(
@@ -881,7 +881,7 @@ def test_resolve_chat_user_id_and_completion_notification_mention(monkeypatch):
                 store_summaries=[{"folder_name": "Store_01", "job_id": "j1", "video_count": 2, "state": "RUNNING"}],
             )
         ) is True
-        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> 🚀 定时自动巡检已启动：定时巡检 (RULE-01)"
+        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> 🚀 Scheduled Auto-Audit Started: 定时巡检 (RULE-01)"
 
         assert asyncio.run(
             reporter.send_batch_summary_notification(
@@ -893,7 +893,7 @@ def test_resolve_chat_user_id_and_completion_notification_mention(monkeypatch):
                 store_summaries=[{"folder_name": "Store_01", "job_id": "j1", "video_count": 2, "state": "DONE", "violations_found": 1, "total_tokens": 1000}],
             )
         ) is True
-        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> ✅ 定时巡检已完成：定时巡检 (RULE-01)"
+        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> ✅ Scheduled Auto-Audit Completed: 定时巡检 (RULE-01)"
 
         assert asyncio.run(
             reporter.send_eval_start_notification(
@@ -905,7 +905,7 @@ def test_resolve_chat_user_id_and_completion_notification_mention(monkeypatch):
                 supervisor_email="test-1@example.com",
             )
         ) is True
-        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> 🚀 黄金集评测已启动：基线评测 (EVAL-01)"
+        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> 🚀 Golden-Set Evaluation Started: 基线评测 (EVAL-01)"
 
         assert asyncio.run(
             reporter.send_eval_completion_notification(
@@ -919,7 +919,7 @@ def test_resolve_chat_user_id_and_completion_notification_mention(monkeypatch):
                 summary={"overall_recall": 0.5, "total_tokens": 1000},
             )
         ) is True
-        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> ✅ 黄金集评测已完成：基线评测 (EVAL-01)"
+        assert posted[-1][1]["text"] == "🔔 <users/104120710022716991580> ✅ Golden-Set Evaluation Completed: 基线评测 (EVAL-01)"
 
         # When DWD is absent or fails for an unknown user, falls back gracefully to plain email (no top-level text)
         monkeypatch.delenv("WORKSPACE_DWD_SERVICE_ACCOUNT", raising=False)
@@ -935,7 +935,7 @@ def test_resolve_chat_user_id_and_completion_notification_mention(monkeypatch):
         assert ok2 is True
         assert "text" not in posted[-1][1]
         p2_str = json.dumps(posted[-1][1], ensure_ascii=False)
-        assert "<b>发起督导</b>：<code>other@example.com</code>" in p2_str
+        assert "<b>Initiated By</b>: <code>other@example.com</code>" in p2_str
         assert "<users/" not in p2_str
 
         # When ENABLE_GOOGLE_CHAT_NOTIFICATION=false, send_completion_notification skips posting

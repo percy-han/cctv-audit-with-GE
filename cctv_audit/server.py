@@ -89,6 +89,10 @@ from .config import config
 from .turn import TurnAction, classify_turn_with_llm
 from .video_ingestor import VideoIngestor, VideoMetadataItem, progress_unit_label
 
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 logger = logging.getLogger("cctv_audit.server")
 
 app = FastAPI(title="Chagee CCTV AI Audit Worker (Zero-DB Workspace + Serverless)")
@@ -315,11 +319,13 @@ def build_a2a_agent_card(base_url: str) -> Dict[str, Any]:
     """Builds the A2A Agent Card (`/.well-known/agent-card.json`) for Gemini Enterprise Cloud Run registration."""
     normalized_base = base_url.rstrip("/")
     return {
-        "name": "门店视频稽核",
+        "name": "CHAGEE Store CCTV AI Auditor",
         "description": (
-            "对霸王茶姬 (CHAGEE) 门店监控录像做 APAC 合规稽核。发送 Google Drive 门店监控文件夹链接，"
-            "先执行分辨率与时长预检；回复「确认稽核」后在后台拉取 SOP Sheet 动态规则、逐窗执行多模态稽核、"
-            "截取 [T-2s, T+20s] 22秒证据视频切片并在原文件夹内生成《AI稽核报告与Token账单》。"
+            "Automated SOP compliance auditing for CHAGEE store CCTV footage. Send a Google Drive "
+            "or GCS store CCTV folder link to run a resolution and duration preflight check; reply "
+            "'Confirm and start' to fetch dynamic SOP rules from Google Sheets in the background, "
+            "run window-by-window multimodal auditing, extract [T-2s, T+20s] 22-second video evidence "
+            "clips, and generate the 'AI_Audit_Report_and_Token_Ledger' inside the original folder."
         ),
         "url": f"{normalized_base}/a2a",
         "version": "1.0.0",
@@ -334,13 +340,13 @@ def build_a2a_agent_card(base_url: str) -> Dict[str, Any]:
         "skills": [
             {
                 "id": "chagee-store-cctv-audit",
-                "name": "门店视频稽核",
-                "description": "输入 Google Drive 门店监控视频文件夹链接，执行 SOP 合规预检、启动后台多模态稽核或查询任务进度。",
+                "name": "CHAGEE Store CCTV AI Auditor",
+                "description": "Enter a Google Drive or GCS store CCTV folder link to run an SOP compliance preflight, start a background multimodal audit, or check job progress.",
                 "tags": ["cctv", "chagee", "sop-audit", "video-understanding"],
                 "examples": [
-                    "稽核这个门店监控文件夹：https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000",
-                    "确认，开始稽核",
-                    "刚才那单现在怎么样了？",
+                    "[Full Daily Audit] Please audit store videos: https://drive.google.com/drive/folders/1ExampleTestFolderId0000000000000",
+                    "Confirm and start",
+                    "What is the current progress?",
                 ],
             }
         ],
@@ -355,7 +361,7 @@ async def _handle_conversation_turn(
 ) -> str:
     """Unified turn handler shared by both `POST /api/stream_reasoning_engine` (ADK) and `POST /a2a` (A2A).
 
-    `AuditService.start_audit` raises `ValueError` carrying *supervisor-facing* Chinese guidance
+    `AuditService.start_audit` raises `ValueError` carrying *supervisor-facing* guidance
     (`audit_service.py:L108`, `L112`). Letting it propagate turns that guidance into an HTTP 500
     on the A2A channel, and — worse — into a truncated NDJSON body on the ADK channel, because
     the exception fires after the stream has already begun. It is a reply, not a fault.
@@ -371,7 +377,7 @@ async def _handle_conversation_turn(
         return (
             job.preflight_report.message_to_user
             if job.preflight_report
-            else f"预检单号 `{job.job_id}` 状态：{job.state.value}"
+            else f"Preflight ID `{job.job_id}` status: {job.state.value}"
         )
     if decision.action == TurnAction.CONFIRM:
         start_kwargs: Dict[str, Any] = {
@@ -387,26 +393,26 @@ async def _handle_conversation_turn(
             logger.info("start_audit rejected turn for %s: %s", user_id, exc)
             return f"⚠️ {exc}"
         resume_banner = (
-            f"• **断点续跑恢复**：已从 GCS 恢复前序 `{len(job.completed_segments)}` 个已完成切片（零重复 Token 消耗），从第 `{len(job.completed_segments) + 1}` 段继续执行\n"
+            f"• **Checkpoint Resume**: Restored `{len(job.completed_segments)}` previously completed segments from GCS (zero duplicate token cost), resuming from segment `{len(job.completed_segments) + 1}`\n"
             if len(job.completed_segments) > 0
             else ""
         )
         mode_line = (
-            f"• 🧪 **稽核模式**：专项抽检 / 新 SOP 测试（仅核查 `{job.target_prompt_tab}` 中的 `{','.join(job.audited_rule_ids)}` 条款，不覆盖该视频其他正式 SOP 记录）\n"
+            f"• 🧪 **Audit Mode**: Targeted Spot-Check / New SOP Test (checking only rules `{','.join(job.audited_rule_ids)}` in `{job.target_prompt_tab}`; existing official SOP records for this video are preserved)\n"
             if getattr(job, "target_prompt_tab", "")
-            else "• ✅ **稽核模式**：日常全量稽核（覆盖 `Tab0` 当前生效全部正式 SOP 条款）\n"
+            else "• ✅ **Audit Mode**: Full Daily Audit (covering all active official SOP rules in `Tab0`)\n"
         )
         output_line = (
-            f"• 稽核完成后将在 GCS 目录 `{job.folder_id}/` 内自动生成 `📁 违规证据切片_Evidence/` 与《门店稽核报告与 Token 账单》Excel（`.xlsx`）报告；期间可随时在本对话中询问「进度怎么样了」查看实时进度。"
+            f"• Once completed, `📁 Evidence_Clips/` and the `📊 AI_Audit_Report_and_Token_Ledger.xlsx` Excel report will be generated inside `{job.folder_id}/`; ask 'What is the current progress?' anytime in this chat to check real-time status."
             if is_gcs_target(job.folder_id)
-            else "• 稽核完成后将在您的原 Google Drive 文件夹内自动生成 `📁 违规证据切片_Evidence/` 与《门店稽核报告与 Token 账单 Sheet》；期间可随时在本对话中询问「进度怎么样了」查看实时进度。"
+            else "• Once completed, `📁 Evidence_Clips/` and the `📊 AI_Audit_Report_and_Token_Ledger` Google Sheet will be generated inside your Google Drive folder; ask 'What is the current progress?' anytime in this chat to check real-time status."
         )
         return (
-            f"🚀 **后台 AI 稽核已正式启动（单号 `{job.job_id}`）**\n"
+            f"🚀 **Background AI Audit Started (Job ID `{job.job_id}`)**\n"
             f"{resume_banner}"
             f"{mode_line}"
-            f"• **生效模型版本**：`{job.active_model_version}`\n"
-            f"• **生效提示词版本**：`{job.active_prompt_version}`\n"
+            f"• **Active Model Version**: `{job.active_model_version}`\n"
+            f"• **Active Prompt Version**: `{job.active_prompt_version}`\n"
             f"{output_line}"
         )
     if decision.action == TurnAction.STATUS:
@@ -416,7 +422,7 @@ async def _handle_conversation_turn(
         except TypeError:  # legacy two-argument get_status (tests / older service doubles)
             job = await audit_service.get_status(user_id, target_job_id)
         if job is None:
-            return "您名下暂无正在运行或已完成的稽核任务。"
+            return "You currently have no running or completed audit jobs."
         total_segs = (
             job.preflight_report.planned_segments_count
             if job.preflight_report is not None
@@ -429,51 +435,51 @@ async def _handle_conversation_turn(
         gcs_job = is_gcs_target(job.folder_id)
         if job.state.value == "ready":
             return (
-                f"⏳ **任务 `{job.job_id}` 当前状态：`ready`（预检已通过，待确认启动）**\n"
-                f"• **待稽核规模**：共 `{total_segs}` {unit}（已消耗 `0` Tokens）\n"
-                f"• 尚未启动后台 AI 稽核，请直接回复「**确认开始**」立即启动（单号 `{job.job_id}`）。"
+                f"⏳ **Job `{job.job_id}` Current Status: `ready` (Preflight passed, awaiting confirmation)**\n"
+                f"• **Planned Scope**: `{total_segs}` {unit} (`0` Tokens consumed)\n"
+                f"• Background AI audit has not started yet. Reply '**Confirm and start**' to launch immediately (Job ID `{job.job_id}`)."
             )
         if job.state.value == "done":
             portal_url = build_portal_url(job_id=job.job_id, user_id=job.user_id)
             portal_line = (
-                f"• 🖥️ **HTML 督导复核工作台**：[点击打开复核工作台]({portal_url})\n"
+                f"• 🖥️ **HTML Supervisor Workbench**: [Open Supervisor Workbench]({portal_url})\n"
                 if portal_url
                 else ""
             )
             report_lines = (
                 f"{portal_line}"
-                f"• 📊 **稽核报告（Excel .xlsx）**：{job.report_sheet_url}\n"
-                f"• 📁 **GCS 报告与违规证据切片目录**：[点击打开 Google Cloud Storage 目录]({build_gcs_console_folder_url(job.folder_id)})"
+                f"• 📊 **Audit Report (Excel .xlsx)**: {job.report_sheet_url}\n"
+                f"• 📁 **GCS Report & Evidence Clips Folder**: [Open in Google Cloud Storage]({build_gcs_console_folder_url(job.folder_id)})"
                 if gcs_job
-                else f"{portal_line}• 专属报告 Sheet：{job.report_sheet_url}"
+                else f"{portal_line}• 📊 **Audit Report Google Sheet**: {job.report_sheet_url}"
             )
             return (
-                f"✅ **任务 `{job.job_id}` 已完成！**\n"
-                f"• 已完成：`{done_segs}/{total_segs}` {unit}\n"
-                f"• 检出违规事件：`{job.violations_found}` 项\n"
-                f"• 累计消耗 Token：`{job.total_tokens_used:,}`\n"
+                f"✅ **Job `{job.job_id}` Completed!**\n"
+                f"• Completed: `{done_segs}/{total_segs}` {unit}\n"
+                f"• Violations Found: `{job.violations_found}`\n"
+                f"• Total Tokens Used: `{job.total_tokens_used:,}`\n"
                 f"{report_lines}"
             )
         if job.state.value == "failed":
             if job.needs_operator_fix:
-                where = "GCS 存储桶权限或配置" if gcs_job else "Google Drive 权限或配置"
+                where = "GCS bucket permissions or configuration" if gcs_job else "Google Drive permissions or configuration"
                 return (
-                    f"⚠️ **任务 `{job.job_id}` 暂停：{where}需要处理（已完成 `{done_segs}/{total_segs}` {unit}）**\n"
-                    f"• 需要处理：{job.error_message or '未知配置问题'}\n"
-                    "• 处理好之后回复「**确认开始**」即可继续，已完成的部分不会重复消耗 Token。"
+                    f"⚠️ **Job `{job.job_id}` Paused: {where} requires attention (`{done_segs}/{total_segs}` {unit} completed)**\n"
+                    f"• Action Required: {job.error_message or 'Unknown configuration issue'}\n"
+                    "• Once resolved, reply '**Confirm and start**' to resume; completed segments will not consume duplicate Tokens."
                 )
             return (
-                f"⚠️ **任务 `{job.job_id}` 执行遇到异常（已完成 `{done_segs}/{total_segs}` {unit}）**\n"
-                f"• 异常详情：`{job.error_message or '未知错误'}`\n"
-                f"• 已完成的 `{done_segs}` {unit}结果已安全保存在 GCS，您可以直接回复「**确认开始**」从断点处零重复 Token 续跑。"
+                f"⚠️ **Job `{job.job_id}` Encountered an Error (`{done_segs}/{total_segs}` {unit} completed)**\n"
+                f"• Error Details: `{job.error_message or 'Unknown error'}`\n"
+                f"• Results for `{done_segs}` completed {unit} are safely checkpointed in GCS. Reply '**Confirm and start**' to resume from the checkpoint with zero duplicate Token cost."
             )
         return (
-            f"⏳ **任务 `{job.job_id}` 当前状态：`{job.state.value}`**\n"
-            f"• **稽核进度**：已完成 `{done_segs}/{total_segs}` {unit}（已消耗 `{job.total_tokens_used:,}` Tokens）\n"
-            f"• **自动续跑次数**：`{job.resume_count}` 次"
+            f"⏳ **Job `{job.job_id}` Current Status: `{job.state.value}`**\n"
+            f"• **Audit Progress**: `{done_segs}/{total_segs}` {unit} completed (`{job.total_tokens_used:,}` Tokens used)\n"
+            f"• **Auto-Resume Count**: `{job.resume_count}`"
         )
     return decision.reply_summary or (
-        "请粘贴您的 Google Drive 监控视频文件夹链接，或 GCS 目录（`gs://存储桶/目录` 或 Cloud Console Storage 链接）以启动预检。"
+        "Please paste your Google Drive store CCTV folder link, or GCS directory (`gs://bucket/prefix` or Cloud Console Storage URL) to start the preflight check."
     )
 
 
@@ -682,8 +688,11 @@ async def http_execute(payload: ExecuteRequestPayload, request: Request = None) 
 
 
 _HISTORICAL_URL_RE = re.compile(r"(?:https?|gs)://\S+", re.IGNORECASE)
-# Job IDs this agent printed earlier in the thread ("预检单号 `ae5e72`", "单号 `ae5e72`", "任务 `ae5e72`").
-_JOB_ID_IN_HISTORY_RE = re.compile(r"(?:单号|任务)\s*`([0-9a-f]{6})`")
+# Job IDs this agent printed earlier in the thread ("Preflight ID `ae5e72`", "Job ID `ae5e72`", "Job `ae5e72`", "单号 `ae5e72`", "任务 `ae5e72`").
+_JOB_ID_IN_HISTORY_RE = re.compile(
+    r"(?:Preflight\s*ID|Job\s*ID|Job|Task|单号|任务)[:\s#]*`([0-9a-f]{6})`",
+    re.IGNORECASE,
+)
 _PLACEHOLDER_SESSION_ID = "000000"
 
 
@@ -844,7 +853,7 @@ async def ge_stream_endpoint(request: Request) -> StreamingResponse:
                 reply = turn_task.result()
             except Exception as exc:
                 logger.exception("Unhandled error in ge_stream_endpoint turn for %s", user_id)
-                reply = f"⚠️ 系统处理请求时遇到异常：`{exc}`"
+                reply = f"⚠️ System encountered an error while processing your request: `{exc}`"
             envelope = build_adk_event_envelope(reply, invocation_id, session_id)
             yield (json.dumps(envelope, ensure_ascii=False) + "\n").encode("utf-8")
         finally:
@@ -990,7 +999,7 @@ async def internal_scheduled_tick(request: Request = None) -> Any:  # type: igno
 
 class PortalReviewUpdateItem(BaseModel):
     incident_id: str = Field(description="Composite primary key of the incident row")
-    status: str = Field(default="待复核", description="Supervisor review decision")
+    status: str = Field(default="PENDING", description="Supervisor review decision")
     note: str = Field(default="", description="Optional supervisor review note")
 
 
@@ -1052,19 +1061,19 @@ async def supervisor_portal_page(request: Request) -> HTMLResponse:
     except PermissionError as exc:
         return HTMLResponse(
             content=(
-                "<!DOCTYPE html><html lang='zh-CN'><head><meta charset='UTF-8'><title>访问受限</title></head>"
+                "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><title>Access Restricted</title></head>"
                 "<body style='font-family:sans-serif;padding:48px;background:#FBF8F3;color:#1C1613;'>"
-                f"<h2>🔒 督导复核工作台访问受限 (403)</h2><p>{exc}</p>"
-                "<p>请从最新的 Google Chat 通知卡片中点击按钮重新打开。</p></body></html>"
+                f"<h2>🔒 Supervisor Audit Workbench Access Restricted (403)</h2><p>{exc}</p>"
+                "<p>Please reopen from the latest Google Chat notification card button.</p></body></html>"
             ),
             status_code=403,
         )
     except LookupError as exc:
         return HTMLResponse(
             content=(
-                "<!DOCTYPE html><html lang='zh-CN'><head><meta charset='UTF-8'><title>未找到任务</title></head>"
+                "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><title>Not Found</title></head>"
                 "<body style='font-family:sans-serif;padding:48px;background:#FBF8F3;color:#1C1613;'>"
-                f"<h2>🔍 未找到稽核任务或批次 (404)</h2><p>{exc}</p></body></html>"
+                f"<h2>🔍 Audit Job or Batch Not Found (404)</h2><p>{exc}</p></body></html>"
             ),
             status_code=404,
         )

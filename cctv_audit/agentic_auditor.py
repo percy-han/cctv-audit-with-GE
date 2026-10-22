@@ -74,21 +74,90 @@ class Severity(str, Enum):
     NONE = "NONE"
 
 
+def _normalize_timestamp_status(value: object) -> str:
+    """Normalizes timestamp calibration status (English or legacy Chinese) to canonical English."""
+    raw = str(value or "").strip()
+    upper = raw.upper()
+    if upper in ("OSD_EXACT", "EXACT") or "精确" in raw:
+        return "OSD_EXACT"
+    if upper in ("OSD_INTERPOLATED", "INTERPOLATED") or "插值" in raw or "推算" in raw:
+        return "OSD_INTERPOLATED"
+    if upper in ("UNVERIFIED_REL_TIME", "REL_TIME", "RELATIVE") or "相对时间" in raw or "无OSD" in raw or "未校验" in raw:
+        return "UNVERIFIED_REL_TIME"
+    return "OSD_EXACT" if raw else "UNVERIFIED_REL_TIME"
+
+
+def _normalize_severity(value: object) -> str:
+    """Normalizes severity label (English or legacy Chinese) to canonical English ('CRITICAL' / 'MEDIUM' / 'NONE')."""
+    if isinstance(value, Severity):
+        if value == Severity.RED_LINE:
+            return "CRITICAL"
+        if value == Severity.NORMAL:
+            return "MEDIUM"
+        return "NONE"
+    raw = str(value or "").strip()
+    upper = raw.upper()
+    if upper in ("RED_LINE", "HIGH", "CRITICAL", "SEVERE") or raw in ("红线", "高危", "严重"):
+        return "CRITICAL"
+    if upper in ("NORMAL", "MEDIUM", "LOW", "WARNING", "MINOR", "COMMON_DEVIATION") or raw in ("一般", "普通", "中等", "中", "低"):
+        return "MEDIUM"
+    return "NONE"
+
+
+def _normalize_confidence(value: object) -> str:
+    """Normalizes confidence label/score (English or legacy Chinese) to canonical English ('HIGH' / 'MEDIUM' / 'LOW')."""
+    if isinstance(value, (int, float)):
+        if float(value) >= 0.8:
+            return "HIGH"
+        if float(value) >= 0.5:
+            return "MEDIUM"
+        return "LOW"
+    raw = str(value or "").strip()
+    upper = raw.upper()
+    if upper in ("HIGH", "CONFIRMED") or raw in ("高", "高置信度"):
+        return "HIGH"
+    if upper in ("MEDIUM", "MED", "MODERATE", "SUSPECTED") or raw in ("中", "中等"):
+        return "MEDIUM"
+    if upper in ("LOW", "UNVERIFIED") or raw in ("低", "低置信度"):
+        return "LOW"
+    try:
+        num = float(raw)
+        return _normalize_confidence(num)
+    except ValueError:
+        return "MEDIUM"
+
+
 class Finding(BaseModel):
     """Structured SOP finding with anti-hallucination timestamp & severity normalization."""
 
-    rule_id: str = Field(description="规则编号，如 A1, A2, B1")
-    status: Status = Field(default=Status.COMPLIANT, description="判定状态")
-    disposition: Disposition = Field(default=Disposition.COMPLIANT, description="五级处置标签")
-    confidence: float = Field(default=0.8, ge=0.0, le=1.0, description="置信度 0-1")
-    timestamp_in_clip: str = Field(default="00:00", description="片段内相对时间戳 MM:SS 或 HH:MM:SS")
-    global_offset_sec: float = Field(default=0.0, description="在原始完整长视频中的全局秒数偏移")
-    segment_index: int = Field(default=0, description="所属视频分片序号 (0-based)")
-    on_screen_clock: str = Field(default="", description="监控画面角落（通常在左上角或右上角）OSD水印时间，如 08:07:05")
-    evidence: str = Field(default="", description="客观视觉事实描述（简体中文）")
-    severity: Severity = Field(default=Severity.NONE, description="严重等级")
-    evidence_clip_local_path: Optional[str] = Field(default=None, description="本地5-10秒违规短视频路径")
-    evidence_drive_url: Optional[str] = Field(default=None, description="Google Drive 永久证据视频链接")
+    rule_id: str = Field(description="SOP rule ID, e.g. A1, A2, B1")
+    status: Status = Field(default=Status.COMPLIANT, description="Compliance verdict status")
+    disposition: Disposition = Field(default=Disposition.COMPLIANT, description="Five-tier disposition label")
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0, description="Confidence score between 0.0 and 1.0")
+    timestamp_in_clip: str = Field(default="00:00", description="Relative timestamp within clip (MM:SS or HH:MM:SS)")
+    global_offset_sec: float = Field(default=0.0, description="Global offset in seconds within the full source video")
+    segment_index: int = Field(default=0, description="Zero-based video segment slice index")
+    on_screen_clock: str = Field(default="", description="On-screen display (OSD) clock watermark in video corner (usually top-left or top-right), e.g. 08:07:05")
+    evidence: str = Field(default="", description="Objective visual factual description in English")
+    severity: Severity = Field(default=Severity.NONE, description="Severity tier")
+    evidence_clip_local_path: Optional[str] = Field(default=None, description="Local file path to the 5-10s MP4 evidence video clip")
+    evidence_drive_url: Optional[str] = Field(default=None, description="Permanent Google Drive or GCS link to the evidence video clip")
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _normalise_confidence_score(cls, value: object) -> float:
+        if isinstance(value, (int, float)):
+            return max(0.0, min(1.0, float(value)))
+        raw = str(value or "").strip()
+        try:
+            return max(0.0, min(1.0, float(raw)))
+        except ValueError:
+            label = _normalize_confidence(raw)
+            if label == "HIGH":
+                return 0.9
+            if label == "LOW":
+                return 0.4
+            return 0.7
 
     @field_validator("severity", mode="before")
     @classmethod
@@ -97,18 +166,18 @@ class Finding(BaseModel):
         if isinstance(value, Severity):
             return value
         raw = str(value or "").strip().upper()
-        if raw in ("RED_LINE", "HIGH", "CRITICAL", "SEVERE", "红线"):
+        if raw in ("RED_LINE", "HIGH", "CRITICAL", "SEVERE", "红线", "高危", "严重"):
             return Severity.RED_LINE
-        if raw in ("NORMAL", "MEDIUM", "LOW", "WARNING", "MINOR", "一般"):
+        if raw in ("NORMAL", "MEDIUM", "LOW", "WARNING", "MINOR", "COMMON_DEVIATION", "一般", "普通", "中等", "中", "低"):
             return Severity.NORMAL
         return Severity.NONE
 
     @field_validator("timestamp_in_clip")
     @classmethod
     def _normalise_timestamp(cls, value: str) -> str:
-        """Normalizes MM:SS / HH:MM:SS and handles full-video omission placeholders ('N/A', '全片')."""
+        """Normalizes MM:SS / HH:MM:SS and handles full-video omission placeholders ('N/A', 'FULL_CLIP', '全片')."""
         cleaned = (value or "").strip()
-        if not cleaned or cleaned.upper() in ("N/A", "NA", "NONE", "NULL", "END", "全片", "全程"):
+        if not cleaned or cleaned.upper() in ("N/A", "NA", "NONE", "NULL", "END", "FULL_CLIP", "ENTIRE_CLIP", "全片", "全程"):
             return "00:00"
         match = re.search(r"(\d{1,3}):(\d{2})(?::(\d{2}))?", cleaned)
         if not match:
@@ -333,37 +402,44 @@ class WindowResult(BaseModel):
 
     calibrated_wall_clock_start: str = Field(
         default="",
-        description="Step 0 首帧 CoT 校准的监控画面绝对时间及易混位复核说明 (DD-MM-YYYY HH:MM:SS)",
+        description="Step 0 first-frame CoT calibrated wall-clock timestamp on the CCTV OSD and ambiguous digit verification notes (DD-MM-YYYY HH:MM:SS)",
     )
     people: List[str] = Field(
         default_factory=list,
-        description="Step 1 全员体貌特征与首次/最后出现时间建档列表 (如 员工A-男-短发-出杯位 [08:00:00-08:05:00])",
+        description="Step 1 exhaustive roster of all people observed with appearance traits and first/last seen timestamps (e.g., Staff_A-Male-ShortHair-BarStation [08:00:00-08:05:00])",
     )
     person_trajectories: List[str] = Field(
         default_factory=list,
         description=(
-            "Step 1 & Step 2 逐人独立事件轨迹（事件驱动 + 合并心跳）：必须与 people 列表中的每一位在场人员一一对应，"
-            "按人员逐条独立输出其在本段内的完整时间线（格式：'员工X [工位]: HH:MM:SS(MM:SS) 动作与接触表面 -> ...'；"
-            "连续几分钟无异常的常规操作时段可合并输出如 '10:00:00-10:05:00 [HEARTBEAT] 正常在岗'），"
-            "严禁只记录单一显眼人员而漏记同屏其他人员（注意：文本中请统一使用中文「违规表」，勿书写英文键名）"
+            "Step 1 & Step 2 per-person independent event trajectories (event-driven + merged heartbeats): "
+            "must correspond 1-to-1 with every person in the people list, outputting an independent complete timeline "
+            "for each person in this segment (format: 'Staff_X [Station]: HH:MM:SS(MM:SS) action and contacted surface -> ...'; "
+            "routine anomaly-free spans of several minutes may be merged as '10:00:00-10:05:00 [HEARTBEAT] routine work at station'). "
+            "Never record only a single salient individual while omitting other people on screen."
         ),
     )
     self_check_notes: List[str] = Field(
         default_factory=list,
         description=(
-            "Step 4 漏检自查逐项核对结论（在生成最终违规表前，对照 person_trajectories 逐条回答步骤 4 的自查项，"
-            "重点核查多人同屏时段其他在场人员的手部接触、多步骤工序首尾 3-5 秒及 5 分钟高危监视窗闭环情况，"
-            "并将自查发现的漏检一并列入下方违规数组；注意：文本中请统一使用中文「违规表」，严禁书写英文键名）"
+            "Step 4 missed-detection self-audit item-by-item verification notes (before generating the final findings list, "
+            "answer each Step 4 self-audit item against person_trajectories, checking other on-screen staff hand contacts during "
+            "multi-person intervals, the first 3s / last 5s of multi-step procedures, and 5-minute high-risk monitoring window closures, "
+            "and append any missed violations uncovered during self-audit to the findings array below)."
         ),
     )
     findings: List[Finding] = Field(
         default_factory=list,
-        description="SOP 规则逐项判定结果（汇总主扫描与 Step 4 漏检自查发现的全部 CONFIRMED / SUSPECTED / UNVERIFIED 记录）",
+        description="SOP rule evaluation results combining all CONFIRMED, SUSPECTED, and UNVERIFIED findings from both the primary scan and Step 4 self-audit",
     )
     carryover_state_summary: str = Field(
         default="",
-        description="供下一段切片接力使用的 <=100 字未闭环状态摘要（含本段结尾 OSD 时间及未闭环的跨段计时/污染监视窗/工具药剂状态）",
+        description="<=100-word unclosed state summary for the next video slice (including end-of-slice OSD clock timestamp and any unclosed cross-slice timers, contamination monitoring windows, or tool/chemical states)",
     )
+
+
+SOPFinding = Finding
+WindowAuditPayload = WindowResult
+SegmentAuditOutput = WindowResult
 
 
 class TokenLedgerRow(BaseModel):
@@ -619,18 +695,19 @@ class AgenticAuditor:
         findings + ledger row."""
         t0 = time.monotonic()
         relay_prefix = (
-            f"【前序分段未闭环状态接力摘要（请先核对本段首帧画面角落（通常为左上角或右上角）OSD时间与前序结尾OSD时间是否连续；若同机位且时间连续则继续追踪计时，若跨时段或换机位则忽略）】：{prior_carryover_summary}\n\n"
+            f"[Prior Segment Unclosed State Carryover Summary (First verify whether the first-frame OSD clock in the video corner—usually top-left or top-right—is continuous with the prior segment's ending OSD clock; if same camera angle and continuous within <=5 min, continue tracking timers and states; if across different time periods or camera angles, ignore)]: {prior_carryover_summary}\n\n"
             if prior_carryover_summary
             else ""
         )
         user_prompt = (
-            f"{relay_prefix}请严格依据系统指令对本段门店监控视频（{segment.source_filename} "
-            f"分片 #{segment.segment_index}，偏移 {int(segment.start_offset_sec)}s~{int(segment.end_offset_sec)}s）"
-            f"执行高召回 SOP 合规稽核，并严格按 JSON Schema 字段顺序输出：\n"
-            f"1. 先在 `people` 中穷尽建档所有出现人员，再在 `person_trajectories` 中为每位人员输出一条独立的完整事件轨迹（事件驱动 + 连续常规时段合并心跳），防止多人同屏时被单一显眼人员吸走注意力；\n"
-            f"2. 在 `self_check_notes` 中对照每位人员的轨迹逐条完成 `# 步骤 4：漏检自查`（特别是多人并发同秒回扫与瞬时微动作回扫）；\n"
-            f"3. 在违规表数组中输出主扫描与漏检自查汇总的全部违规/存疑记录（严守「一行为一记录」与多维正交拆行，严禁合并吞并）；\n"
-            f"4. 在 `carryover_state_summary` 中附上本段结尾 OSD 时间及所有尚未闭环的跨段追踪状态/计时起点。"
+            f"{relay_prefix}Strictly follow the system instruction to perform a high-recall SOP compliance audit "
+            f"on this store CCTV video segment ({segment.source_filename} "
+            f"Slice #{segment.segment_index}, offset {int(segment.start_offset_sec)}s~{int(segment.end_offset_sec)}s), "
+            f"and output strictly in the JSON Schema field order in English:\n"
+            f"1. First exhaustively catalog all individuals in `people`, then output an independent complete event trajectory for each person in `person_trajectories` (event-driven + merged heartbeats for routine spans) to prevent attention masking when multiple staff are on screen;\n"
+            f"2. In `self_check_notes`, complete `# Step 4: Missed-Detection Self-Audit` item by item against each person's trajectory (especially same-second multi-person rescan and transient micro-action rescan);\n"
+            f"3. In `findings`, output all violation/suspected/unverified records combined from the primary scan and Step 4 self-audit (strictly enforcing one-action-one-record and multi-dimensional orthogonal row splitting; never merge or swallow companion violations);\n"
+            f"4. In `carryover_state_summary`, attach the end-of-slice OSD clock timestamp and all unclosed cross-slice tracking states or timer start points."
         )
 
         model_name = prompt_cfg.active_model_version

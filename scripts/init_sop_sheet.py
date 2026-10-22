@@ -48,11 +48,144 @@ from xml.sax.saxutils import escape as xml_escape
 
 DEFAULT_SNAPSHOT = Path(__file__).resolve().parent.parent / "sop" / "master_sheet.json"
 DEFAULT_XLSX = Path(__file__).resolve().parent.parent / "sop" / "master_sheet.xlsx"
-TAB0_TITLE = "Tab0_版本总控与回滚开关"
+TAB0_TITLE = "Tab0_Version_Control"
+LEGACY_TAB0_TITLE = "Tab0_版本总控与回滚开关"
+LEGACY_TAB_RENAME_MAP: dict[str, str] = {
+    "Tab0_版本总控与回滚开关": "Tab0_Version_Control",
+    "Prompt_v2.5_V10全量17条标准版": "Prompt_v2.5_Standard",
+    "Prompt_v2.5_归档基准": "Prompt_v2.5_Standard",
+    "Tab2_定时巡检配置表": "Tab2_Scheduled_Jobs",
+    "Tab3_黄金集评测工作台": "Tab3_Golden_Eval",
+    "Tab4_专项测试表": "Tab4_Spot_Check",
+}
 _SHEET_URL_RE = re.compile(r"/spreadsheets/d/([A-Za-z0-9_-]+)")
 _TFVAR_LINE_RE = re.compile(r'^\s*([a-zA-Z0-9_]+)\s*=\s*"([^"]*)"')
 _SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 _CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+
+
+def build_master_sheet_payload() -> dict[str, Any]:
+    """Builds the canonical English Master SOP Sheet payload from `cctv_audit.prompt_manager`."""
+    _import_cctv_audit()
+    from cctv_audit.prompt_manager import (
+        DEFAULT_CHAGEE_V25_RULES,
+        DEFAULT_PROMPT_TAB_TITLE,
+        DEFAULT_TAB3_SAMPLE_ROW,
+        DEFAULT_TAB4_SAMPLE_ROW,
+        EVAL_WORKBENCH_HEADERS,
+        SCHEDULED_RULE_HEADERS,
+        SHEET_RULE_HEADER,
+        TAB0_TITLE as PM_TAB0_TITLE,
+        TAB2_SCHEDULED_TITLE,
+        TAB3_EVAL_TITLE,
+        TAB4_SPOT_CHECK_TITLE,
+        rules_to_sheet_rows,
+    )
+
+    standard_rows = rules_to_sheet_rows(list(DEFAULT_CHAGEE_V25_RULES))
+    return {
+        "_comment": (
+            "Snapshot of the SOP Master Sheet (Layer 2 rules + Tab0 version pointers). "
+            "Load into a Google Sheet with scripts/init_sop_sheet.py. "
+            "Tab0 row 'Active_Prompt_Version' names the rules tab the service reads at run time."
+        ),
+        "source_snapshot_date": "2026-10-21",
+        "tabs": [
+            {
+                "title": PM_TAB0_TITLE,
+                "values": [
+                    ["Config_Key", "Active_Value", "Description", "Candidates"],
+                    [
+                        "Active_Prompt_Version",
+                        DEFAULT_PROMPT_TAB_TITLE,
+                        "Active production SOP rule tab name (0.1s switch & rollback)",
+                        f"{DEFAULT_PROMPT_TAB_TITLE} | Prompt_v2.6_r01 | Prompt_v2.6_r02",
+                    ],
+                    [
+                        "Active_Model_Version",
+                        "gemini-3.8-flash",
+                        "Active production Vertex AI model version (AUTO_LATEST_FLASH prohibited)",
+                        "gemini-3.8-flash | gemini-2.5-flash",
+                    ],
+                    [
+                        "Fallback_Model_Version",
+                        "gemini-3.8-flash",
+                        "Governed fallback model version when primary model probe fails",
+                        "gemini-3.8-flash",
+                    ],
+                ],
+            },
+            {
+                "title": DEFAULT_PROMPT_TAB_TITLE,
+                "values": [row[:] for row in standard_rows],
+            },
+            {
+                "title": "Prompt_v2.6_r01",
+                "values": [row[:] for row in standard_rows],
+            },
+            {
+                "title": "Prompt_v2.6_r02",
+                "values": [row[:] for row in standard_rows],
+            },
+            {
+                "title": TAB2_SCHEDULED_TITLE,
+                "values": [
+                    list(SCHEDULED_RULE_HEADERS),
+                    [
+                        "SCHED-EXAMPLE-DRIVE",
+                        "[Example] Daily Regional Automated Inspection (fill in root folder link and set Enabled to ENABLED to activate)",
+                        "https://drive.google.com/drive/folders/1ExampleRootFolderIdReplaceMe0000",
+                        "18",
+                        "00",
+                        "1",
+                        "auditor@example.com",
+                        "PAUSED",
+                        "Default example (not enabled)",
+                    ],
+                    [
+                        "SCHED-EXAMPLE-GCS",
+                        "[Example] Zero-GWS Bucket Daily Automated Inspection (fill in gs:// root prefix and set Enabled to ENABLED to activate)",
+                        "gs://example-workspace-bucket/stores",
+                        "19",
+                        "00",
+                        "1",
+                        "auditor@example.com",
+                        "PAUSED",
+                        "Default example (not enabled)",
+                    ],
+                ],
+            },
+            {
+                "title": TAB3_EVAL_TITLE,
+                "values": [
+                    list(EVAL_WORKBENCH_HEADERS),
+                    list(DEFAULT_TAB3_SAMPLE_ROW),
+                ],
+            },
+            {
+                "title": TAB4_SPOT_CHECK_TITLE,
+                "values": [
+                    list(SHEET_RULE_HEADER),
+                    list(DEFAULT_TAB4_SAMPLE_ROW),
+                ],
+            },
+        ],
+    }
+
+
+def write_local_artifacts(
+    json_path: Path = DEFAULT_SNAPSHOT,
+    xlsx_path: Path = DEFAULT_XLSX,
+) -> dict[str, Any]:
+    """Writes both `sop/master_sheet.json` and `sop/master_sheet.xlsx` locally from `build_master_sheet_payload()`."""
+    payload = build_master_sheet_payload()
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=1) + "\n",
+        encoding="utf-8",
+    )
+    export_xlsx(payload["tabs"], xlsx_path)
+    return payload
 
 
 def extract_sheet_id(value: str) -> str:
@@ -106,11 +239,12 @@ def load_snapshot(path: Path) -> list[dict[str, Any]]:
     if not isinstance(tabs, list) or not tabs:
         raise ValueError(f"{path}: no 'tabs' list")
     titles = [t.get("title") for t in tabs]
-    if TAB0_TITLE not in titles:
+    tab0_title = next((t for t in (TAB0_TITLE, LEGACY_TAB0_TITLE) if t in titles), None)
+    if tab0_title is None:
         raise ValueError(f"{path}: missing pointer tab {TAB0_TITLE!r}")
     if len(set(titles)) != len(titles):
         raise ValueError(f"{path}: duplicate tab titles")
-    tab0 = next(t for t in tabs if t["title"] == TAB0_TITLE)
+    tab0 = next(t for t in tabs if t["title"] == tab0_title)
     pointers = {row[0]: row[1] for row in tab0["values"][1:] if len(row) >= 2}
     active = pointers.get("Active_Prompt_Version", "")
     if active not in titles:
@@ -121,12 +255,12 @@ def load_snapshot(path: Path) -> list[dict[str, Any]]:
         values = tab.get("values")
         if not isinstance(values, list) or not values or not all(isinstance(r, list) for r in values):
             raise ValueError(f"{path}: tab {tab.get('title')!r} has no row data")
-        if tab["title"] == "Tab3_黄金集评测工作台":
+        if tab["title"] in ("Tab3_Golden_Eval", "Tab3_黄金集评测工作台"):
             if len(values[0]) not in (9, 10):
                 raise ValueError(
                     f"{path}: eval workbench tab {tab['title']!r} must have 9 or 10 columns, got {len(values[0])}"
                 )
-        elif tab["title"] != TAB0_TITLE and len(values[0]) != 9:
+        elif tab["title"] not in (TAB0_TITLE, LEGACY_TAB0_TITLE) and len(values[0]) != 9:
             raise ValueError(f"{path}: rules tab {tab['title']!r} must have 9 columns, got {len(values[0])}")
     return tabs
 
@@ -238,6 +372,26 @@ def _a1_quote(title: str) -> str:
 def write_tabs(service: Any, sheet_id: str, tabs: list[dict[str, Any]], overwrite: bool) -> None:
     meta = service.spreadsheets().get(spreadsheetId=sheet_id, fields="sheets.properties").execute()
     existing = {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta.get("sheets", [])}
+
+    if overwrite:
+        rename_requests: list[dict[str, Any]] = []
+        for old_title, new_title in LEGACY_TAB_RENAME_MAP.items():
+            if old_title in existing and new_title not in existing:
+                sheet_gid = existing.pop(old_title)
+                existing[new_title] = sheet_gid
+                rename_requests.append(
+                    {
+                        "updateSheetProperties": {
+                            "properties": {"sheetId": sheet_gid, "title": new_title},
+                            "fields": "title",
+                        }
+                    }
+                )
+        if rename_requests:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id, body={"requests": rename_requests}
+            ).execute()
+
     clashes = [t["title"] for t in tabs if t["title"] in existing]
     if clashes and not overwrite:
         raise SystemExit(
@@ -441,12 +595,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--snapshot", type=Path, default=DEFAULT_SNAPSHOT, help=f"default: {DEFAULT_SNAPSHOT}")
     parser.add_argument("--export-xlsx", type=Path, default=None, help="Export snapshot to a multi-tab .xlsx file for browser File -> Import (no OAuth needed)")
+    parser.add_argument("--local-only", action="store_true", help="Regenerate sop/master_sheet.json and sop/master_sheet.xlsx locally from prompt_manager constants without calling Google APIs")
     parser.add_argument("--tfvars", type=Path, default=None, help="Optional <env>.tfvars to auto-derive worker service account and workspace_impersonate_user")
     parser.add_argument("--service-account", default="", help="Worker service account email to impersonate via IAM Credentials API (uses plain cloud-platform ADC)")
     parser.add_argument("--impersonate-user", default="", help="Optional Workspace bot email for DWD subject")
     parser.add_argument("--overwrite", action="store_true", help="Clear and rewrite tabs whose titles already exist")
     parser.add_argument("--dry-run", action="store_true", help="Validate the snapshot only; do not call the API")
     args = parser.parse_args(argv)
+
+    if args.local_only:
+        xlsx_target = args.export_xlsx or DEFAULT_XLSX
+        payload = write_local_artifacts(args.snapshot, xlsx_target)
+        tabs = payload["tabs"]
+        print(f"local artifacts written: {args.snapshot}, {xlsx_target} ({[(t['title'], len(t['values']) - 1) for t in tabs]})")
+        return 0
 
     tabs = load_snapshot(args.snapshot)
     print(f"snapshot OK: {[(t['title'], len(t['values']) - 1) for t in tabs]} (rows excl. header)")
@@ -476,7 +638,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"done: {live_uri} (read-back verified)")
         print(f"console: {console_url}")
         print(f"live URI (tracks the latest version): {live_uri}")
-        print("  roll back anytime: Cloud Console -> bucket -> master_sheet.xlsx -> Version history (版本历史记录) -> Restore (恢复)")
+        print("  roll back anytime: Cloud Console -> bucket -> master_sheet.xlsx -> Version history -> Restore")
         if generation:
             print(f"pinned URI (this exact version, immutable): {live_uri}#{generation}")
         print(f'next: set master_prompt_sheet_id = "{live_uri}" in <env>.tfvars and grant the worker service account '
@@ -484,7 +646,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if not args.sheet_id:
-        parser.error("either --sheet-id or --export-xlsx (or --dry-run) is required")
+        parser.error("either --sheet-id or --export-xlsx (or --dry-run / --local-only) is required")
 
     sheet_id = extract_sheet_id(args.sheet_id)
     sa_email, bot_user = resolve_impersonation_targets(args.tfvars, args.service_account, args.impersonate_user)

@@ -79,20 +79,23 @@ class FakeSheets:
 class SpecTest(unittest.TestCase):
     def test_title_pattern_uses_configured_time_zone(self):
         spec = _spec()
-        self.assertEqual(spec.title, "CHAGEE AI稽核测评_r02_r02_run2_20261010-090203")
-        self.assertRegex(spec.title, r"^CHAGEE AI稽核测评_r02_r02_run2_\d{8}-\d{6}$")
-        self.assertEqual(_spec(tz="Etc/UTC").title, "CHAGEE AI稽核测评_r02_r02_run2_20261010-010203")
+        self.assertEqual(spec.title, "CHAGEE_AI_Audit_Eval_r02_r02_run2_20261010-090203")
+        self.assertRegex(spec.title, r"^CHAGEE_AI_Audit_Eval_r02_r02_run2_\d{8}-\d{6}$")
+        self.assertEqual(_spec(tz="Etc/UTC").title, "CHAGEE_AI_Audit_Eval_r02_r02_run2_20261010-010203")
         with self.assertRaises(ValueError):
             _spec(tz="Mars/Olympus")
 
     def test_tabs_and_row_counts(self):
         spec = _spec()
-        self.assertEqual([t.title for t in spec.tables], ["本次测评概览", "本次逐题结果", "历史轮次对比", "历史单跑明细", "本次黄金集快照"])
+        self.assertEqual(
+            [t.title for t in spec.tables],
+            [srp.TAB_OVERVIEW, srp.TAB_ITEMS, srp.TAB_ROUNDS, srp.TAB_RUNS, srp.TAB_GOLDEN],
+        )
         snapshot = spec.tables[4]
         self.assertEqual(len(snapshot.rows) - 1, 21)
         r11b = next(r for r in snapshot.rows if r[1] == "R11b")
-        self.assertEqual(r11b[snapshot.col("标注时间点 (OSD)")], "12:11:00")
-        self.assertEqual(r11b[snapshot.col("SOP 大类来源")], "audit_clause")  # raw golden lines, no manifest
+        self.assertEqual(r11b[snapshot.col("Labelled Timestamp (OSD)")], "12:11:00")
+        self.assertEqual(r11b[snapshot.col("SOP Category Source")], "audit_clause")  # raw golden lines, no manifest
         items = spec.tables[1]
         self.assertEqual(len(items.rows) - 1, 21)  # 19 golden items, 2 of them compound
         rounds = spec.tables[2]
@@ -105,33 +108,33 @@ class SpecTest(unittest.TestCase):
         spec = _spec()
         _, score, record, _ = _fixture()
         overview = {r[0]: r[1] for r in spec.tables[0].rows}
-        self.assertEqual(overview["总体召回率 (19 题)"], score and record["metrics"]["overall_recall"])
-        self.assertAlmostEqual(overview["总体召回率 (19 题)"], score["recall"]["all"]["recall"], places=5)
+        self.assertEqual(overview["Overall Recall (19 items)"], score and record["metrics"]["overall_recall"])
+        self.assertAlmostEqual(overview["Overall Recall (19 items)"], score["recall"]["all"]["recall"], places=5)
         rounds = spec.tables[2]
         r02 = rounds.rows[3]
-        self.assertAlmostEqual(r02[rounds.col("总体召回率")], (0.434211 + 0.421053) / 2, places=5)
+        self.assertAlmostEqual(r02[rounds.col("Overall Recall")], (0.434211 + 0.421053) / 2, places=5)
         items = spec.tables[1]
         r08 = next(r for r in items.rows if r[0] == "R08")
-        self.assertEqual(r08[items.col("本题得分")], 1.0)
-        self.assertIn("F007", r08[items.col("匹配的 AI 告警")])
-        self.assertEqual(r08[items.col("人工标注原文")], "Footage 2: 080530 Soaping time is less than 20s")
+        self.assertEqual(r08[items.col("Part Score")], 1.0)
+        self.assertIn("F007", r08[items.col("Matched AI Findings")])
+        self.assertEqual(r08[items.col("Human Label (Verbatim)")], "Footage 2: 080530 Soaping time is less than 20s")
         r11a = next(r for r in items.rows if r[0] == "R11a")
-        self.assertEqual(r11a[items.col("标注时间点 (OSD)")], "12:10:36")
-        self.assertEqual(overview["Input Token 数 (含动态抽帧)"], record["metrics"]["prompt_token_count"])
-        self.assertEqual(overview["Thinking Token 数"], record["metrics"]["thoughts_token_count"])
-        self.assertEqual(overview["Output Token 数"], record["metrics"]["candidates_token_count"])
+        self.assertEqual(r11a[items.col("Labelled Timestamp (OSD)")], "12:10:36")
+        self.assertEqual(overview["Input Tokens (incl. Agentic Frame Sampling)"], record["metrics"]["prompt_token_count"])
+        self.assertEqual(overview["Thinking Tokens"], record["metrics"]["thoughts_token_count"])
+        self.assertEqual(overview["Output Tokens"], record["metrics"]["candidates_token_count"])
         runs = spec.tables[3]
         r01_row = next(r for r in runs.rows[1:] if r[runs.col("run_id")] == "r01_run1")
-        self.assertAlmostEqual(r01_row[runs.col("单视频平均成本 (USD)")], 0.331525, places=6)
-        self.assertEqual(r01_row[runs.col("Input Token 数")], 6183314)
-        self.assertEqual(r01_row[runs.col("Thinking Token 数")], 114826)
-        self.assertEqual(r01_row[runs.col("Output Token 数")], 63016)
-        self.assertEqual(r01_row[runs.col("总 Token 数")], 6361156)
+        self.assertAlmostEqual(r01_row[runs.col("Mean Cost / Clip (USD)")], 0.331525, places=6)
+        self.assertEqual(r01_row[runs.col("Input Tokens")], 6183314)
+        self.assertEqual(r01_row[runs.col("Thinking Tokens")], 114826)
+        self.assertEqual(r01_row[runs.col("Output Tokens")], 63016)
+        self.assertEqual(r01_row[runs.col("Total Tokens")], 6361156)
 
     def test_percent_values_are_numbers_with_percent_format(self):
         spec = _spec()
         rounds = spec.tables[2]
-        for h in ("总体召回率", "仅 CONFIRMED 召回率", "告警命中率", "A_Handwashing",
+        for h in ("Overall Recall", "CONFIRMED-Only Recall", "Alert Hit Rate", "A_Handwashing",
                   "Bau Cat | Handwashing Monitoring"):
             c = rounds.col(h)
             self.assertEqual(rounds.col_formats[c], srp.PERCENT)
@@ -143,7 +146,7 @@ class SpecTest(unittest.TestCase):
             self.assertNotIn("开发集", flat_text)
             self.assertNotIn("数据集划分", flat_text)
         overview = spec.tables[0]
-        recall_row = next(i for i, r in enumerate(overview.rows) if r[0] == "总体召回率 (19 题)")
+        recall_row = next(i for i, r in enumerate(overview.rows) if r[0] == "Overall Recall (19 items)")
         self.assertIn((recall_row, 1, srp.PERCENT), overview.cell_formats)
         fmt = srp.build_format_requests(spec)
         pct = [r for r in fmt if "repeatCell" in r
@@ -159,7 +162,7 @@ class SpecTest(unittest.TestCase):
             src = chart["domains"][0]["domain"]["sourceRange"]["sources"][0]
             table = tables[src["sheetId"]]
             self.assertEqual(src["startColumnIndex"], 0)
-            self.assertIn(table.rows[0][0], ("轮次", "运行"))
+            self.assertIn(table.rows[0][0], ("Round", "Run"))
             for row in table.rows[1:]:
                 self.assertIsInstance(row[0], str)
                 self.assertIsNone(re.match(r"^\d{4}-\d{2}-\d{2}", row[0]))  # never a date
@@ -202,7 +205,7 @@ class PublishTest(unittest.TestCase):
             body = drive.created[0]["body"]
             self.assertEqual(body["parents"], [FOLDER])
             self.assertEqual(body["mimeType"], "application/vnd.google-apps.spreadsheet")
-            self.assertRegex(body["name"], r"^CHAGEE AI稽核测评_r02_r02_run2_\d{8}-\d{6}$")
+            self.assertRegex(body["name"], r"^CHAGEE_AI_Audit_Eval_r02_r02_run2_\d{8}-\d{6}$")
             self.assertTrue(drive.created[0]["supportsAllDrives"])
             self.assertEqual(sheets.value_updates[0]["valueInputOption"], "RAW")
             charts = [r for r in sheets.batch_updates[-1]["requests"] if "addChart" in r]
