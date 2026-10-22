@@ -113,6 +113,30 @@ def test_classify_turn_populates_target_prompt_tab_and_anti_confusion_fallback()
         assert "Please audit store videos" in d_missing_url.reply_summary
         assert "Tab4_Spot_Check" in d_missing_url.reply_summary
 
+        # Verify truncated JSON resilience in classify_turn_with_llm
+        import cctv_audit.turn as turn_mod
+
+        class _FakeTruncatedResp:
+            parsed = None
+            text = '{"action":"inspect","drive_url":"' + folder_url + '","reply_summary":"Target prompt tab: Tab4_'
+
+        orig_gen = turn_mod.generate_content_with_retry
+
+        async def _fake_gen(**kwargs: Any) -> Any:
+            assert kwargs["gen_config"].max_output_tokens == 512
+            return _FakeTruncatedResp()
+
+        turn_mod.generate_content_with_retry = _fake_gen  # type: ignore[assignment]
+        try:
+            d_recovered = await classify_turn_with_llm(
+                f"[Spot-Check Tab4 Only (Non-Full)] Please audit store videos: {folder_url}"
+            )
+            assert d_recovered.action == TurnAction.INSPECT
+            assert d_recovered.drive_url == folder_url
+            assert d_recovered.target_prompt_tab == TAB4_SPOT_CHECK_TITLE
+        finally:
+            turn_mod.generate_content_with_retry = orig_gen  # type: ignore[assignment]
+
     asyncio.run(_run())
 
 

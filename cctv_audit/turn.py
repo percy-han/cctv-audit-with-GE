@@ -35,6 +35,15 @@ _CANCEL_RE = re.compile(
     r"^\s*(?:cancel|stop|abort|nevermind|never\s+mind|停止|取消)\s*[.!。！]*\s*$",
     re.IGNORECASE,
 )
+_URL_EXTRACT_RE = re.compile(
+    r"(?:https?://(?:drive\.google\.com|docs\.google\.com|console\.cloud\.google\.com/storage)\S+|gs://\S+)",
+    re.IGNORECASE,
+)
+_STATUS_KEYWORD_RE = re.compile(
+    r"(?:\bstatus\b|\bprogress\b|\bdone\b|\bfinished\b|进度|状态|跑完了吗|好了吗|怎么样)",
+    re.IGNORECASE,
+)
+_JOB_ID_EXTRACT_RE = re.compile(r"\b([0-9a-f]{6})\b", re.IGNORECASE)
 
 _SPOT_CHECK_KEYWORDS: tuple[str, ...] = (
     "spot-check",
@@ -105,25 +114,60 @@ class TurnDecision(BaseModel):
     )
     target_prompt_tab: str = Field(
         default="",
-        description=(
-            "Set to 'Tab4_Spot_Check' when the user explicitly requests a targeted spot-check or new SOP test using Tab4_Spot_Check (or legacy Tab4_专项测试表); "
-            "always leave empty '' for a standard full daily audit."
-        ),
+        description="Leave empty '' (populated deterministically from user utterance).",
     )
     reply_summary: str = Field(
         default="",
-        description="A concise one-sentence English summary of the recognized user intent, or a helpful English clarification prompt when action=unclear.",
+        description="A single short English sentence (<20 words) summarizing the recognized user intent without repeating field names.",
     )
 
 
 TURN_CLASSIFIER_SYSTEM_INSTRUCTION = """You are the conversation turn router for the CHAGEE Store CCTV AI Auditor.
 This system enforces a strict two-step controlled workflow and understands both English and Chinese user inputs:
-- Step 1 (`inspect`): The supervisor pastes a Google Drive folder/video link or a GCS directory (`gs://bucket/prefix` or Cloud Console Storage URL). The system runs a fast `<720P` resolution preflight and token estimate. If the user's message explicitly mentions `Tab4`, `Tab4_Spot_Check`, `Spot-Check`, `Tab4_专项测试表`, or `专项抽检`, set `target_prompt_tab` to `"Tab4_Spot_Check"`; otherwise `target_prompt_tab` MUST be an empty string `""` (Full Daily Audit).
+- Step 1 (`inspect`): The supervisor pastes a Google Drive folder/video link or a GCS directory (`gs://bucket/prefix` or Cloud Console Storage URL). The system runs a fast `<720P` resolution preflight.
 - Step 2 (`confirm`): After reviewing the preflight report, the supervisor confirms starting the audit (e.g., "Confirm and start", "confirm", "start", "yes", "go ahead", "proceed", "run", "ok", "okay", "确认开始", "开始", "好的", "开始稽核"). Only then does the system launch background audio stripping, video slicing, and multimodal AI auditing.
 - Check Progress (`status`): The supervisor asks about progress or results (e.g., "What is the current progress?", "Is it done?", "进度如何", "跑完了吗").
-Output your classification strictly following the `TurnDecision` JSON Schema. IMPORTANT: `drive_url` (Drive link or GCS path) must appear character-for-character in the user's input — never fabricate or guess a link! Always write `reply_summary` in English."""
+Output your classification strictly following the `TurnDecision` JSON Schema. IMPORTANT: `drive_url` (Drive link or GCS path) must appear character-for-character in the user's input — never fabricate or guess a link! Keep `reply_summary` under 20 words in English and never repeat text."""
 
 _ROUTER_SYSTEM_INSTRUCTION = TURN_CLASSIFIER_SYSTEM_INSTRUCTION
+
+
+def _fallback_classify_turn(raw_conversation_text: str) -> TurnDecision:
+    """Deterministic fallback classifier used if the LLM router response is truncated or fails validation."""
+    latest = _extract_latest_user_utterance(raw_conversation_text)
+    url_match = _URL_EXTRACT_RE.search(latest)
+    if url_match:
+        url = url_match.group(0).rstrip(".,;)>】」'\"")
+        return verify_url_verbatim(
+            TurnDecision(
+                action=TurnAction.INSPECT,
+                drive_url=url,
+                reply_summary="Running preflight inspection on the provided video folder.",
+            ),
+            raw_conversation_text,
+        )
+    if _APPROVE_RE.match(latest):
+        return TurnDecision(
+            action=TurnAction.CONFIRM,
+            reply_summary="Confirmed starting the audit job.",
+        )
+    job_match = _JOB_ID_EXTRACT_RE.search(latest)
+    job_id = job_match.group(1).lower() if job_match else ""
+    if _STATUS_KEYWORD_RE.search(latest):
+        return TurnDecision(
+            action=TurnAction.STATUS,
+            job_id=job_id,
+            reply_summary="Checking audit job progress.",
+        )
+    agent_handle = f"@{config.agent_display_name}"
+    return TurnDecision(
+        action=TurnAction.UNCLEAR,
+        reply_summary=(
+            "Please provide a Google Drive folder link or GCS directory to inspect and begin the audit process:\n"
+            f"• 💡 **For a Full Daily Audit (all active SOP rules)**, enter: \"`{agent_handle} [Full Daily Audit] Please audit store videos: <video folder link>`\"\n"
+            f"• 🧪 **For a Targeted Spot-Check or New SOP Test**, click `[Spot-Check Tab4 Only (Non-Full)]` (or mention `{TAB4_SPOT_CHECK_TITLE}`) and paste your video folder link."
+        ),
+    )
 
 
 def verify_url_verbatim(decision: TurnDecision, raw_conversation_text: str) -> TurnDecision:
@@ -185,16 +229,26 @@ async def classify_turn_with_llm(
         response_mime_type="application/json",
         response_schema=TurnDecision,
         temperature=0.0,
+        max_output_tokens=512,
         thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
-    resp = await generate_content_with_retry(
-        model=model_name or config.fallback_model_version,
-        contents=[cleaned],
-        gen_config=gen_config,
-    )
-    parsed: TurnDecision = (
-        resp.parsed
-        if getattr(resp, "parsed", None) is not None
-        else TurnDecision.model_validate_json(resp.text)
-    )
-    return verify_url_verbatim(parsed, cleaned)
+    try:
+        resp = await generate_content_with_retry(
+            model=model_name or config.fallback_model_version,
+            contents=[cleaned],
+            gen_config=gen_config,
+            max_attempts=2,
+            timeout_ms=15000,
+        )
+        parsed: TurnDecision = (
+            resp.parsed
+            if getattr(resp, "parsed", None) is not None
+            else TurnDecision.model_validate_json(resp.text)
+        )
+        return verify_url_verbatim(parsed, cleaned)
+    except Exception as exc:
+        logger.warning(
+            "LLM turn router failed or truncated (%s); using deterministic fallback router",
+            exc,
+        )
+        return _fallback_classify_turn(cleaned)
