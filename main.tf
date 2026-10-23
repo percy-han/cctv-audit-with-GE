@@ -2,7 +2,7 @@
 # Enforces CON-003 (Singapore Data Residency), REQ-008 (Multi-User Concurrency), REQ-012/013 (Pure Workspace Stack)
 
 terraform {
-  required_version = ">= 1.7.0" # `removed` block below
+  required_version = ">= 1.9.0" # `removed` blocks; cross-variable validation (portal_allowed_members)
   required_providers {
     google = {
       source  = "hashicorp/google"
@@ -285,6 +285,40 @@ variable "google_chat_webhook_url" {
   }
 }
 
+variable "enable_portal_iap" {
+  description = <<-EOT
+    Serve the supervisor portal (/portal, /api/portal/*) from a dedicated Cloud Run service
+    <p>-portal protected by Cloud Run direct IAP (Google sign-in). Each viewer additionally only sees
+    stores whose report they can open in Google Drive, and every review action is written to
+    gs://<workspace bucket>/audit_logs/reviews/. The public worker then redirects /portal there and
+    refuses the portal APIs. false = legacy behaviour: the worker serves the portal behind the signed
+    link only (no viewer identity). Requires the project to belong to an organization.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "portal_allowed_members" {
+  description = <<-EOT
+    Principals allowed through IAP to the portal (roles/iap.httpsResourceAccessor on <p>-portal),
+    e.g. ["domain:customer.com"] or ["group:store-supervisors@customer.com"]. This only admits the
+    Google sign-in; which stores a person sees is still decided by their Google Drive access.
+    Required (non-empty) when enable_portal_iap = true.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for m in var.portal_allowed_members : can(regex("^(domain|group|user):[^\\s]+$", m))])
+    error_message = "Each portal_allowed_members entry must start with domain:, group: or user: (e.g. \"domain:customer.com\")."
+  }
+
+  validation {
+    condition     = !var.enable_portal_iap || length(var.portal_allowed_members) > 0
+    error_message = "portal_allowed_members must list at least one domain:/group:/user: principal when enable_portal_iap = true."
+  }
+}
+
 locals {
   # Scopes the Workspace super admin authorises for the runtime SA's OAuth client ID
   # (must stay identical to cctv_audit/gcp.py::_WORKSPACE_SCOPES + _CHAT_MENTION_SCOPES).
@@ -303,6 +337,41 @@ locals {
   gcs_sop_uri            = "gs://${local.workspace_bucket_name}/sop/master_sheet.xlsx"
   ge_engine_id           = var.ge_engine_id != "" ? var.ge_engine_id : "${var.name_prefix}-ge"
   re_display_name        = var.reasoning_engine_display_name != "" ? var.reasoning_engine_display_name : "${var.name_prefix}-agent"
+
+  # Supervisor portal service behind Cloud Run direct IAP (Round 86A) and its deterministic URL
+  # ("" when the portal is not split out).
+  portal_service_name = "${var.name_prefix}-portal"
+  portal_url          = var.enable_portal_iap ? "https://${local.portal_service_name}-${data.google_project.current.number}.${var.region}.run.app" : ""
+  # Portal links / redirect target for the worker service and job (empty map = legacy behaviour).
+  worker_portal_env = var.enable_portal_iap ? {
+    PORTAL_SERVICE_URL = local.portal_url
+    PORTAL_BASE_URL    = local.portal_url
+  } : {}
+
+  # Environment of <p>-portal: what the portal needs to read jobs (GCS), report Sheets (DWD) and the
+  # SOP catalog, and to verify the worker's signed links (the HMAC key derives from GCP_PROJECT,
+  # STAGING_BUCKET and MASTER_PROMPT_SHEET_ID, so these must equal the worker's values).
+  portal_env = merge(
+    {
+      GCP_PROJECT                   = var.project_id
+      GCP_LOCATION                  = var.region
+      VERTEX_MODEL_LOCATION         = var.vertex_model_location
+      STAGING_BUCKET                = local.staging_bucket_name
+      MASTER_PROMPT_SHEET_ID        = var.master_prompt_sheet_id
+      GCS_SOP_URI                   = local.gcs_sop_uri
+      AGENT_DISPLAY_NAME            = local.ge_agent_display_name
+      WORKSPACE_DWD_SERVICE_ACCOUNT = data.google_service_account.audit_worker_sa.email
+      PORTAL_MODE                   = "iap"
+      ENABLE_BACKGROUND_WATCHDOG    = "false"
+      ENFORCE_INTERNAL_OIDC_AUTH    = "true"
+      PORTAL_PROJECT_NUMBER         = data.google_project.current.number
+      AUDIT_LOG_BUCKET              = local.workspace_bucket_name
+      PORTAL_BASE_URL               = local.portal_url
+    },
+    var.workspace_impersonate_user == "" ? {} : { WORKSPACE_IMPERSONATE_USER = var.workspace_impersonate_user },
+  )
+  # gcloud --set-env-vars with a custom delimiter (values may contain ',' or '@').
+  portal_env_flag = join("##", [for k in sort(keys(local.portal_env)) : "${k}=${local.portal_env[k]}"])
 
   # "<label> (<company>)", "<label>", "<company>" or, with neither set, the stack name.
   ge_brand = (
@@ -583,6 +652,17 @@ resource "google_cloud_run_v2_service" "cctv_audit_worker" {
         value = "true"
       }
       env {
+        name  = "AUDIT_LOG_BUCKET"
+        value = google_storage_bucket.workspace_bucket.name
+      }
+      dynamic "env" {
+        for_each = local.worker_portal_env
+        content {
+          name  = env.key
+          value = env.value
+        }
+      }
+      env {
         name  = "WORKSPACE_DWD_SERVICE_ACCOUNT"
         value = data.google_service_account.audit_worker_sa.email
       }
@@ -623,7 +703,8 @@ resource "google_cloud_run_v2_service" "cctv_audit_worker" {
   }
 
   # stack_teardown is destroyed (runs destroy-stack) only after this worker on a real destroy.
-  depends_on = [google_project_service.required, terraform_data.stack_teardown]
+  # portal_service: the worker only starts redirecting to <p>-portal once it exists.
+  depends_on = [google_project_service.required, terraform_data.stack_teardown, terraform_data.portal_service]
 }
 
 resource "google_cloud_run_v2_service_iam_member" "ge_discovery_engine_invoker" {
@@ -706,6 +787,17 @@ resource "google_cloud_run_v2_job" "cctv_audit_job_worker" {
         env {
           name  = "ENABLE_BACKGROUND_WATCHDOG"
           value = "false"
+        }
+        env {
+          name  = "AUDIT_LOG_BUCKET"
+          value = google_storage_bucket.workspace_bucket.name
+        }
+        dynamic "env" {
+          for_each = local.worker_portal_env
+          content {
+            name  = env.key
+            value = env.value
+          }
         }
         env {
           name  = "WORKSPACE_DWD_SERVICE_ACCOUNT"
@@ -896,6 +988,91 @@ removed {
   }
 }
 
+# 4c. Supervisor portal behind Cloud Run direct IAP (Round 86A).
+# The GA google provider (6.x) has no `iap_enabled` on google_cloud_run_v2_service, so a managed
+# service resource would let a later apply silently drop IAP. <p>-portal is therefore deployed
+# ONLY by this local-exec (`gcloud run deploy --iap`), re-run whenever the image digest or any
+# portal setting in triggers_replace changes. Deliberately NO destroy-time provisioner (a destroy
+# provisioner on a replaced terraform_data once wiped prod, Round 71b): removing the stack or
+# setting enable_portal_iap = false leaves the portal service in place; delete it with
+# `gcloud run services delete <p>-portal` if it is no longer wanted.
+resource "google_project_service" "iap" {
+  count              = var.enable_portal_iap ? 1 : 0
+  project            = var.project_id
+  service            = "iap.googleapis.com"
+  disable_on_destroy = false
+}
+
+resource "terraform_data" "portal_service" {
+  count = var.enable_portal_iap ? 1 : 0
+
+  triggers_replace = [
+    var.project_id,
+    var.region,
+    var.container_image,
+    local.portal_service_name,
+    data.google_service_account.audit_worker_sa.email,
+    sha256(local.portal_env_flag),
+  ]
+
+  provisioner "local-exec" {
+    interpreter = ["bash", "-c"]
+    environment = {
+      PORTAL_PROJECT = var.project_id
+      PORTAL_REGION  = var.region
+      PORTAL_SERVICE = local.portal_service_name
+      PORTAL_IMAGE   = var.container_image
+      PORTAL_SA      = data.google_service_account.audit_worker_sa.email
+      PORTAL_ENV     = local.portal_env_flag
+      IAP_AGENT      = "serviceAccount:service-${data.google_project.current.number}@gcp-sa-iap.iam.gserviceaccount.com"
+    }
+    command = <<-EOT
+      set -euo pipefail
+      gcloud beta services identity create --service=iap.googleapis.com --project="$PORTAL_PROJECT" --quiet
+      gcloud run deploy "$PORTAL_SERVICE" \
+        --image="$PORTAL_IMAGE" \
+        --region="$PORTAL_REGION" \
+        --project="$PORTAL_PROJECT" \
+        --service-account="$PORTAL_SA" \
+        --no-allow-unauthenticated \
+        --iap \
+        --ingress=all \
+        --min-instances=0 \
+        --max-instances=5 \
+        --cpu=1 \
+        --memory=1Gi \
+        --timeout=300 \
+        --set-env-vars="^##^$PORTAL_ENV" \
+        --quiet
+      gcloud run services add-iam-policy-binding "$PORTAL_SERVICE" \
+        --region="$PORTAL_REGION" \
+        --project="$PORTAL_PROJECT" \
+        --member="$IAP_AGENT" \
+        --role=roles/run.invoker \
+        --quiet
+    EOT
+  }
+
+  depends_on = [
+    google_project_service.required,
+    google_project_service.iap,
+    google_storage_bucket_iam_member.staging_bucket_rw,
+    google_storage_bucket_iam_member.workspace_bucket_rw,
+  ]
+}
+
+# Who may pass IAP to <p>-portal. Store-level visibility is still the viewer's own Drive access.
+resource "google_iap_web_cloud_run_service_iam_member" "portal_accessors" {
+  for_each               = var.enable_portal_iap ? toset(var.portal_allowed_members) : toset([])
+  project                = var.project_id
+  location               = var.region
+  cloud_run_service_name = local.portal_service_name
+  role                   = "roles/iap.httpsResourceAccessor"
+  member                 = each.value
+
+  depends_on = [terraform_data.portal_service]
+}
+
 # 5. Unattended Watchdog (Cloud Scheduler -> POST /internal/jobs/sweep every 2 minutes)
 # Ensures that if a Tier-2 Cloud Run Worker crashes 20+ minutes after the supervisor clicked "确认开始"
 # (when the supervisor has already closed GE chat), Cloud Scheduler automatically sweeps GCS for any
@@ -985,6 +1162,11 @@ output "container_image" {
 output "cloud_run_worker_pool_url" {
   description = "Elastic Cloud Run Worker Pool URL (max_instance_count=20) invoked by ReasoningEngine for heavy FFmpeg slicing and multimodal inference"
   value       = var.enable_standalone_cloud_run ? google_cloud_run_v2_service.cctv_audit_worker[0].uri : null
+}
+
+output "portal_url" {
+  description = "IAP-protected supervisor portal service (<p>-portal); null when enable_portal_iap = false"
+  value       = var.enable_portal_iap ? local.portal_url : null
 }
 
 output "worker_service_account_email" {

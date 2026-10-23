@@ -16,6 +16,7 @@ import math
 import logging
 import os
 import threading
+import time
 from typing import Any, NoReturn, Optional, List, Sequence
 
 from pathlib import Path
@@ -1361,3 +1362,84 @@ class GoogleWorkspaceGateway:
 
         return await loop.run_in_executor(None, _update)
 
+
+
+# ---------------------------------------------------------------------------------------------
+# Portal authorization (Round 86A): can this viewer open this Drive file?
+#
+# Impersonates the *viewer* through the same keyless DWD path as the bot (`drive` scope is already
+# authorised) and asks Drive for the file's id. Drive itself evaluates every share (user, group,
+# domain, shared drive membership), so the portal follows exactly the permissions the store folder
+# owner manages in Drive. Both allow and deny results are cached per (viewer, file) for
+# `VIEWER_DRIVE_ACCESS_TTL_SEC`, so a revoked share takes effect within 5 minutes.
+# ---------------------------------------------------------------------------------------------
+
+VIEWER_DRIVE_ACCESS_TTL_SEC: float = 300.0
+_viewer_drive_cache_lock = threading.Lock()
+_viewer_drive_cache: dict[tuple[str, str], tuple[float, tuple[bool, str]]] = {}
+
+
+def _build_viewer_drive_service(viewer_email: str) -> Any:
+    """Drive v3 client acting as `viewer_email` (keyless DWD). Test seam."""
+    from googleapiclient.discovery import build
+
+    creds = workspace_credentials(impersonate_user=viewer_email)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _clear_viewer_drive_cache() -> None:
+    with _viewer_drive_cache_lock:
+        _viewer_drive_cache.clear()
+
+
+def _viewer_can_open_drive_file_sync(viewer_email: str, file_id: str) -> tuple[bool, str]:
+    try:
+        service = _build_viewer_drive_service(viewer_email)
+        service.files().get(fileId=file_id, fields="id", supportsAllDrives=True).execute(num_retries=2)
+        return True, ""
+    except WorkspaceAuthError as exc:
+        text = str(exc)
+        if "unauthorized_client" in text:
+            reason = (
+                "Your account could not be checked against Google Drive: domain-wide delegation is "
+                "not authorised for this service. Ask the Workspace administrator."
+            )
+        elif "invalid_grant" in text:
+            reason = (
+                f"{viewer_email} is not a user of the Google Workspace domain this service is "
+                "authorised for, so its Google Drive access cannot be verified."
+            )
+        else:
+            reason = f"Google Drive access for {viewer_email} could not be verified: {text}"
+        logger.warning("Viewer Drive check for %s on %s denied: %s", viewer_email, file_id, text)
+        return False, reason
+    except google.auth.exceptions.RefreshError as exc:
+        logger.warning("Viewer Drive check for %s on %s denied (refresh): %s", viewer_email, file_id, exc)
+        return False, f"Google Drive access for {viewer_email} could not be verified: {exc}"
+    except Exception as exc:  # noqa: BLE001 - classified below; never allow on error
+        status = _http_status(exc)
+        if status in (403, 404):
+            return False, f"Google Drive returned HTTP {status} for {viewer_email} on this report."
+        raise
+
+
+async def viewer_can_open_drive_file(viewer_email: str, file_id: str) -> tuple[bool, str]:
+    """(True, "") when `viewer_email` can open Drive file `file_id`; (False, reason) otherwise.
+
+    HTTP 403/404 and DWD refresh errors (`unauthorized_client`, user outside the domain) are
+    denials; other errors (e.g. Drive 5xx) propagate and are not cached.
+    """
+    viewer = (viewer_email or "").strip().lower()
+    fid = (file_id or "").strip()
+    if not viewer or not fid:
+        return False, "Missing viewer identity or Drive file."
+    key = (viewer, fid)
+    now = time.monotonic()
+    with _viewer_drive_cache_lock:
+        cached = _viewer_drive_cache.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+    result = await asyncio.to_thread(_viewer_can_open_drive_file_sync, viewer, fid)
+    with _viewer_drive_cache_lock:
+        _viewer_drive_cache[key] = (time.monotonic() + VIEWER_DRIVE_ACCESS_TTL_SEC, result)
+    return result

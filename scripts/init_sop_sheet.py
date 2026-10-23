@@ -105,7 +105,7 @@ def build_master_sheet_payload() -> dict[str, Any]:
                         "Active_Model_Version",
                         "gemini-3.8-flash",
                         "Active production Vertex AI model version (AUTO_LATEST_FLASH prohibited)",
-                        "gemini-3.8-flash | gemini-4-argon | gemini-2.5-flash",
+                        "gemini-3.8-flash | gemini-2.5-flash",
                     ],
                     [
                         "Fallback_Model_Version",

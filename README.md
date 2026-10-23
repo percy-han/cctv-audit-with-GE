@@ -334,6 +334,13 @@ gcloud iam service-accounts describe <p>-worker@<项目ID>.iam.gserviceaccount.c
      - 边看 20 秒违规证据视频、边对照右侧违反的 SOP 原文；
      - 点击 **`✅ 确认违规`** 或 **`❌ 排除误报`** 并填写整改备注，结果实时同步写回原 Google Sheet 的第 J、K 列；
      - 一键切换到 **「📋 门店 48h 整改通知单」** 页签复制标准整改通知下发店长。
+6. **工作台访问控制与复核审计日志（`enable_portal_iap = true`，默认开启）**：
+   - **谁能打开**：工作台由独立的 Cloud Run 服务 `<p>-portal` 提供，前面挂 **Cloud Run 原生 IAP**，打开链接先走 Google 登录页。只有 tfvars 里 `portal_allowed_members`（如 `["domain:<客户域名>"]` 或 `["group:督导组@<客户域名>"]`）中的账号能通过登录；`enable_portal_iap = true` 时该列表必填。
+   - **能看哪些门店**：登录后再按 **Google Drive 权限** 逐店判断——只有能在 Drive 里打开该门店报告 Sheet（报告未生成时为门店文件夹）的人才能看/复核该门店；批次工作台只显示有权限的门店，一个都没有则 403。取消共享后最多 5 分钟生效。登录账号须属于机器人账号所在的 Workspace 域（靠域委派以该账号身份查 Drive）。gs:// 门店（纯 GCS 模式）没有 Drive 权限可查，只靠 IAP 登录名单把关。
+   - 旧的 `<p>-worker/portal?...` 链接会自动 302 跳到 `<p>-portal`（签名链接本身不变）；worker 上的 `/api/portal/*` 直接 403。`terraform output portal_url` 查看地址。
+   - **审计日志**：每次在工作台改状态/备注，都会**先**往 `gs://<workspace 桶>/audit_logs/reviews/<YYYY>/<MM>/<DD>/<job 或 batch ID>/<UTC 时间>_<8 位随机>.json` 写一条只增不改的记录（`if_generation_match=0`），**写不进去就拒绝修改 Sheet 并返回 500**（没有日志就不改）。字段：`ts_utc`、`reviewer_email`（IAP 验证过的登录邮箱）、`reviewer_source`、`job_id` / `batch_id` / `store_job_id`、`composite_key`、`rule_id` / `video_filename` / `timestamp_in_clip`、`old_status` → `new_status`、`old_note` → `new_note`、`report_sheet_url`、`client_ip`、`user_agent`、`phase`（`requested`；Sheet 写失败时另记 `sheet_write_failed`）。状态和备注都没变的提交不记录。
+   - **已知缺口**：直接在 Google Sheet 里改 J/K 列不会产生审计日志（Sheets 没有回调）。两位稽核员几乎同时改同一条时，后写者日志里的 `old_status` 可能不是最新值（Sheets 不支持条件写入），但两次修改都会各留一条记录、按 `ts_utc` 排序即可还原先后。Drive 权限检查遇到 Google 侧 5xx 时返回 500（不放行、也不误报"无权限"），刷新重试即可。
+   - 关闭（`enable_portal_iap = false`）时恢复旧行为：worker 直接提供工作台，只靠签名链接，无登录身份、无 Drive 权限校验。已部署的 `<p>-portal` 不会被 Terraform 自动删除，如不再需要请手动 `gcloud run services delete <p>-portal`。
 
 ### Zero-GWS / GCS 兜底模式详解（没有 Google Workspace 时）
 

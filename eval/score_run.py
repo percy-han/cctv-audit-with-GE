@@ -241,6 +241,12 @@ def classify_sop_category(item: dict[str, Any]) -> str:
     return sop_category_and_source(item)[0]
 
 
+def judge_location() -> str:
+    """Vertex AI location for the LLM judge (client + judge_model resource path): env
+    ``EVAL_JUDGE_LOCATION``, default ``"global"``."""
+    return os.environ.get("EVAL_JUDGE_LOCATION", "").strip() or "global"
+
+
 JUDGE_TEMPLATE = """You are an expert evaluator for retail tea store CCTV SOP audits. Task: Determine whether the AI audit output captured the following human-labelled violation.
 
 [Human Label (Ground Truth Reference)]
@@ -506,7 +512,7 @@ def _genai_judge_fallback(
     client = genai.Client(
         vertexai=True,
         project=project,
-        location="global",
+        location=judge_location(),
         credentials=credentials,
     )
     out: list[tuple[float | None, str]] = []
@@ -547,11 +553,12 @@ def sdk_judge(cases: list[dict[str, str]], project: str, judge_model: str,
     except ImportError:
         return _genai_judge_fallback(cases, project, judge_model, credentials)
 
-    client = agentplatform.Client(project=project, location="global", credentials=credentials)
+    location = judge_location()
+    client = agentplatform.Client(project=project, location=location, credentials=credentials)
     metric = types.LLMMetric(
         name="label_hit",
         prompt_template=JUDGE_TEMPLATE,
-        judge_model=f"projects/{project}/locations/global/publishers/google/models/{judge_model}",
+        judge_model=f"projects/{project}/locations/{location}/publishers/google/models/{judge_model}",
     )
     ds = types.EvaluationDataset(eval_cases=[
         types.EvalCase(
@@ -939,7 +946,7 @@ render_markdown_report = render_markdown
 def resolve_judge_model(project: str, credentials: Any = None) -> str:
     """Newest Gemini Pro visible in the project, listed live (never hardcoded)."""
     from google import genai
-    gc = genai.Client(vertexai=True, project=project, location="global", credentials=credentials)
+    gc = genai.Client(vertexai=True, project=project, location=judge_location(), credentials=credentials)
     names = [m.name.split("/")[-1] for m in gc.models.list(config={"page_size": 200, "query_base": True})]
     return pick_judge_model(names)
 

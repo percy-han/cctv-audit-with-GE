@@ -25,13 +25,20 @@ Tenant identity (`REQ-008`) precedence, strongest evidence first:
    2. Caller-supplied JSON-RPC `params.metadata` (Gemini Enterprise relays the supervisor here
       when it invokes with its own service-agent credentials).
    3. `X-Goog-Authenticated-User-Id` — opaque but stable; better than a shared bucket.
-   4. `DEFAULT_TENANT_FALLBACK` — logged at WARNING because it merges callers into one bucket.
+   4. `DEFAULT_TENANT_FALLBACK` (env, default `shared-tenant`) — logged at WARNING because it
+      merges callers into one job-store bucket. It is only a tenant key, never a Workspace identity.
+
+Supervisor portal (Round 86A): with `PORTAL_MODE=iap` this same image runs as the dedicated
+`<p>-portal` Cloud Run service behind Cloud Run direct IAP and serves only `/portal`,
+`/api/portal/*` and `/healthz` (everything else 404). On the public worker, a non-empty
+`PORTAL_SERVICE_URL` moves the portal there (302 for the page, 403 for the APIs).
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import os
@@ -42,7 +49,7 @@ from typing import Any, Dict, List, Optional
 
 try:
     from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 except ImportError:  # Graceful fallback when running unit tests without fastapi installed
 
     class Request:  # type: ignore[no-redef]
@@ -65,6 +72,12 @@ except ImportError:  # Graceful fallback when running unit tests without fastapi
             self.content = content
             self.status_code = status_code
             self.media_type = "application/json"
+
+    class RedirectResponse:  # type: ignore[no-redef]
+        def __init__(self, url: str, status_code: int = 307) -> None:
+            self.headers = {"location": url}
+            self.status_code = status_code
+            self.body = b""
 
     class StreamingResponse:  # type: ignore[no-redef]
         def __init__(self, content: Any, media_type: str = "application/x-ndjson") -> None:
@@ -98,6 +111,16 @@ logger = logging.getLogger("cctv_audit.server")
 app = FastAPI(title="Chagee CCTV AI Audit Worker (Zero-DB Workspace + Serverless)")
 
 from .gcs_gateway import RoutingStorageGateway, build_gcs_console_folder_url, is_gcs_target
+from .portal_auth import (
+    IAP_MODE_ALLOWED_PATHS,
+    IapAuthError,
+    authenticate_portal_viewer,
+    client_ip_of,
+    is_iap_mode,
+    portal_service_url,
+    user_agent_of,
+)
+from .review_audit_log import ReviewAuditLogError
 from .portal import (
     apply_portal_reviews,
     build_portal_url,
@@ -115,6 +138,19 @@ audit_service = AuditService(
 
 AUTHOR = "chagee-cctv-audit"
 
+
+async def _iap_mode_route_lockdown(request: Any, call_next: Any) -> Any:
+    """`PORTAL_MODE=iap`: the portal service answers only the portal routes and `/healthz`."""
+    if is_iap_mode():
+        path = str(getattr(getattr(request, "url", None), "path", "") or "")
+        if path not in IAP_MODE_ALLOWED_PATHS and path.rstrip("/") not in IAP_MODE_ALLOWED_PATHS:
+            return JSONResponse(status_code=404, content={"error": "Not Found"})
+    return await call_next(request)
+
+
+if hasattr(app, "middleware"):
+    app.middleware("http")(_iap_mode_route_lockdown)
+
 # --- Tenant identity (REQ-008) -------------------------------------------------------------
 # Cloud Run IAM and IAP strip any client-supplied `X-Goog-Authenticated-User-*` request headers
 # and re-inject them from the verified ID token, so these two headers cannot be forged by the
@@ -123,7 +159,8 @@ AUTHENTICATED_USER_EMAIL_HEADER = "x-goog-authenticated-user-email"
 AUTHENTICATED_USER_ID_HEADER = "x-goog-authenticated-user-id"
 GOOGLE_IDENTITY_PREFIX = "accounts.google.com:"
 SERVICE_PRINCIPAL_SUFFIX = "gserviceaccount.com"
-DEFAULT_TENANT_FALLBACK = "auditor@chagee.com"
+# Job-store tenant key used when no caller identity is available (never a DWD subject).
+DEFAULT_TENANT_FALLBACK = os.environ.get("DEFAULT_TENANT_FALLBACK", "").strip() or "shared-tenant"
 
 # --- A2A JSON-RPC 2.0 ----------------------------------------------------------------------
 # `message/stream` is intentionally absent: `build_a2a_agent_card` declares
@@ -1029,12 +1066,59 @@ def _query_param(request: Any, name: str) -> str:
     return ""
 
 
+_PORTAL_MOVED_ERROR = (
+    "The supervisor portal moved to a Google-login protected address: use the portal URL "
+    "(open the latest link from Google Chat / Gemini Enterprise)."
+)
+
+
+def _portal_redirect_target(request: Any, base_url: str) -> str:
+    url = getattr(request, "url", None)
+    path = str(getattr(url, "path", "") or "/portal")
+    query = str(getattr(url, "query", "") or "")
+    if not query:
+        params = getattr(request, "query_params", None)
+        if params is not None and hasattr(params, "items"):
+            import urllib.parse
+
+            query = urllib.parse.urlencode(list(params.items()))
+    return f"{base_url}{path}" + (f"?{query}" if query else "")
+
+
+def _portal_viewer(request: Any) -> tuple[str, Optional[str]]:
+    """`(viewer_email, error)`. Viewer is '' outside `PORTAL_MODE=iap`; error set => HTTP 401."""
+    if not is_iap_mode():
+        return "", None
+    try:
+        return authenticate_portal_viewer(request), None
+    except IapAuthError as exc:
+        return "", str(exc)
+
+
+def _unauthorized_html(message: str) -> HTMLResponse:
+    return HTMLResponse(
+        content=(
+            "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><title>Sign-in Required</title></head>"
+            "<body style='font-family:sans-serif;padding:48px;background:#FBF8F3;color:#1C1613;'>"
+            f"<h2>🔒 Sign-in Required (401)</h2><p>{html.escape(message)}</p>"
+            "<p>Please open the portal link again and sign in with your Google account.</p></body></html>"
+        ),
+        status_code=401,
+    )
+
+
 @app.get("/portal")
 async def supervisor_portal_page(request: Request) -> HTMLResponse:
     """Serves the interactive HTML Supervisor Audit Portal (`REQ-015`) for either a single-store
     `job` or a multi-store scheduled `batch`, guarded by HMAC-SHA256 signature verification.
     """
     _capture_external_base_url(request)
+    moved_to = "" if is_iap_mode() else portal_service_url()
+    if moved_to:
+        return RedirectResponse(url=_portal_redirect_target(request, moved_to), status_code=302)  # type: ignore[return-value]
+    viewer_email, auth_err = _portal_viewer(request)
+    if auth_err is not None:
+        return _unauthorized_html(auth_err)
     job_id = _query_param(request, "job") or _query_param(request, "job_id")
     batch_id = _query_param(request, "batch") or _query_param(request, "batch_id")
     store_job_id = _query_param(request, "store") or _query_param(request, "store_job_id")
@@ -1056,6 +1140,7 @@ async def supervisor_portal_page(request: Request) -> HTMLResponse:
             user_id=user_id,
             exp=exp,
             sig=sig,
+            viewer_email=viewer_email,
         )
         return HTMLResponse(content=render_supervisor_portal_html(payload), status_code=200)
     except PermissionError as exc:
@@ -1063,7 +1148,7 @@ async def supervisor_portal_page(request: Request) -> HTMLResponse:
             content=(
                 "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><title>Access Restricted</title></head>"
                 "<body style='font-family:sans-serif;padding:48px;background:#FBF8F3;color:#1C1613;'>"
-                f"<h2>🔒 Supervisor Audit Workbench Access Restricted (403)</h2><p>{exc}</p>"
+                f"<h2>🔒 Supervisor Audit Workbench Access Restricted (403)</h2><p>{html.escape(str(exc))}</p>"
                 "<p>Please reopen from the latest Google Chat notification card button.</p></body></html>"
             ),
             status_code=403,
@@ -1073,7 +1158,7 @@ async def supervisor_portal_page(request: Request) -> HTMLResponse:
             content=(
                 "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><title>Not Found</title></head>"
                 "<body style='font-family:sans-serif;padding:48px;background:#FBF8F3;color:#1C1613;'>"
-                f"<h2>🔍 Audit Job or Batch Not Found (404)</h2><p>{exc}</p></body></html>"
+                f"<h2>🔍 Audit Job or Batch Not Found (404)</h2><p>{html.escape(str(exc))}</p></body></html>"
             ),
             status_code=404,
         )
@@ -1083,6 +1168,11 @@ async def supervisor_portal_page(request: Request) -> HTMLResponse:
 async def supervisor_portal_data_api(request: Request) -> Any:
     """Returns JSON data for the HTML Supervisor Audit Portal (`REQ-015`)."""
     _capture_external_base_url(request)
+    if not is_iap_mode() and portal_service_url():
+        return JSONResponse(status_code=403, content={"ok": False, "error": _PORTAL_MOVED_ERROR})
+    viewer_email, auth_err = _portal_viewer(request)
+    if auth_err is not None:
+        return JSONResponse(status_code=401, content={"ok": False, "error": auth_err})
     job_id = _query_param(request, "job") or _query_param(request, "job_id")
     batch_id = _query_param(request, "batch") or _query_param(request, "batch_id")
     store_job_id = _query_param(request, "store") or _query_param(request, "store_job_id")
@@ -1104,6 +1194,7 @@ async def supervisor_portal_data_api(request: Request) -> Any:
             user_id=user_id,
             exp=exp,
             sig=sig,
+            viewer_email=viewer_email,
         )
     except PermissionError as exc:
         return JSONResponse(status_code=403, content={"error": str(exc)})
@@ -1119,6 +1210,11 @@ async def supervisor_portal_review_api(
     back to the underlying Google Sheet `Tab 1` (Columns J & K) using composite-key row matching (`[P0-1]`).
     """
     _capture_external_base_url(request)
+    if not is_iap_mode() and portal_service_url():
+        return JSONResponse(status_code=403, content={"ok": False, "error": _PORTAL_MOVED_ERROR})
+    viewer_email, auth_err = _portal_viewer(request)
+    if auth_err is not None:
+        return JSONResponse(status_code=401, content={"ok": False, "error": auth_err})
     eff_items = payload.updates if payload.updates else payload.reviews
     try:
         return await apply_portal_reviews(
@@ -1131,6 +1227,19 @@ async def supervisor_portal_review_api(
             exp=payload.exp,
             sig=payload.sig,
             updates=[r.model_dump() for r in eff_items],
+            viewer_email=viewer_email,
+            iap_mode=is_iap_mode(),
+            client_ip=client_ip_of(request),
+            user_agent=user_agent_of(request),
+        )
+    except ReviewAuditLogError as exc:
+        logger.error("Portal review rejected: audit log write failed: %s", exc)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "error": f"Review NOT saved: the audit log could not be written ({exc}). No change was made.",
+            },
         )
     except PermissionError as exc:
         return JSONResponse(status_code=403, content={"ok": False, "error": str(exc)})
@@ -1158,6 +1267,8 @@ async def _tier1_unattended_watchdog_loop() -> None:
 async def _start_unattended_watchdog() -> None:
     import os
 
+    if is_iap_mode():
+        return  # the IAP portal service never runs audits or sweeps
     if os.environ.get("ENABLE_BACKGROUND_WATCHDOG", "true").lower() in ("1", "true", "yes"):
         asyncio.create_task(_tier1_unattended_watchdog_loop())
 

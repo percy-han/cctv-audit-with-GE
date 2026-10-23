@@ -22,6 +22,8 @@ NEEDS_PRIVATE_DATA = {
     "test_resume_skips_checkpointed_clips_and_matches",
     "test_loop_early_stop_and_variance_confirmation",
     "test_fallen_back_model_is_recorded_as_static_and_supporting_model_as_agentic",
+    "test_default_signatures_reproduce_golden_v1_stable_set",
+    "test_golden_v1_version_unchanged",
 }
 
 

@@ -17,6 +17,7 @@ Provides:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import html
@@ -38,6 +39,15 @@ from .gcs_gateway import (
     is_gcs_target,
 )
 from .jobs import AuditJob
+from .portal_auth import DriveAccessChecker, denied_message, filter_visible_stores, require_store_access
+from .review_audit_log import (
+    PHASE_REQUESTED,
+    PHASE_SHEET_WRITE_FAILED,
+    ReviewAuditLogError,
+    audit_log_bucket,
+    build_review_audit_record,
+    write_review_audit_records,
+)
 
 INITIAL_REVIEW_STATUS: str = "PENDING"
 
@@ -1092,8 +1102,15 @@ async def load_portal_payload(
     store_job_id: str = "",
     exp: int = 0,
     sig: str = "",
+    viewer_email: str = "",
+    drive_checker: Optional[DriveAccessChecker] = None,
 ) -> Dict[str, Any]:
-    """Loads and validates the full JSON payload for `/portal` and `GET /api/portal/data`."""
+    """Loads and validates the full JSON payload for `/portal` and `GET /api/portal/data`.
+
+    `viewer_email` (IAP-verified, `PORTAL_MODE=iap` only) turns on the per-store Google Drive gate:
+    a single-store view is refused (PermissionError -> 403) unless the viewer can open the store's
+    report in Drive; a batch view lists only the stores the viewer can open (none -> 403).
+    """
     if audit_service is not None:
         if job_store is None:
             job_store = getattr(audit_service, "jobs", None)
@@ -1130,15 +1147,47 @@ async def load_portal_payload(
             batch_rec.store_tasks.values(),
             key=lambda x: (x.folder_name, x.job_id),
         )
+        live_jobs: Dict[str, Optional[AuditJob]] = {}
+        for t in sorted_tasks:
+            live_jobs[t.job_id] = await job_store.get(t.user_id, t.job_id)
+        if viewer_email:
+            visibility = await filter_visible_stores(
+                viewer_email,
+                [
+                    (
+                        t.job_id,
+                        (
+                            (live_jobs[t.job_id].report_sheet_url or t.report_sheet_url)  # type: ignore[union-attr]
+                            if live_jobs[t.job_id] is not None
+                            else t.report_sheet_url
+                        )
+                        or "",
+                        t.folder_id,
+                    )
+                    for t in sorted_tasks
+                ],
+                checker=drive_checker,
+            )
+            if store_job_id and store_job_id in batch_rec.store_tasks and not visibility.get(
+                store_job_id, (False, "")
+            )[0]:
+                raise PermissionError(
+                    denied_message(viewer_email, visibility.get(store_job_id, (False, ""))[1])
+                )
+            sorted_tasks = [t for t in sorted_tasks if visibility.get(t.job_id, (False, ""))[0]]
+            if not sorted_tasks:
+                raise PermissionError(
+                    denied_message(viewer_email, "None of the stores in this batch are shared with you.")
+                )
         selected_task = None
         if store_job_id:
-            selected_task = batch_rec.store_tasks.get(store_job_id)
+            selected_task = next((t for t in sorted_tasks if t.job_id == store_job_id), None)
         if selected_task is None and sorted_tasks:
             done_tasks = [t for t in sorted_tasks if t.state.upper() == "DONE"]
             selected_task = done_tasks[0] if done_tasks else sorted_tasks[0]
 
         for t in sorted_tasks:
-            live_job = await job_store.get(t.user_id, t.job_id)
+            live_job = live_jobs.get(t.job_id)
             st_state = (
                 live_job.state.value.upper()
                 if live_job is not None
@@ -1225,6 +1274,13 @@ async def load_portal_payload(
         target_job = await job_store.get_by_job_id(job_id, user_id=user_id)
         if target_job is None:
             raise LookupError(f"Audit job `{job_id}` not found. / 未找到稽核单号 `{job_id}` 的任务记录。")
+        if viewer_email:
+            await require_store_access(
+                viewer_email,
+                target_job.report_sheet_url or "",
+                target_job.folder_id,
+                checker=drive_checker,
+            )
 
     if target_job is None:
         raise LookupError("No store audit job available to display. / 未找到可展示的门店稽核任务。")
@@ -1341,6 +1397,47 @@ async def load_portal_payload(
     }
 
 
+_audit_bucket_warned = False
+
+
+def _warn_audit_bucket_missing_once() -> None:
+    global _audit_bucket_warned
+    if not _audit_bucket_warned:
+        _audit_bucket_warned = True
+        logger.warning(
+            "AUDIT_LOG_BUCKET is not set: portal review actions are NOT being audit-logged "
+            "(acceptable only for local development; Terraform sets it on every deployed service)."
+        )
+
+
+def _compute_review_audit_changes(
+    tab1_rows: Sequence[Sequence[Any]],
+    normalized_updates: List[Dict[str, str]],
+) -> List[Tuple[Dict[str, str], List[Any], str, str, str, str]]:
+    """`(update, row, old_status, new_status, old_note, new_note)` for every update that changes a row.
+
+    Uses the same composite-key matcher as the Sheet write-back, applied update by update on a
+    working copy so repeated edits of one row chain old -> new correctly. No-ops are dropped.
+    """
+    from .gcs_gateway import match_and_apply_tab1_reviews
+
+    working: List[List[Any]] = [list(r) for r in tab1_rows]
+    changes: List[Tuple[Dict[str, str], List[Any], str, str, str, str]] = []
+    for upd in normalized_updates:
+        updated_rows, patches = match_and_apply_tab1_reviews(working, [upd])
+        if not patches:
+            continue
+        idx = patches[0][0] - 2
+        before = [str(c) for c in list(working[idx])[:11]] + [""] * max(0, 11 - len(working[idx]))
+        old_status, old_note = before[9], before[10]
+        new_status, new_note = str(patches[0][1]), str(patches[0][2])
+        working = updated_rows
+        if old_status == new_status and old_note == new_note:
+            continue
+        changes.append((upd, before, old_status, new_status, old_note, new_note))
+    return changes
+
+
 async def apply_portal_reviews(
     *,
     audit_service: Any = None,
@@ -1355,8 +1452,23 @@ async def apply_portal_reviews(
     sig: str = "",
     updates: Optional[List[Dict[str, str]]] = None,
     reviews: Optional[List[Dict[str, str]]] = None,
+    viewer_email: str = "",
+    drive_checker: Optional[DriveAccessChecker] = None,
+    iap_mode: bool = False,
+    client_ip: str = "",
+    user_agent: str = "",
+    audit_writer: Optional[Any] = None,
+    audit_bucket: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Verifies HMAC signature and writes supervisor review decisions + notes to Sheet `Tab 1` Columns J & K."""
+    """Verifies HMAC signature and writes supervisor review decisions + notes to Sheet `Tab 1` Columns J & K.
+
+    Round 86A, fail-closed audit trail: the current J/K values are read first, one append-only GCS
+    record per changed row is written (`phase=requested`), and only then is the Sheet updated. If
+    the audit write fails, `ReviewAuditLogError` propagates (HTTP 500) and the Sheet is untouched.
+    If the Sheet write fails afterwards, `phase=sheet_write_failed` records are written best-effort
+    and the original error is re-raised. In `PORTAL_MODE=iap` (`iap_mode=True`) the reviewer is the
+    IAP-verified `viewer_email`, the Drive gate applies, and a missing `AUDIT_LOG_BUCKET` is an error.
+    """
     if audit_service is not None:
         if job_store is None:
             job_store = getattr(audit_service, "jobs", None)
@@ -1378,6 +1490,7 @@ async def apply_portal_reviews(
         raise PermissionError(err_msg)
 
     target_job: Optional[AuditJob] = None
+    task_sheet_url = ""
     if batch_id:
         from .scheduled_auditor import ScheduledBatchRecord
 
@@ -1390,6 +1503,7 @@ async def apply_portal_reviews(
         task = batch_rec.store_tasks.get(eff_store_job_id)
         if task is None:
             raise LookupError(f"Store job `{eff_store_job_id}` not found in batch `{batch_id}`. / 批次 `{batch_id}` 中未找到门店任务 `{eff_store_job_id}`。")
+        task_sheet_url = task.report_sheet_url or ""
         target_job = await job_store.get(task.user_id, task.job_id)
         if target_job is None and task.report_sheet_url:
             target_job = AuditJob(
@@ -1405,6 +1519,13 @@ async def apply_portal_reviews(
 
     if target_job is None:
         raise LookupError("Audit job record not found. / 未找到对应的稽核任务记录。")
+    if viewer_email:
+        await require_store_access(
+            viewer_email,
+            target_job.report_sheet_url or task_sheet_url,
+            target_job.folder_id,
+            checker=drive_checker,
+        )
     if not target_job.report_sheet_url or gateway is None:
         return {"ok": False, "updated_count": 0, "persisted_to_sheet": False}
 
@@ -1424,17 +1545,82 @@ async def apply_portal_reviews(
             upd_entry["human_review_note"] = str(item["human_review_note"])
         normalized_updates.append(upd_entry)
 
-    updated_count = await gateway.update_report_human_reviews(
-        target_job.folder_id,
-        target_job.report_sheet_url,
-        normalized_updates,
+    # 1. Old values from the rows the composite-key matcher works on.
+    current_tab1, _ = await gateway.read_report_sheet_data(
+        target_job.folder_id, target_job.report_sheet_url
     )
+    changes = _compute_review_audit_changes(current_tab1 or [], normalized_updates)
+    if not changes:
+        return {
+            "ok": True,
+            "updated_count": 0,
+            "persisted_to_sheet": True,
+            "job_id": target_job.job_id,
+            "report_sheet_url": target_job.report_sheet_url,
+            "audit_log_objects": [],
+        }
+
+    reviewer_source = "iap" if iap_mode else "hmac_link"
+    reviewer = (viewer_email or "").strip().lower() if iap_mode else ""
+    store_scope = target_job.job_id if batch_id else ""
+    bucket = audit_bucket if audit_bucket is not None else audit_log_bucket()
+    writer = audit_writer or write_review_audit_records
+
+    def _records(phase: str) -> List[Dict[str, Any]]:
+        return [
+            build_review_audit_record(
+                reviewer_email=reviewer,
+                reviewer_source=reviewer_source,
+                job_id=target_job.job_id,  # type: ignore[union-attr]
+                batch_id=batch_id,
+                store_job_id=store_scope,
+                composite_key=upd["incident_id"],
+                row=row,
+                old_status=old_s,
+                new_status=new_s,
+                old_note=old_n,
+                new_note=new_n,
+                report_sheet_url=target_job.report_sheet_url or "",  # type: ignore[union-attr]
+                client_ip=client_ip,
+                user_agent=user_agent,
+                phase=phase,
+            )
+            for upd, row, old_s, new_s, old_n, new_n in changes
+        ]
+
+    # 2. Audit first: no audit log, no change.
+    audit_objects: List[str] = []
+    if bucket:
+        audit_objects = await asyncio.to_thread(writer, _records(PHASE_REQUESTED), bucket=bucket)
+    elif iap_mode:
+        raise ReviewAuditLogError(
+            "AUDIT_LOG_BUCKET is not configured on the portal service; review not applied."
+        )
+    else:
+        _warn_audit_bucket_missing_once()
+
+    # 3. Sheet write-back of the changed rows only.
+    changed_updates = [upd for upd, *_ in changes]
+    try:
+        updated_count = await gateway.update_report_human_reviews(
+            target_job.folder_id,
+            target_job.report_sheet_url,
+            changed_updates,
+        )
+    except Exception:
+        if bucket:
+            try:
+                await asyncio.to_thread(writer, _records(PHASE_SHEET_WRITE_FAILED), bucket=bucket)
+            except Exception as follow_exc:  # noqa: BLE001 - best effort; keep the original error
+                logger.error("Could not write sheet_write_failed audit records: %s", follow_exc)
+        raise
     return {
         "ok": True,
         "updated_count": updated_count,
         "persisted_to_sheet": True,
         "job_id": target_job.job_id,
         "report_sheet_url": target_job.report_sheet_url,
+        "audit_log_objects": audit_objects,
     }
 
 

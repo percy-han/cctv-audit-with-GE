@@ -36,4 +36,8 @@ workspace_impersonate_user = "<bot-user@customer-domain>" # "" = the worker SA i
 # ge_example_folder_url = "https://drive.google.com/drive/folders/<id>"
 # extra_ge_engine_ids      = []                   # only Gemini Enterprise apps this stack owns
 # enable_google_chat_notification = false
+# Supervisor portal behind Cloud Run IAP (default true; then portal_allowed_members is required).
+# Store visibility is additionally each viewer's own Google Drive access to the store's report.
+# enable_portal_iap      = true
+# portal_allowed_members = ["domain:<customer-domain>"] # or "group:<group@customer-domain>", "user:<email>"
 # google_chat_webhook_url         = "gs://<project-id>-<prefix>-staging/config/google_chat_webhook.txt" # or direct https://chat.googleapis.com/v1/spaces/... URL

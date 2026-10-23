@@ -37,7 +37,7 @@ import google.auth
 import google.auth.transport.requests
 
 DISPLAY_NAME = "CHAGEE Store CCTV AI Auditor"
-DESCRIPTION = "Automated CCTV SOP compliance auditing for CHAGEE stores (24 SOP rules, timestamped video evidence clips, Token ledger & Supervisor Workbench)."
+DESCRIPTION = "Automated CCTV SOP compliance auditing for CHAGEE stores (timestamped video evidence clips, Token ledger & Supervisor Workbench)."
 
 CLASS_METHODS: list[dict[str, Any]] = [
     {
@@ -634,7 +634,7 @@ def ensure_gemini_enterprise_and_bind_agent(
     agent_payload = {
         "displayName": agent_display_name,
         "description": (
-            f"Automated CCTV SOP compliance auditing for {brand_label}stores (24 SOP rules, timestamped video evidence clips, Token ledger & Supervisor Workbench). "
+            f"Automated CCTV SOP compliance auditing for {brand_label}stores (timestamped video evidence clips, Token ledger & Supervisor Workbench). "
             f"To use, mention @{agent_display_name} in Gemini Enterprise (or select this Agent in the sidebar): "
             "for a full SOP audit, enter 'Please audit store videos: <Drive/GCS link>'; for targeted SOP spot-checks or new SOP testing, update rules in Tab4_Spot_Check first, "
             "then click the [Spot-Check Tab4 Only (Non-Full)] prompt chip and paste your link."

@@ -26,11 +26,12 @@ DEFAULT_AUTH_ID = os.environ.get("GE_AUTH_ID", "")
 
 # Defaults for --agent-display-name / --agent-description (or GE_AGENT_DISPLAY_NAME /
 # GE_AGENT_DESCRIPTION). Give each stack's agent its own name when several share a project.
-AGENT_DISPLAY_NAME = os.environ.get("GE_AGENT_DISPLAY_NAME", "门店视频稽核")
+# English defaults, kept consistent with deploy/deploy_reasoning_engine.py DISPLAY_NAME / DESCRIPTION.
+AGENT_DISPLAY_NAME = os.environ.get("GE_AGENT_DISPLAY_NAME", "CHAGEE Store CCTV AI Auditor")
 AGENT_DESCRIPTION = os.environ.get(
     "GE_AGENT_DESCRIPTION",
-    "自动读取并切片 Google Drive 门店监控视频，依据动态 Google Sheet SOP 清单执行 Gemini 3.1 Pro "
-    "多模态合规稽核、截取违规证据片段并生成复核报表。",
+    "Automated CCTV SOP compliance auditing for CHAGEE stores (timestamped video evidence clips, "
+    "Token ledger & Supervisor Workbench).",
 )
 
 

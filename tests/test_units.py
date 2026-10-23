@@ -857,6 +857,28 @@ def test_agentic_media_processing_is_set_on_the_video_part() -> None:
     assert not hasattr(plain_part, "media_processing")
 
 
+def test_token_prices_read_env_with_safe_fallback(monkeypatch, caplog) -> None:
+    """Round 86B: INPUT/OUTPUT_COST_PER_MILLION_USD override the defaults; invalid/negative -> default + WARNING."""
+    from cctv_audit.config import AuditConfig
+
+    monkeypatch.delenv("INPUT_COST_PER_MILLION_USD", raising=False)
+    monkeypatch.delenv("OUTPUT_COST_PER_MILLION_USD", raising=False)
+    cfg = AuditConfig()
+    assert (cfg.input_cost_per_million_usd, cfg.output_cost_per_million_usd) == (0.75, 3.75)
+
+    monkeypatch.setenv("INPUT_COST_PER_MILLION_USD", "1.25")
+    monkeypatch.setenv("OUTPUT_COST_PER_MILLION_USD", "0")
+    cfg = AuditConfig()
+    assert (cfg.input_cost_per_million_usd, cfg.output_cost_per_million_usd) == (1.25, 0.0)
+
+    monkeypatch.setenv("INPUT_COST_PER_MILLION_USD", "abc")
+    monkeypatch.setenv("OUTPUT_COST_PER_MILLION_USD", "-1")
+    with caplog.at_level("WARNING", logger="cctv_audit.config"):
+        cfg = AuditConfig()
+    assert (cfg.input_cost_per_million_usd, cfg.output_cost_per_million_usd) == (0.75, 3.75)
+    assert "INPUT_COST_PER_MILLION_USD" in caplog.text and "OUTPUT_COST_PER_MILLION_USD" in caplog.text
+
+
 def test_ledger_counts_tool_use_prompt_tokens_as_input() -> None:
     """TC-016 (Round 49b): agentic video mode bills the frames it pulls in as
     `tool_use_prompt_token_count` (198k-247k per 302 s slice in the Round 49 A/B, vs 9.6k prompt

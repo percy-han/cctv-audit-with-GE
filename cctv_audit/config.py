@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -18,6 +19,25 @@ _SHEET_URL_PATTERN = re.compile(r"/spreadsheets/(?:u/\d+/)?d/([a-zA-Z0-9_-]{15,}
 _URL_SHAPED_PATTERN = re.compile(r"://|/")
 # Object suffixes accepted for a GCS-hosted Master SOP workbook (Zero-GWS mode).
 GCS_SOP_SUFFIXES = (".xlsx", ".json")
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _env_non_negative_float(name: str, default: float) -> float:
+    """Reads a non-negative float from env `name`; unset/blank -> `default`; invalid or negative ->
+    `default` plus a WARNING (a typo in a price env var must not crash the job or skew the ledger)."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        _LOGGER.warning("%s=%r is not a number; falling back to default %s", name, raw, default)
+        return default
+    if value != value or value < 0:  # NaN or negative
+        _LOGGER.warning("%s=%r must be a non-negative number; falling back to default %s", name, raw, default)
+        return default
+    return value
 
 
 def extract_spreadsheet_id(raw_value: str) -> str:
@@ -126,8 +146,15 @@ class AuditConfig(BaseModel):
     )
     # Token cost estimation rates (USD per 1M tokens for Gemini 3.8 Flash Standard Paid Tier:
     # https://ai.google.dev/gemini-api/docs/pricing#gemini-3.8-flash — $0.75 input / $3.75 output through Dec 31, 2026)
-    input_cost_per_million_usd: float = Field(default=0.75, ge=0.0)
-    output_cost_per_million_usd: float = Field(default=3.75, ge=0.0)
+    # Override per customer contract / model via env INPUT_COST_PER_MILLION_USD / OUTPUT_COST_PER_MILLION_USD.
+    input_cost_per_million_usd: float = Field(
+        default_factory=lambda: _env_non_negative_float("INPUT_COST_PER_MILLION_USD", 0.75),
+        ge=0.0,
+    )
+    output_cost_per_million_usd: float = Field(
+        default_factory=lambda: _env_non_negative_float("OUTPUT_COST_PER_MILLION_USD", 3.75),
+        ge=0.0,
+    )
     enable_google_chat_notification: bool = Field(
         default_factory=lambda: os.environ.get("ENABLE_GOOGLE_CHAT_NOTIFICATION", "false").strip().lower()
         in ("1", "true", "yes", "on")
@@ -142,8 +169,8 @@ class AuditConfig(BaseModel):
         default_factory=lambda: Path(os.environ.get("LOCAL_WORK_DIR", "/tmp/chagee_audit"))
     )
     agent_display_name: str = Field(
-        default_factory=lambda: os.environ.get("AGENT_DISPLAY_NAME", "CHAGEE 门店视频 AI 稽核专家").strip()
-        or "CHAGEE 门店视频 AI 稽核专家"
+        default_factory=lambda: os.environ.get("AGENT_DISPLAY_NAME", "CHAGEE Store CCTV AI Auditor").strip()
+        or "CHAGEE Store CCTV AI Auditor"
     )
 
     @field_validator("master_prompt_sheet_id", mode="before")

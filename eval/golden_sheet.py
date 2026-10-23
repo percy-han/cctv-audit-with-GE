@@ -29,6 +29,7 @@ import argparse
 from dataclasses import dataclass, field
 import hashlib
 import json
+import logging
 from pathlib import Path
 import re
 import sys
@@ -505,6 +506,48 @@ def _infer_chagee_sop_category(clause: str, focus: str) -> str:
     return ""
 
 
+_LOGGER = logging.getLogger(__name__)
+
+# Content signatures used ONLY as a last-resort fallback to recognise golden_v1's stable-baseline items
+# when the label Sheet has no Eval_Config / 测评配置 [Per-Item Settings] (explicit per-item "Stable
+# Baseline" Yes/No always wins). Never falls back to hard-coded row IDs.
+STABLE_BASELINE_SIGNATURES: tuple[str, ...] = (
+    "080530",
+    "080554",
+    "121604",
+    "apron not kept",
+    "125511",
+    "134235",
+)
+
+
+def stable_baseline_from_signatures(
+    records: Sequence[Mapping[str, Any]],
+    signatures: Sequence[str] = STABLE_BASELINE_SIGNATURES,
+) -> set[str]:
+    """Stable-baseline item IDs recognised by content signature (case-insensitive substring of
+    ``finding_verbatim``). All-or-nothing: only when EVERY signature matches exactly one item;
+    otherwise returns an empty set and logs a WARNING naming the unmatched / ambiguous signatures."""
+    matches: dict[str, list[str]] = {}
+    for sig in signatures:
+        needle = sig.lower()
+        matches[sig] = [
+            str(rec["item_id"]) for rec in records
+            if needle in str(rec.get("finding_verbatim") or "").lower()
+        ]
+    unmatched = [sig for sig, ids in matches.items() if not ids]
+    ambiguous = {sig: ids for sig, ids in matches.items() if len(ids) > 1}
+    if unmatched or ambiguous:
+        _LOGGER.warning(
+            "No stable baseline: content-signature fallback needs every signature to match exactly one "
+            "golden item (unmatched=%s, ambiguous=%s). Set 'Stable Baseline' per item in the Eval_Config "
+            "[Per-Item Settings] section to declare it explicitly.",
+            unmatched, ambiguous,
+        )
+        return set()
+    return {ids[0] for ids in matches.values()}
+
+
 def _infer_single_ts_compound_parts(finding: str) -> list[str] | None:
     """Splits a single-timestamp finding text containing two independent violation sentences (e.g. R18 in golden_v1)
     into two scoring parts, while keeping multi-stage causal chains (e.g. Cross Contamination) as a single part."""
@@ -882,24 +925,8 @@ def _load_golden_from_sheet_and_folder(
     if optional_cfg and optional_cfg.items:
         item_settings = list(optional_cfg.items)
     else:
-        default_stable = {"R08", "R09", "R12", "R13", "R14", "R19"}
-        stable_signatures = (
-            "080530",
-            "080554",
-            "121604",
-            "apron not kept",
-            "125511",
-            "134235",
-        )
-        matched_by_sig = {
-            str(rec["item_id"])
-            for rec in records
-            if any(
-                sig in str(rec.get("finding_verbatim") or "").lower()
-                for sig in stable_signatures
-            )
-        }
-        effective_stable = matched_by_sig if matched_by_sig else default_stable
+        # No explicit [Per-Item Settings] -> content-signature fallback (all-or-nothing, no row-ID default).
+        effective_stable = stable_baseline_from_signatures(records)
         item_settings = []
         for idx_r, rec in enumerate(records, 1):
             iid = str(rec["item_id"])
