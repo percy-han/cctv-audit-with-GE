@@ -159,20 +159,70 @@ class SpecTest(unittest.TestCase):
 
     def test_every_chart_domain_is_the_text_label_column(self):
         spec = _spec()
-        self.assertEqual(len(spec.chart_requests), 4)
+        self.assertEqual(len(spec.chart_requests), 7)
         tables = {t.sheet_id: t for t in spec.tables}
         for req in spec.chart_requests:
             chart = req["addChart"]["chart"]["spec"]["basicChart"]
             src = chart["domains"][0]["domain"]["sourceRange"]["sources"][0]
             table = tables[src["sheetId"]]
             self.assertEqual(src["startColumnIndex"], 0)
-            self.assertIn(table.rows[0][0], ("Round", "Run"))
-            for row in table.rows[1:]:
+            start_row = src.get("startRowIndex", 0)
+            if start_row == 0:
+                rows_to_check = table.rows
+            else:
+                matched_block = next(b for b in table.extra_blocks if b.start_row == start_row)
+                rows_to_check = matched_block.rows
+            self.assertIn(
+                rows_to_check[0][0],
+                (
+                    "Round",
+                    "Run",
+                    "Model (Same Model -> Different SOP Prompts)",
+                    "SOP Prompt (Same Prompt -> Different Models)",
+                ),
+            )
+            for row in rows_to_check[1:]:
                 self.assertIsInstance(row[0], str)
                 self.assertIsNone(re.match(r"^\d{4}-\d{2}-\d{2}", row[0]))  # never a date
             self.assertEqual(chart["headerCount"], 1)
-        chart4 = spec.chart_requests[3]["addChart"]["chart"]["spec"]["basicChart"]
-        self.assertIn("RIGHT_AXIS", {s["targetAxis"] for s in chart4["series"]})
+        chart_runs = spec.chart_requests[-1]["addChart"]["chart"]["spec"]["basicChart"]
+        self.assertIn("RIGHT_AXIS", {s["targetAxis"] for s in chart_runs["series"]})
+
+    def test_by_model_and_by_prompt_pivot_blocks(self):
+        base_rows, score, _, golden = _fixture()
+        extra_rec = dict(base_rows[-1])
+        extra_rec["round_id"] = "r03"
+        extra_rec["run_id"] = "r03_argon_1"
+        extra_rec["model_version"] = "gemini-4-argon"
+        extra_rec["sop_version"] = "Prompt_v2.5_V10全量17条标准版"
+        extra_rec2 = dict(base_rows[-1])
+        extra_rec2["round_id"] = "r03"
+        extra_rec2["run_id"] = "r03_flash_1"
+        extra_rec2["model_version"] = "gemini-3.8-flash"
+        extra_rec2["sop_version"] = "Prompt_v2.5_Standard"
+        spec = srp.build_report_spec(
+            history=[*base_rows, extra_rec, extra_rec2],
+            score_doc=score,
+            run_record=extra_rec2,
+            golden_items=golden,
+            now_utc=NOW,
+        )
+        rounds = spec.tables[2]
+        self.assertEqual(len(rounds.extra_blocks), 2)
+        by_model, by_prompt = rounds.extra_blocks[0], rounds.extra_blocks[1]
+        # Canonical SOP version merges Prompt_v2.5_V10全量17条标准版 and Prompt_v2.5_Standard into v2.5_Standard (agentic)
+        self.assertIn("v2.5_Standard (agentic) · Weighted Recall", by_model.rows[0])
+        self.assertIn("v2.5_Standard (agentic) · Lenient Recall (Partial=1)", by_model.rows[0])
+        self.assertEqual([r[0] for r in by_model.rows[1:]], ["gemini-3.8-flash", "gemini-4-argon"])
+        self.assertEqual(
+            [r[0] for r in by_prompt.rows[1:]],
+            ["v2.5_r00 (static)", "v2.6_r01 (agentic)", "v2.6_r02 (agentic)", "v2.5_Standard (agentic)"],
+        )
+        self.assertIn("gemini-4-argon · Lenient Recall (Partial=1)", by_prompt.rows[0])
+        val_ranges = srp.build_value_ranges(spec)
+        round_ranges = [vr["range"] for vr in val_ranges if vr["range"].startswith(f"'{srp.TAB_ROUNDS}'!")]
+        self.assertIn(f"'{srp.TAB_ROUNDS}'!A{by_model.start_row + 1}", round_ranges)
+        self.assertIn(f"'{srp.TAB_ROUNDS}'!A{by_prompt.start_row + 1}", round_ranges)
 
     def test_structure_freezes_headers_and_drops_default_sheet(self):
         spec = _spec()
@@ -213,7 +263,7 @@ class PublishTest(unittest.TestCase):
             self.assertTrue(drive.created[0]["supportsAllDrives"])
             self.assertEqual(sheets.value_updates[0]["valueInputOption"], "RAW")
             charts = [r for r in sheets.batch_updates[-1]["requests"] if "addChart" in r]
-            self.assertEqual(len(charts), 4)
+            self.assertEqual(len(charts), 7)
             saved = json.loads((Path(tmp) / "sheet_report.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["spreadsheet_url"], out.spreadsheet_url)
             self.assertEqual(saved["folder_id"], FOLDER)
@@ -276,15 +326,15 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(len(spec.tables[2].rows), 21)
         self.assertEqual(len(spec.tables[3].rows), 21)
         chart_reqs = spec.chart_requests
-        # Round chart (chart 0) caps to latest MAX_CHART_ROUNDS (12) while keeping row 0 header
-        round_domain_sources = chart_reqs[0]["addChart"]["chart"]["spec"]["basicChart"]["domains"][0]["domain"]["sourceRange"]["sources"]
+        # Round chart (chart 3: Chart 4 Core Recall & Alert Hit Rate by Round) caps to latest MAX_CHART_ROUNDS (12) while keeping row 0 header
+        round_domain_sources = chart_reqs[3]["addChart"]["chart"]["spec"]["basicChart"]["domains"][0]["domain"]["sourceRange"]["sources"]
         self.assertEqual(len(round_domain_sources), 2)
         self.assertEqual(round_domain_sources[0]["startRowIndex"], 0)
         self.assertEqual(round_domain_sources[0]["endRowIndex"], 1)
         self.assertEqual(round_domain_sources[1]["startRowIndex"], 21 - srp.MAX_CHART_ROUNDS)
         self.assertEqual(round_domain_sources[1]["endRowIndex"], 21)
-        # Run chart (chart 3) caps to latest MAX_CHART_RUNS (15) while keeping row 0 header
-        run_domain_sources = chart_reqs[3]["addChart"]["chart"]["spec"]["basicChart"]["domains"][0]["domain"]["sourceRange"]["sources"]
+        # Run chart (last chart: Chart 7) caps to latest MAX_CHART_RUNS (15) while keeping row 0 header
+        run_domain_sources = chart_reqs[-1]["addChart"]["chart"]["spec"]["basicChart"]["domains"][0]["domain"]["sourceRange"]["sources"]
         self.assertEqual(len(run_domain_sources), 2)
         self.assertEqual(run_domain_sources[0]["startRowIndex"], 0)
         self.assertEqual(run_domain_sources[0]["endRowIndex"], 1)

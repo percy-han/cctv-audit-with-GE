@@ -47,7 +47,7 @@ CODE_ROOT = THIS_DIR.parent
 if str(CODE_ROOT) not in sys.path:
     sys.path.insert(0, str(CODE_ROOT))
 
-from eval.eval_records import compute_all_round_averages  # noqa: E402
+from eval.eval_records import canonical_sop_version, compute_all_round_averages  # noqa: E402
 from eval.tune_loop import MAX_MEAN_ALERT_DENSITY  # noqa: E402
 
 logger = logging.getLogger("eval.sheet_report")
@@ -83,6 +83,19 @@ MAX_CHART_RUNS = 15
 
 
 @dataclass
+class ExtraBlock:
+    """A secondary table block placed below the main table on the same sheet tab (starting at Column A)."""
+
+    title: str
+    start_row: int  # 0-based row index where `rows[0]` (the header row) is written
+    rows: list[list[Any]]
+    col_formats: dict[int, dict[str, str]] = field(default_factory=dict)
+
+    def col(self, header: str) -> int:
+        return self.rows[0].index(header)
+
+
+@dataclass
 class Table:
     """One tab: header row + data rows, plus number formats by column (data rows) or by cell."""
 
@@ -92,6 +105,7 @@ class Table:
     cell_formats: list[tuple[int, int, dict[str, str]]] = field(default_factory=list)
     wide_cols: dict[int, int] = field(default_factory=dict)  # column -> pixel width (wrapped text)
     note: str = ""  # written to the right of the header row (row 1, one blank column after the table)
+    extra_blocks: list[ExtraBlock] = field(default_factory=list)
 
     @property
     def sheet_id(self) -> int:
@@ -126,8 +140,14 @@ def build_report_title(round_id: str, run_id: str, now_utc: datetime, tz: ZoneIn
 
 
 def _sop_short(sop_version: str) -> str:
-    s = str(sop_version or "unknown")
+    s = canonical_sop_version(sop_version)
     return s[len("Prompt_"):] if s.startswith("Prompt_") else s
+
+
+def prompt_mode_label(sop_version: str, media_mode: str) -> str:
+    short = _sop_short(sop_version)
+    mode = str(media_mode or "").strip()
+    return f"{short} ({mode})" if mode else short
 
 
 def _blank(v: Any) -> Any:
@@ -369,6 +389,106 @@ def build_golden_snapshot_table(golden_items: Sequence[Mapping[str, Any]], stabl
     return t
 
 
+def _collect_model_prompt_matrix(
+    history: Sequence[dict[str, Any]],
+) -> tuple[list[str], list[str], dict[str, str], dict[tuple[str, str], list[dict[str, Any]]]]:
+    """Collect ordered unique models, ordered unique prompt labels, prompt->media_mode, and grouped runs."""
+    models: list[str] = []
+    prompts: list[str] = []
+    prompt_media: dict[str, str] = {}
+    cells: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for rec in history:
+        m_ver = str(rec.get("model_version") or "unknown").strip() or "unknown"
+        media = str(rec.get("media_mode") or "agentic").strip() or "agentic"
+        p_lbl = prompt_mode_label(str(rec.get("sop_version") or "unknown"), media)
+        if m_ver not in models:
+            models.append(m_ver)
+        if p_lbl not in prompts:
+            prompts.append(p_lbl)
+            prompt_media[p_lbl] = media
+        cells.setdefault((m_ver, p_lbl), []).append(rec)
+    return models, prompts, prompt_media, cells
+
+
+def _mean_metric(recs: Sequence[dict[str, Any]], key: str, fallback_key: str | None = None) -> float | str:
+    vals: list[float] = []
+    for r in recs:
+        m = r.get("metrics") or {}
+        v = m.get(key)
+        if v is None and fallback_key:
+            v = m.get(fallback_key)
+        if v is not None:
+            vals.append(float(v))
+    return round(sum(vals) / len(vals), 6) if vals else ""
+
+
+def build_by_model_block(
+    history: Sequence[dict[str, Any]],
+    *,
+    start_row: int,
+) -> tuple[ExtraBlock, list[str]]:
+    """Pivot table grouping by Model (`Same Model -> Different SOP Prompts`)."""
+    models, prompts, _, cells = _collect_model_prompt_matrix(history)
+    header = [
+        "Model (Same Model -> Different SOP Prompts)",
+        "Runs Count",
+        *[f"{p} · Weighted Recall" for p in prompts],
+        *[f"{p} · Lenient Recall (Partial=1)" for p in prompts],
+    ]
+    rows: list[list[Any]] = [header]
+    for m_ver in models:
+        m_runs = sum(len(cells.get((m_ver, p), ())) for p in prompts)
+        w_vals = [_mean_metric(cells.get((m_ver, p), ()), "overall_recall") for p in prompts]
+        l_vals = [_mean_metric(cells.get((m_ver, p), ()), "lenient_recall", "overall_recall") for p in prompts]
+        rows.append([m_ver, m_runs, *w_vals, *l_vals])
+    col_formats: dict[int, dict[str, str]] = {1: INTEGER}
+    for c in range(2, len(header)):
+        col_formats[c] = PERCENT
+    return (
+        ExtraBlock(
+            title="By Model: Same Model -> Different SOP Prompts",
+            start_row=start_row,
+            rows=rows,
+            col_formats=col_formats,
+        ),
+        prompts,
+    )
+
+
+def build_by_prompt_block(
+    history: Sequence[dict[str, Any]],
+    *,
+    start_row: int,
+) -> tuple[ExtraBlock, list[str]]:
+    """Pivot table grouping by SOP Prompt (`Same SOP Prompt -> Different Models`)."""
+    models, prompts, prompt_media, cells = _collect_model_prompt_matrix(history)
+    header = [
+        "SOP Prompt (Same Prompt -> Different Models)",
+        "Media Mode",
+        "Runs Count",
+        *[f"{m_ver} · Weighted Recall" for m_ver in models],
+        *[f"{m_ver} · Lenient Recall (Partial=1)" for m_ver in models],
+    ]
+    rows: list[list[Any]] = [header]
+    for p_lbl in prompts:
+        p_runs = sum(len(cells.get((m_ver, p_lbl), ())) for m_ver in models)
+        w_vals = [_mean_metric(cells.get((m_ver, p_lbl), ()), "overall_recall") for m_ver in models]
+        l_vals = [_mean_metric(cells.get((m_ver, p_lbl), ()), "lenient_recall", "overall_recall") for m_ver in models]
+        rows.append([p_lbl, prompt_media.get(p_lbl, ""), p_runs, *w_vals, *l_vals])
+    col_formats: dict[int, dict[str, str]] = {2: INTEGER}
+    for c in range(3, len(header)):
+        col_formats[c] = PERCENT
+    return (
+        ExtraBlock(
+            title="By SOP Prompt: Same SOP Prompt -> Different Models",
+            start_row=start_row,
+            rows=rows,
+            col_formats=col_formats,
+        ),
+        models,
+    )
+
+
 def build_rounds_table(history: Sequence[dict[str, Any]]) -> tuple[Table, list[str], list[str]]:
     """One row per round average. Returns (table, sop category headers, outlet x focus headers)."""
     rounds = compute_all_round_averages(history)
@@ -385,7 +505,7 @@ def build_rounds_table(history: Sequence[dict[str, Any]]) -> tuple[Table, list[s
     for lbl, r in zip(labels, rounds):
         m = r.get("metrics") or {}
         rows.append([
-            lbl, r.get("round_id", ""), r.get("sop_version", ""), r.get("model_version", ""),
+            lbl, r.get("round_id", ""), canonical_sop_version(r.get("sop_version", "")), r.get("model_version", ""),
             r.get("media_mode", ""), r.get("runs_count", 0), ", ".join(r.get("run_ids") or []),
             _blank(m.get("overall_recall")),
             _blank(m.get("lenient_recall", m.get("overall_recall"))),
@@ -401,6 +521,12 @@ def build_rounds_table(history: Sequence[dict[str, Any]]) -> tuple[Table, list[s
     t.col_formats[t.col("Mean Findings / Clip")] = DECIMAL_2
     t.col_formats[t.col("Mean Timestamp Drift (sec)")] = DECIMAL_2
     t.col_formats[t.col("Mean Cost / Clip (USD)")] = USD
+
+    b1_start = len(t.rows) + 2
+    by_model_block, _ = build_by_model_block(history, start_row=b1_start)
+    b2_start = b1_start + len(by_model_block.rows) + 2
+    by_prompt_block, _ = build_by_prompt_block(history, start_row=b2_start)
+    t.extra_blocks = [by_model_block, by_prompt_block]
     return t, cats, ofs
 
 
@@ -425,7 +551,7 @@ def build_runs_table(history: Sequence[dict[str, Any]], current_run_id: str) -> 
         )
         rows.append([
             run_label(rec), "★" if rec.get("run_id") == current_run_id else "",
-            rec.get("round_id", ""), rec.get("run_id", ""), rec.get("sop_version", ""),
+            rec.get("round_id", ""), rec.get("run_id", ""), canonical_sop_version(rec.get("sop_version", "")),
             rec.get("model_version", ""), rec.get("media_mode", ""),
             _blank(m.get("overall_recall")), _blank(m.get("lenient_recall", m.get("overall_recall"))),
             _blank(m.get("confirmed_only_recall")),
@@ -483,6 +609,22 @@ def _col_range(
     }]}}
 
 
+def _block_col_range(sheet_id: int, start_row: int, col: int, n_rows: int) -> dict[str, Any]:
+    return {
+        "sourceRange": {
+            "sources": [
+                {
+                    "sheetId": sheet_id,
+                    "startRowIndex": start_row,
+                    "endRowIndex": start_row + n_rows,
+                    "startColumnIndex": col,
+                    "endColumnIndex": col + 1,
+                }
+            ]
+        }
+    }
+
+
 def build_chart_request(
     table: Table,
     *,
@@ -493,6 +635,7 @@ def build_chart_request(
     left_title: str,
     right_title: str = "",
     anchor_row: int,
+    anchor_col: int = 0,
     max_data_rows: int | None = None,
 ) -> dict[str, Any]:
     """A native ``basicChart`` whose domain is the text label column, so the X axis is categorical."""
@@ -519,41 +662,134 @@ def build_chart_request(
             },
         },
         "position": {"overlayPosition": {
-            "anchorCell": {"sheetId": table.sheet_id, "rowIndex": anchor_row, "columnIndex": 0},
+            "anchorCell": {"sheetId": table.sheet_id, "rowIndex": anchor_row, "columnIndex": anchor_col},
+            "widthPixels": CHART_WIDTH_PX, "heightPixels": CHART_HEIGHT_PX,
+        }},
+    }}}
+
+
+def build_block_chart_request(
+    sheet_id: int,
+    block: ExtraBlock,
+    *,
+    title: str,
+    domain_header: str,
+    series: Sequence[tuple[str, str, str]],
+    bottom_title: str,
+    left_title: str,
+    right_title: str = "",
+    anchor_row: int,
+    anchor_col: int = 0,
+) -> dict[str, Any]:
+    """A native ``basicChart`` backed by an ``ExtraBlock`` pivot table on the same sheet tab."""
+    n = len(block.rows)
+    types = {s[1] for s in series}
+    chart_type = "COMBO" if len(types) > 1 else next(iter(types))
+    axis = [{"position": "BOTTOM_AXIS", "title": bottom_title},
+            {"position": "LEFT_AXIS", "title": left_title}]
+    if right_title:
+        axis.append({"position": "RIGHT_AXIS", "title": right_title})
+    return {"addChart": {"chart": {
+        "spec": {
+            "title": title,
+            "basicChart": {
+                "chartType": chart_type,
+                "legendPosition": "BOTTOM_LEGEND",
+                "headerCount": 1,
+                "axis": axis,
+                "domains": [{"domain": _block_col_range(sheet_id, block.start_row, block.col(domain_header), n)}],
+                "series": [
+                    {"series": _block_col_range(sheet_id, block.start_row, block.col(h), n), "type": typ, "targetAxis": ax}
+                    for h, typ, ax in series
+                ],
+            },
+        },
+        "position": {"overlayPosition": {
+            "anchorCell": {"sheetId": sheet_id, "rowIndex": anchor_row, "columnIndex": anchor_col},
             "widthPixels": CHART_WIDTH_PX, "heightPixels": CHART_HEIGHT_PX,
         }},
     }}}
 
 
 def build_chart_requests(rounds: Table, cats: Sequence[str], ofs: Sequence[str], runs: Table) -> list[dict]:
-    # Charts 2 and 3 put rounds on the X axis with one series per SOP category / outlet x focus: the
-    # series count is fixed (3 / 4) while the X axis grows by one group per round, so the legend
-    # stays readable for any N and all three round charts share the same X axis as chart 1.
-    base = len(rounds.rows) + 2
-    reqs = [
-        build_chart_request(
-            rounds, title="Chart 1: Core Recall & Alert Hit Rate by Round", domain_header="Round",
-            series=[("Overall Recall", "COLUMN", "LEFT_AXIS"),
-                    ("Lenient Recall (Partial=1)", "COLUMN", "LEFT_AXIS"),
-                    ("CONFIRMED-Only Recall", "COLUMN", "LEFT_AXIS"),
-                    ("Alert Hit Rate", "LINE", "LEFT_AXIS")],
-            bottom_title="Round · SOP Version", left_title="Rate", anchor_row=base,
-            max_data_rows=MAX_CHART_ROUNDS),
-    ]
+    last_table_row = max(
+        [len(rounds.rows), *[b.start_row + len(b.rows) for b in rounds.extra_blocks]]
+    )
+    base = last_table_row + 2
+    reqs: list[dict[str, Any]] = []
+
+    if len(rounds.extra_blocks) >= 2:
+        by_model_block, by_prompt_block = rounds.extra_blocks[0], rounds.extra_blocks[1]
+        model_lenient_headers = [h for h in by_model_block.rows[0][2:] if h.endswith("· Lenient Recall (Partial=1)")]
+        model_weighted_headers = [h for h in by_model_block.rows[0][2:] if h.endswith("· Weighted Recall")]
+        prompt_series_headers = list(by_prompt_block.rows[0][3:])
+        if model_lenient_headers:
+            reqs.append(build_block_chart_request(
+                rounds.sheet_id,
+                by_model_block,
+                title="Chart 1: By Model — Same Model Across Different SOP Prompts (Lenient Recall Partial=1)",
+                domain_header="Model (Same Model -> Different SOP Prompts)",
+                series=[(h, "COLUMN", "LEFT_AXIS") for h in model_lenient_headers],
+                bottom_title="Model Version",
+                left_title="Lenient Recall (Partial=1)",
+                anchor_row=base,
+                anchor_col=0,
+            ))
+        if model_weighted_headers:
+            reqs.append(build_block_chart_request(
+                rounds.sheet_id,
+                by_model_block,
+                title="Chart 2: By Model — Same Model Across Different SOP Prompts (Overall Weighted Recall)",
+                domain_header="Model (Same Model -> Different SOP Prompts)",
+                series=[(h, "COLUMN", "LEFT_AXIS") for h in model_weighted_headers],
+                bottom_title="Model Version",
+                left_title="Overall Recall (Weighted)",
+                anchor_row=base,
+                anchor_col=7,
+            ))
+        if prompt_series_headers:
+            reqs.append(build_block_chart_request(
+                rounds.sheet_id,
+                by_prompt_block,
+                title="Chart 3: By SOP Prompt — Same SOP Prompt Across Different Models (Weighted & Lenient Recall)",
+                domain_header="SOP Prompt (Same Prompt -> Different Models)",
+                series=[(h, "COLUMN", "LEFT_AXIS") for h in prompt_series_headers],
+                bottom_title="SOP Prompt (Media Mode)",
+                left_title="Recall",
+                anchor_row=base + CHART_ROW_STRIDE,
+                anchor_col=0,
+            ))
+        round_chart_base = base + CHART_ROW_STRIDE
+        round_chart1_col = 7
+    else:
+        round_chart_base = base
+        round_chart1_col = 0
+
+    reqs.append(build_chart_request(
+        rounds, title="Chart 4: Core Recall & Alert Hit Rate by Round", domain_header="Round",
+        series=[("Overall Recall", "COLUMN", "LEFT_AXIS"),
+                ("Lenient Recall (Partial=1)", "COLUMN", "LEFT_AXIS"),
+                ("CONFIRMED-Only Recall", "COLUMN", "LEFT_AXIS"),
+                ("Alert Hit Rate", "LINE", "LEFT_AXIS")],
+        bottom_title="Round · SOP Version", left_title="Rate", anchor_row=round_chart_base,
+        anchor_col=round_chart1_col,
+        max_data_rows=MAX_CHART_ROUNDS))
     if cats:
         reqs.append(build_chart_request(
-            rounds, title="Chart 2: Recall by SOP Category across Rounds", domain_header="Round",
+            rounds, title="Chart 5: Recall by SOP Category across Rounds", domain_header="Round",
             series=[(c, "COLUMN", "LEFT_AXIS") for c in cats],
-            bottom_title="Round · SOP Version", left_title="Recall", anchor_row=base + CHART_ROW_STRIDE,
+            bottom_title="Round · SOP Version", left_title="Recall", anchor_row=round_chart_base + CHART_ROW_STRIDE,
+            anchor_col=0,
             max_data_rows=MAX_CHART_ROUNDS))
     if ofs:
         reqs.append(build_chart_request(
-            rounds, title="Chart 3: Recall by Outlet × Audit Focus across Rounds", domain_header="Round",
+            rounds, title="Chart 6: Recall by Outlet × Audit Focus across Rounds", domain_header="Round",
             series=[(o, "COLUMN", "LEFT_AXIS") for o in ofs],
-            bottom_title="Round · SOP Version", left_title="Recall", anchor_row=base + 2 * CHART_ROW_STRIDE,
+            bottom_title="Round · SOP Version", left_title="Recall", anchor_row=round_chart_base + CHART_ROW_STRIDE,
+            anchor_col=7,
             max_data_rows=MAX_CHART_ROUNDS))
     reqs.append(build_chart_request(
-        runs, title=f"Chart 4: Per-Run Alert Density / Timestamp Drift / Cost per Clip (Guardrail {MAX_MEAN_ALERT_DENSITY:.1f} findings/clip)",
+        runs, title=f"Chart 7: Per-Run Alert Density / Timestamp Drift / Cost per Clip (Guardrail {MAX_MEAN_ALERT_DENSITY:.1f} findings/clip)",
         domain_header="Run",
         series=[("Mean Findings / Clip", "COLUMN", "LEFT_AXIS"), ("Mean Timestamp Drift (sec)", "COLUMN", "LEFT_AXIS"),
                 (GUARDRAIL_HEADER, "LINE", "LEFT_AXIS"), ("Mean Cost / Clip (USD)", "LINE", "RIGHT_AXIS")],
@@ -597,11 +833,13 @@ def build_structure_requests(spec: ReportSpec, default_sheet_ids: Sequence[int])
     reqs: list[dict[str, Any]] = [{"updateSpreadsheetProperties": {
         "properties": {"timeZone": spec.time_zone}, "fields": "timeZone"}}]
     for idx, t in enumerate(spec.tables):
+        content_rows = max([len(t.rows), *[b.start_row + len(b.rows) for b in t.extra_blocks]])
+        max_cols = max([len(t.rows[0]), *[len(b.rows[0]) for b in t.extra_blocks if b.rows]])
         reqs.append({"addSheet": {"properties": {
             "sheetId": t.sheet_id, "title": t.title, "index": idx,
             "gridProperties": {
-                "rowCount": max(len(t.rows) + 4 * CHART_ROW_STRIDE, 100),
-                "columnCount": max(len(t.rows[0]) + 3, 26),
+                "rowCount": max(content_rows + 5 * CHART_ROW_STRIDE, 120),
+                "columnCount": max(max_cols + 3, 26),
                 "frozenRowCount": 1,
             },
         }}})
@@ -622,6 +860,8 @@ def _col_letter(idx: int) -> str:
 def build_value_ranges(spec: ReportSpec) -> list[dict[str, Any]]:
     ranges = [{"range": f"'{t.title}'!A1", "values": t.rows} for t in spec.tables]
     for t in spec.tables:
+        for b in t.extra_blocks:
+            ranges.append({"range": f"'{t.title}'!A{b.start_row + 1}", "values": b.rows})
         if t.note:
             ranges.append({"range": f"'{t.title}'!{_col_letter(len(t.rows[0]) + 1)}1", "values": [[t.note]]})
     return ranges
@@ -649,10 +889,22 @@ def build_format_requests(spec: ReportSpec) -> list[dict[str, Any]]:
         }})
         for col, fmt in sorted(t.col_formats.items()):
             reqs.append(_fmt_req(t.sheet_id, 1, n_rows, col, col + 1, fmt))
+        for b in t.extra_blocks:
+            b_rows, b_cols = len(b.rows), len(b.rows[0])
+            reqs.append({"repeatCell": {
+                "range": {"sheetId": t.sheet_id, "startRowIndex": b.start_row, "endRowIndex": b.start_row + 1,
+                          "startColumnIndex": 0, "endColumnIndex": b_cols},
+                "cell": {"userEnteredFormat": {"textFormat": {"bold": True},
+                                               "backgroundColor": {"red": 0.91, "green": 0.94, "blue": 0.99}}},
+                "fields": "userEnteredFormat(textFormat,backgroundColor)",
+            }})
+            for col, fmt in sorted(b.col_formats.items()):
+                reqs.append(_fmt_req(t.sheet_id, b.start_row + 1, b.start_row + b_rows, col, col + 1, fmt))
         for row, col, fmt in t.cell_formats:
             reqs.append(_fmt_req(t.sheet_id, row, row + 1, col, col + 1, fmt))
+        max_cols = max([n_cols, *[len(b.rows[0]) for b in t.extra_blocks if b.rows]])
         reqs.append({"autoResizeDimensions": {"dimensions": {
-            "sheetId": t.sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": n_cols}}})
+            "sheetId": t.sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": max_cols}}})
         for col, px in sorted(t.wide_cols.items()):
             reqs.append({"updateDimensionProperties": {
                 "range": {"sheetId": t.sheet_id, "dimension": "COLUMNS", "startIndex": col, "endIndex": col + 1},

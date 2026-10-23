@@ -204,7 +204,7 @@ def build_eval_monitoring_record(
         if model_version and model_version.strip()
         else res_summary["model_version"]
     )
-    resolved_sop = (
+    resolved_sop = canonical_sop_version(
         sop_version.strip()
         if sop_version and sop_version.strip()
         else res_summary["sop_version"]
@@ -320,6 +320,17 @@ def build_eval_monitoring_record(
         "video_breakdown": score_doc.get("video_breakdown") or {},
     }
 
+
+
+_CANONICAL_SOP_VERSION_ALIASES: dict[str, str] = {
+    "Prompt_v2.5_V10全量17条标准版": "Prompt_v2.5_Standard",
+}
+
+
+def canonical_sop_version(sop_version: str | None) -> str:
+    """Normalize legacy localized SOP tab titles to their canonical English tab identifier."""
+    s = str(sop_version or "unknown").strip() or "unknown"
+    return _CANONICAL_SOP_VERSION_ALIASES.get(s, s)
 
 
 def aggregate_round_monitoring_record(records_for_round: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -453,7 +464,7 @@ def aggregate_round_monitoring_record(records_for_round: Sequence[dict[str, Any]
         "runs_count": n,
         "run_ids": [str(r.get("run_id") or "") for r in records_for_round],
         "model_version": str(last.get("model_version") or "unknown"),
-        "sop_version": str(last.get("sop_version") or "unknown"),
+        "sop_version": canonical_sop_version(str(last.get("sop_version") or "unknown")),
         "media_mode": str(last.get("media_mode") or "agentic"),
         "judge_model": str(last.get("judge_model") or ""),
         "golden_version": str(last.get("golden_version") or GOLDEN_UNVERSIONED),
@@ -477,7 +488,7 @@ def compute_all_round_averages(history_records: Sequence[dict[str, Any]]) -> lis
         key = (
             str(rec.get("round_id") or "r00"),
             str(rec.get("model_version") or "unknown"),
-            str(rec.get("sop_version") or "unknown"),
+            canonical_sop_version(str(rec.get("sop_version") or "unknown")),
             str(rec.get("media_mode") or "agentic"),
             str(rec.get("golden_version") or GOLDEN_UNVERSIONED),
         )
