@@ -177,11 +177,14 @@ def build_reasoning_engine_body(
     env_list = [
         {"name": "GCP_PROJECT", "value": project_id},
         {"name": "GCP_LOCATION", "value": gcp_location},
-        {"name": "VERTEX_MODEL_LOCATION", "value": vertex_model_location},
-        {"name": "MASTER_PROMPT_SHEET_ID", "value": master_prompt_sheet_id},
+        {"name": "VERTEX_MODEL_LOCATION", "value": vertex_model_location or "global"},
         {"name": "KEEPALIVE_HOLD_SECONDS", "value": "25"},
         {"name": "ENABLE_BACKGROUND_WATCHDOG", "value": "false"},
     ]
+    # Vertex AI rejects env entries with an empty value ("Required field is not set"); an unset
+    # MASTER_PROMPT_SHEET_ID means the same as "" to the app (Zero-GWS / seeded GCS workbook).
+    if master_prompt_sheet_id:
+        env_list.append({"name": "MASTER_PROMPT_SHEET_ID", "value": master_prompt_sheet_id})
     if agent_display_name:
         env_list.append({"name": "AGENT_DISPLAY_NAME", "value": agent_display_name})
     if staging_bucket:

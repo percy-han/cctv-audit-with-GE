@@ -1,5 +1,7 @@
 # 门店 CCTV AI 稽核（Gemini Enterprise + Gemini 视频理解）
 
+> **部署与运维请以 [`docs/DEPLOYMENT_GUIDE.md`](docs/DEPLOYMENT_GUIDE.md) 为准**（含系统架构、部署前准备、分阶段部署步骤、业务使用手册、日常维护与故障排查）。本 README 部分页签名 / 按钮文字仍是旧的中文命名，以代码和该手册为准。
+
 门店督导在 **Gemini Enterprise（GE）** 里把一个 **Google Drive 视频文件夹链接** 或 **Google Cloud Storage（GCS）存储桶目录链接（`gs://...` 或 GCP 控制台链接）** 发给稽核 Agent，系统会在后台逐个视频做 AI 稽核，按 SOP 规则找出违规，并根据输入链接类型**自动切换输出方式**：
 - **Google Workspace 模式（输入 Google Drive 文件夹）**：在同一个 Drive 文件夹里生成一张稽核报告 **Google Sheet** 及 `📁 违规证据切片_Evidence/`（每条违规带画面时间和 20 秒证据片段链接），SOP 从 Google Sheet 读取。
 - **Zero-GWS / 纯 GCS 兜底模式（输入 `gs://` 或 GCS 控制台目录，无需 Google Workspace）**：在同一个 GCS 目录里直接生成一份双工作表 Excel 报告 **`📊 AI稽核报告与Token账单.xlsx`** 及 `📁 违规证据切片_Evidence/`，SOP 直接从 Terraform 自动创建的版本控制存储桶（`gs://<项目ID>-<p>-workspace/sop/master_sheet.xlsx`）读取。两种模式可**同时并存、按单自动路由**，也可独立使用。

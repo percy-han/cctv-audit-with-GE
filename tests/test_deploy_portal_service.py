@@ -207,3 +207,25 @@ def test_main_tf_runs_the_script_not_gcloud() -> None:
     assert "when" not in block  # no destroy-time provisioner
     assert "sha256(local.portal_env_json)" in block and "var.container_image" in block
     assert '--env-json "$PORTAL_ENV_JSON"' in block
+
+
+def test_reasoning_engine_body_omits_empty_master_prompt_sheet_id():
+    """Dry-run finding: Vertex AI rejects ReasoningEngine env entries with an empty value
+    ("Required field is not set"), so Stage-A deploys with master_prompt_sheet_id="" must omit it."""
+    from deploy.deploy_reasoning_engine import build_reasoning_engine_body
+
+    img = "asia-southeast1-docker.pkg.dev/p/r/i@sha256:" + "0" * 64
+
+    def _env(body):
+        return {e["name"]: e["value"] for e in body["spec"]["deploymentSpec"]["env"]}
+
+    empty = _env(build_reasoning_engine_body("p", "us-central1", img, "", display_name="x-agent",
+                                             gcp_location="asia-southeast1"))
+    assert "MASTER_PROMPT_SHEET_ID" not in empty
+    assert all(v != "" for v in empty.values())
+    full = _env(build_reasoning_engine_body("p", "us-central1", img, "SHEET123", display_name="x-agent",
+                                            gcp_location="asia-southeast1"))
+    assert full["MASTER_PROMPT_SHEET_ID"] == "SHEET123"
+    blank_loc = _env(build_reasoning_engine_body("p", "us-central1", img, "", display_name="x-agent",
+                                                 gcp_location="asia-southeast1", vertex_model_location=""))
+    assert blank_loc["VERTEX_MODEL_LOCATION"] == "global"
