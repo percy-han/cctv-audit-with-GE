@@ -238,8 +238,11 @@ def build_overview_table(
     add("Golden Set Items / Parts", f"{n_items} items / {run_record.get('golden_part_count') or golden.get('part_count') or ''} parts",
         "")
     add("Judge Model (judge_model)", run_record.get("judge_model") or score_doc.get("judge_model"),
-        f"Median of {score_doc.get('judge_passes', '')} passes per part" if score_doc.get("judge_passes") else "")
-    add(f"Overall Recall ({n_items} items)", m.get("overall_recall"), "Authoritative weighted score from eval/score_run.py (Full=1.0, Partial=0.5)", PERCENT)
+        f"Video analysis runs 1x per run; Judge runs {score_doc.get('judge_passes', 3)}x per part and takes the median vote (1.0 / 0.5 / 0.0)"
+        if score_doc.get("judge_passes") else "Video analysis runs 1x per run; Judge runs 3x per part and takes the median vote")
+    add(f"Overall Recall ({n_items} items)", m.get("overall_recall"),
+        "Weighted recall: exact match (timestamp + sub-clause) = 1.0, partial match (same event/chain caught) = 0.5, miss = 0.0, divided by total items",
+        PERCENT)
     lenient_val = (
         m.get("lenient_recall")
         if m.get("lenient_recall") is not None
@@ -249,12 +252,18 @@ def build_overview_table(
             else m.get("overall_recall")
         )
     )
-    add(f"Lenient Recall (Partial=1) ({n_items} items)", lenient_val, "Any hit (Full=1.0, Partial=1.0) counted as 1.0", PERCENT)
-    add("CONFIRMED-Only Recall", m.get("confirmed_only_recall"), "Counts only findings with CONFIRMED disposition", PERCENT)
+    add(f"Lenient Recall (Partial=1) ({n_items} items)", lenient_val,
+        "Event-level recall: both Full (1.0) and Partial (0.5) hits count as 1.0 (measures whether AI flagged the violation for the supervisor)",
+        PERCENT)
+    add("CONFIRMED-Only Recall", m.get("confirmed_only_recall"),
+        "Recall counting ONLY high-certainty CONFIRMED findings (excluding SUSPECTED findings)",
+        PERCENT)
     add("Mean Alert Density / Clip (findings_per_clip)", m.get("findings_per_clip"),
-        f"Guardrail <= {MAX_MEAN_ALERT_DENSITY:.1f}", DECIMAL_2)
+        f"Average AI findings reported per 5-min video clip (Guardrail <= {MAX_MEAN_ALERT_DENSITY:.1f})", DECIMAL_2)
     add("Total Findings", m.get("total_findings"), f"{density.get('clips', '')} video clips", INTEGER)
-    add("Alert Hit Rate (hit_rate)", m.get("hit_rate"), "Findings matching human labels / total findings", PERCENT)
+    add("Alert Hit Rate (hit_rate)", m.get("hit_rate"),
+        "Matched AI findings / total AI findings (~10%-15% is normal because human labels only mark 16 sample violations while AI scans every violation in full clips; NOT precision)",
+        PERCENT)
     stable_state = m.get("stable_guardrail") or "not_configured"
     stable_ids = run_record.get("stable_baseline_items") or golden.get("stable_baseline_items") or []
     add("Regressed Stable Baseline Items (regressed_stable_items)", m.get("regressed_stable_items"),
@@ -366,6 +375,53 @@ def build_items_table(
     return t
 
 
+def build_metric_guide_block(*, start_row: int) -> ExtraBlock:
+    """Plain-language explanation of the core evaluation metrics and 1x-video / 3x-judge scoring flow."""
+    header = [
+        "Metric / Mechanism (指标与机制)",
+        "Formula / Rule (计算口径)",
+        "Plain-Language Explanation (通俗说明 — 说人话)",
+    ]
+    rows: list[list[Any]] = [
+        header,
+        [
+            "Overall Recall (带权重召回率)",
+            "(1.0 × Full Hits + 0.5 × Partial Hits) ÷ Total Golden Items (16)",
+            "严格按权重计分：AI 在对应时间窗内抓到违规且具体子条款完全一致算 1.0 分；抓到了同一违规事件/因果链但子原因或前序触发物描述有细微差异（Partial 半对）算 0.5 分；漏报算 0 分。",
+        ],
+        [
+            "Lenient Recall (Partial=1) (宽松召回率 / 半对算对)",
+            "(1.0 × Full Hits + 1.0 × Partial Hits) ÷ Total Golden Items (16)",
+            "业务事件级召回率：只要 AI 在该时间段弹出了对应违规告警（无论是 1.0 全对还是 0.5 半对），统一按 1.0 分计算。对应督导真实复核体感——只要 AI 弹出切片，督导点开 3 秒即可确认违规。",
+        ],
+        [
+            "CONFIRMED-Only Recall (仅高确信告警召回率)",
+            "Weighted Recall using ONLY findings where disposition == CONFIRMED",
+            "只统计 AI 标为 CONFIRMED（画面铁证确凿）的告警、剔除 SUSPECTED（疑似/遮挡待核实）告警后的召回率。用来衡量“如果只看高确信告警，会少抓多少违规”。",
+        ],
+        [
+            "Alert Hit Rate (人工标注命中占比)",
+            "AI Findings Matched to Golden Set ÷ Total AI Findings across all 13 clips",
+            "⚠️ 注意：这不是准确率（Precision）！因为人工在 13 段视频里只挑了 16 个典型问题标注，而 AI 会把全片所有未戴发网、抹布乱放、茶桶未按时搅拌全部报出来（约 90~100 条），分母远大于 16，所以该比例天然在 10%~15% 左右，仅作告警密度参考。",
+        ],
+        [
+            "Mean Findings / Clip (平均每段视频告警数)",
+            "Total AI Findings ÷ Number of Video Clips (13 clips, Guardrail <= 8.0)",
+            "衡量 AI 是否“乱报刷屏”的核心护栏指标：平均每段 5 分钟视频报出的违规条数不能超过 8.0 条，防止模型靠无限刷告警来混高召回率。",
+        ],
+        [
+            "Evaluation Execution: 1x Video Pass + 3x Judge Voting (视频跑 1 遍 + 裁判打分跑 3 遍)",
+            "Audit Model: 1 pass per trigger | Judge Model (gemini-3.1-pro-preview): 3 passes → Median",
+            "每次从工作台触发一轮测评时：① 13 段监控视频由被测视觉模型（如 gemini-3.8-flash 或 gemini-4-argon）实际推理分析 1 遍；② 打分阶段先由代码硬过滤时间窗（瞬时动作 ±20s、跨时段因果链 ±60s、5分钟静置 -60s/+330s），再由裁判模型（gemini-3.1-pro-preview）对每道有候选的题独立打分 3 遍并取中位数（Median of 3），消除裁判模型偶发抖动。",
+        ],
+    ]
+    return ExtraBlock(
+        title="Metric & Scoring Mechanism Guide (核心指标与打分机制说明)",
+        start_row=start_row,
+        rows=rows,
+    )
+
+
 def build_golden_snapshot_table(golden_items: Sequence[Mapping[str, Any]], stable_ids: Sequence[str] = ()) -> Table:
     """One row per golden part exactly as this run used it (category / time mode with their source)."""
     from eval.score_run import sop_category_and_source, temporal_mode_and_source
@@ -386,6 +442,7 @@ def build_golden_snapshot_table(golden_items: Sequence[Mapping[str, Any]], stabl
             ])
     t = Table(TAB_GOLDEN, rows)
     t.wide_cols = {t.col("Human Label (Verbatim)"): 360, t.col("Video Filename(s)"): 320}
+    t.extra_blocks = [build_metric_guide_block(start_row=len(t.rows) + 2)]
     return t
 
 
@@ -526,7 +583,9 @@ def build_rounds_table(history: Sequence[dict[str, Any]]) -> tuple[Table, list[s
     by_model_block, _ = build_by_model_block(history, start_row=b1_start)
     b2_start = b1_start + len(by_model_block.rows) + 2
     by_prompt_block, _ = build_by_prompt_block(history, start_row=b2_start)
-    t.extra_blocks = [by_model_block, by_prompt_block]
+    b3_start = b2_start + len(by_prompt_block.rows) + 2
+    metric_guide_block = build_metric_guide_block(start_row=b3_start)
+    t.extra_blocks = [by_model_block, by_prompt_block, metric_guide_block]
     return t, cats, ofs
 
 

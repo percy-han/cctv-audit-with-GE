@@ -208,8 +208,10 @@ class SpecTest(unittest.TestCase):
             now_utc=NOW,
         )
         rounds = spec.tables[2]
-        self.assertEqual(len(rounds.extra_blocks), 2)
-        by_model, by_prompt = rounds.extra_blocks[0], rounds.extra_blocks[1]
+        self.assertEqual(len(rounds.extra_blocks), 3)
+        by_model, by_prompt, metric_guide = rounds.extra_blocks[0], rounds.extra_blocks[1], rounds.extra_blocks[2]
+        self.assertEqual(metric_guide.rows[0][0], "Metric / Mechanism (指标与机制)")
+        self.assertEqual(len(spec.tables[4].extra_blocks), 1)
         # Canonical SOP version merges Prompt_v2.5_V10全量17条标准版 and Prompt_v2.5_Standard into v2.5_Standard (agentic)
         self.assertIn("v2.5_Standard (agentic) · Weighted Recall", by_model.rows[0])
         self.assertIn("v2.5_Standard (agentic) · Lenient Recall (Partial=1)", by_model.rows[0])
