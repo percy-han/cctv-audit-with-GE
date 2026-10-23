@@ -158,16 +158,18 @@ def _object_parent(obj: str) -> str:
 # Report tab values (column parity with GoogleWorkspaceGateway.create_dual_tab_report_sheet)
 # --------------------------------------------------------------------------------------------
 
+# Must match the data column order written by gcs_gateway.build_tab1_values / ViolationSheetRow
+# (A..K). Readers address columns by position (J = review status, K = review note), never by label.
 TAB1_HEADERS = [
-    "Store/Folder Name",
+    "Audit ID",
     "Video Filename",
     "Violation Timestamp (MM:SS)",
     "SOP Rule ID",
+    "AI Disposition",
     "Severity",
+    "AI Confidence",
     "Violation Description & Timestamped Trajectory",
     "Evidence Clip Link (Click to Play)",
-    "Audited Prompt Version",
-    "Audited Model Version",
     "Supervisor Review Status (Dropdown)",
     "Supervisor Review Note",
 ]

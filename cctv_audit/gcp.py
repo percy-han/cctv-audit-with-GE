@@ -498,16 +498,18 @@ TAB1_TITLE = "Tab1_Violation_Review"
 LEGACY_TAB1_TITLES = ("Tab1_Violation_Review", "违规事件 3 秒复核台")
 TAB2_TITLE = "Tab2_Token_Ledger"
 LEGACY_TAB2_TITLES = ("Tab2_Token_Ledger", "本次视频 Token 消耗与耗时账单")
+# Must match the data column order written by gcs_gateway.build_tab1_values / ViolationSheetRow
+# (A..K). Readers address columns by position (J = review status, K = review note), never by label.
 TAB1_HEADERS = [
-    "Store/Folder Name",
+    "Audit ID",
     "Video Filename",
     "Violation Timestamp (MM:SS)",
     "SOP Rule ID",
+    "AI Disposition",
     "Severity",
+    "AI Confidence",
     "Violation Description & Timestamped Trajectory",
     "Evidence Clip Link (Click to Play)",
-    "Audited Prompt Version",
-    "Audited Model Version",
     "Supervisor Review Status (Dropdown)",
     "Supervisor Review Note",
 ]

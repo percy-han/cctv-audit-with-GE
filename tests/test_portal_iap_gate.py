@@ -796,3 +796,38 @@ def test_audit_record_captures_the_evidence_clip_and_row_snapshot():
         composite_key="k", row=["j", "v.mp4"], old_status="", new_status="", old_note="", new_note="",
         report_sheet_url="", client_ip="", user_agent="")
     assert empty["evidence_clip_url"] == "" and empty["evidence_clip_file_id"] == ""
+
+
+def test_reset_reviews_button_removed():
+    """Round 86: the bulk "Reset Local Reviews" button wrote PENDING + empty note to EVERY finding in the
+    shared Sheet (wiping other supervisors' work) and was removed."""
+    from cctv_audit import portal
+
+    html = portal._SUPERVISOR_PORTAL_HTML_TEMPLATE
+    assert "btn-reset-review" not in html
+    assert "resetReview" not in html
+    assert "Reset Local Reviews" not in html and "清空本地复核记录" not in html
+    assert "batchConfirm()" in html  # bulk-confirm stays as-is
+
+
+def test_tab1_headers_match_written_data_columns():
+    """Tab-1 header labels must describe the columns build_tab1_values actually writes (A..K)."""
+    from types import SimpleNamespace
+
+    from cctv_audit import gcp, gcs_gateway
+
+    assert gcp.TAB1_HEADERS == gcs_gateway.TAB1_HEADERS
+    row = SimpleNamespace(audit_id="j1", video_filename="v.mp4", timestamp_in_clip="00:15", rule_id="A2",
+                          disposition="CONFIRMED", severity="RED_LINE", confidence=0.9,
+                          evidence_description="desc", evidence_drive_url="https://drive.google.com/file/d/X/view",
+                          human_review_status="PENDING", human_review_note="n")
+    header, data = gcs_gateway.build_tab1_values([row])
+    labelled = dict(zip(header, data))
+    assert labelled["Audit ID"] == "j1"
+    assert labelled["AI Disposition"] == "CONFIRMED"
+    assert labelled["Severity"] == "RED_LINE"
+    assert labelled["AI Confidence"] == 0.9
+    assert labelled["Violation Description & Timestamped Trajectory"] == "desc"
+    assert labelled["Evidence Clip Link (Click to Play)"].startswith("https://drive.google.com/file/d/")
+    assert header[9] == "Supervisor Review Status (Dropdown)" and data[9] == "PENDING"
+    assert header[10] == "Supervisor Review Note" and data[10] == "n"

@@ -2488,7 +2488,6 @@ _SUPERVISOR_PORTAL_HTML_TEMPLATE = r"""<!DOCTYPE html>
             <span class="vv" id="p-p">0</span>
           </div>
         </div>
-        <button class="btn btn-sm" id="btn-reset-review" onclick="resetReview()" style="align-self:flex-start">Reset Local Reviews</button>
       </div>
 
     </div>
@@ -2849,7 +2848,6 @@ function applyLangUI() {
   setTxt("p-lbl-d", "False Positives Dismissed", "已排除误报");
   setTxt("p-lbl-f", "Follow-Up Footage Needed", "待调后续录像");
   setTxt("p-lbl-p", "Pending Review", "待复核");
-  setTxt("btn-reset-review", "Reset Local Reviews", "清空本地复核记录");
   setTxt("lbl-sev-ALL", "All Events", "全部事件");
   setTxt("lbl-sev-RED", "Red Line", "红线");
   setTxt("lbl-sev-NORMAL", "Standard", "一般偏差");
@@ -3541,21 +3539,6 @@ function batchConfirm() {
   renderProgress();
   renderSections();
   toast(tr("Marked " + targets.length + " AI-confirmed finding(s) as Confirmed Violation", "已将 " + targets.length + " 项 AI 实锤事件标记为确认违规"));
-  if (batchUpdates.length) persistReviewsToSheet(batchUpdates);
-}
-
-function resetReview() {
-  if (!Object.keys(review).length) { toast(tr("No local review records to reset", "本地没有复核记录")); return; }
-  const batchUpdates = F.filter(f => f.incident_id).map(f => ({
-    incident_id: f.incident_id,
-    status: "PENDING",
-    note: ""
-  }));
-  review = {};
-  persist();
-  renderProgress();
-  renderSections();
-  toast(tr("Cleared local review records", "已清空本地复核记录"));
   if (batchUpdates.length) persistReviewsToSheet(batchUpdates);
 }
 
