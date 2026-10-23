@@ -127,10 +127,50 @@ def build_review_audit_record(
     }
 
 
-def _default_client() -> Any:
-    from google.cloud import storage
+class _RestBlob:
+    def __init__(self, bucket: str, name: str) -> None:
+        self._bucket, self._name = bucket, name
 
-    return storage.Client(project=os.environ.get("GCP_PROJECT", "").strip() or None)
+    def upload_from_string(self, data: str, *, content_type: str, if_generation_match: int) -> None:
+        import urllib.parse
+        import urllib.request
+
+        import google.auth
+        import google.auth.transport.requests
+
+        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/devstorage.read_write"])
+        creds.refresh(google.auth.transport.requests.Request())
+        url = (
+            "https://storage.googleapis.com/upload/storage/v1/b/"
+            f"{urllib.parse.quote(self._bucket, safe='')}/o"
+            f"?uploadType=media&name={urllib.parse.quote(self._name, safe='')}"
+            f"&ifGenerationMatch={int(if_generation_match)}"
+        )
+        req = urllib.request.Request(url, data=data.encode("utf-8"), method="POST")
+        req.add_header("Authorization", f"Bearer {creds.token}")
+        req.add_header("Content-Type", content_type)
+        with urllib.request.urlopen(req, timeout=15) as resp:  # HTTPError (e.g. 412) propagates
+            resp.read()
+
+
+class _RestBucket:
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def blob(self, name: str) -> _RestBlob:
+        return _RestBlob(self._name, name)
+
+
+class _RestGcsClient:
+    """Minimal GCS JSON-API client (google-auth + urllib, like cctv_audit/jobs.py). The worker image
+    does not ship google-cloud-storage, so the audit log must not depend on it."""
+
+    def bucket(self, name: str) -> _RestBucket:
+        return _RestBucket(name)
+
+
+def _default_client() -> Any:
+    return _RestGcsClient()
 
 
 def write_review_audit_records(

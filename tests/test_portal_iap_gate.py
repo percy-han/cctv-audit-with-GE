@@ -720,3 +720,56 @@ def test_review_noop_is_skipped(tmp_path: Path) -> None:
     res = asyncio.run(_apply(tmp_path, gw, lambda records, bucket: pytest.fail("no-op must not be logged")))
     assert res["ok"] is True and res["updated_count"] == 0
     assert gw.update_calls == []
+
+
+def test_default_audit_client_does_not_need_google_cloud_storage(monkeypatch):
+    """Regression (Round 86 live deploy): the worker image has no google-cloud-storage; the default
+    audit-log client must use the JSON API via google-auth + urllib with ifGenerationMatch=0."""
+    import builtins
+    import urllib.request
+
+    from cctv_audit import review_audit_log as ral
+
+    real_import = builtins.__import__
+
+    def _no_storage(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "google.cloud" and fromlist and "storage" in fromlist:
+            raise ImportError("cannot import name 'storage' from 'google.cloud'")
+        if name == "google.cloud.storage":
+            raise ImportError("no google-cloud-storage")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _no_storage)
+
+    class _Creds:
+        token = "tok"
+
+        def refresh(self, _req):
+            return None
+
+    import google.auth
+    monkeypatch.setattr(google.auth, "default", lambda scopes=None, **kw: (_Creds(), "p"))
+    sent = []
+
+    class _Resp:
+        def read(self):
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _urlopen(req, timeout=0):
+        sent.append(req)
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    rec = {"ts_utc": "2026-10-23T12:00:00.000001Z", "job_id": "j1", "batch_id": "", "phase": "requested"}
+    out = ral.write_review_audit_records([rec], bucket="bkt")
+    assert out and out[0].startswith("gs://bkt/audit_logs/reviews/2026/10/23/j1/")
+    assert len(sent) == 1
+    url = sent[0].full_url
+    assert "ifGenerationMatch=0" in url and "uploadType=media" in url and "/b/bkt/o" in url
+    assert sent[0].get_header("Authorization") == "Bearer tok"
