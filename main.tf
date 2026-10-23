@@ -370,8 +370,8 @@ locals {
     },
     var.workspace_impersonate_user == "" ? {} : { WORKSPACE_IMPERSONATE_USER = var.workspace_impersonate_user },
   )
-  # gcloud --set-env-vars with a custom delimiter (values may contain ',' or '@').
-  portal_env_flag = join("##", [for k in sort(keys(local.portal_env)) : "${k}=${local.portal_env[k]}"])
+  # Passed to deploy/deploy_portal_service.py as one JSON object (jsonencode sorts the keys).
+  portal_env_json = jsonencode(local.portal_env)
 
   # "<label> (<company>)", "<label>", "<company>" or, with neither set, the stack name.
   ge_brand = (
@@ -991,10 +991,12 @@ removed {
 # 4c. Supervisor portal behind Cloud Run direct IAP (Round 86A).
 # The GA google provider (6.x) has no `iap_enabled` on google_cloud_run_v2_service, so a managed
 # service resource would let a later apply silently drop IAP. <p>-portal is therefore deployed
-# ONLY by this local-exec (`gcloud run deploy --iap`), re-run whenever the image digest or any
-# portal setting in triggers_replace changes. Deliberately NO destroy-time provisioner (a destroy
-# provisioner on a replaced terraform_data once wiped prod, Round 71b): removing the stack or
-# setting enable_portal_iap = false leaves the portal service in place; delete it with
+# ONLY by deploy/deploy_portal_service.py (Cloud Run Admin API v2 with iapEnabled=true, plus the IAP
+# service agent and its run.invoker binding; stdlib + google-auth, because the Cloud Build terraform
+# image has no gcloud), re-run whenever the image digest or any portal setting in triggers_replace
+# changes. Deliberately NO destroy-time provisioner (a destroy provisioner on a replaced
+# terraform_data once wiped prod, Round 71b): removing the stack or setting enable_portal_iap =
+# false leaves the portal service in place; delete it with
 # `gcloud run services delete <p>-portal` if it is no longer wanted.
 resource "google_project_service" "iap" {
   count              = var.enable_portal_iap ? 1 : 0
@@ -1012,44 +1014,22 @@ resource "terraform_data" "portal_service" {
     var.container_image,
     local.portal_service_name,
     data.google_service_account.audit_worker_sa.email,
-    sha256(local.portal_env_flag),
+    sha256(local.portal_env_json),
   ]
 
   provisioner "local-exec" {
-    interpreter = ["bash", "-c"]
     environment = {
-      PORTAL_PROJECT = var.project_id
-      PORTAL_REGION  = var.region
-      PORTAL_SERVICE = local.portal_service_name
-      PORTAL_IMAGE   = var.container_image
-      PORTAL_SA      = data.google_service_account.audit_worker_sa.email
-      PORTAL_ENV     = local.portal_env_flag
-      IAP_AGENT      = "serviceAccount:service-${data.google_project.current.number}@gcp-sa-iap.iam.gserviceaccount.com"
+      PORTAL_ENV_JSON = local.portal_env_json
     }
     command = <<-EOT
-      set -euo pipefail
-      gcloud beta services identity create --service=iap.googleapis.com --project="$PORTAL_PROJECT" --quiet
-      gcloud run deploy "$PORTAL_SERVICE" \
-        --image="$PORTAL_IMAGE" \
-        --region="$PORTAL_REGION" \
-        --project="$PORTAL_PROJECT" \
-        --service-account="$PORTAL_SA" \
-        --no-allow-unauthenticated \
-        --iap \
-        --ingress=all \
-        --min-instances=0 \
-        --max-instances=5 \
-        --cpu=1 \
-        --memory=1Gi \
-        --timeout=300 \
-        --set-env-vars="^##^$PORTAL_ENV" \
-        --quiet
-      gcloud run services add-iam-policy-binding "$PORTAL_SERVICE" \
-        --region="$PORTAL_REGION" \
-        --project="$PORTAL_PROJECT" \
-        --member="$IAP_AGENT" \
-        --role=roles/run.invoker \
-        --quiet
+      python3 ${path.module}/deploy/deploy_portal_service.py \
+        --project-id "${var.project_id}" \
+        --project-number "${data.google_project.current.number}" \
+        --region "${var.region}" \
+        --service "${local.portal_service_name}" \
+        --image "${var.container_image}" \
+        --service-account "${data.google_service_account.audit_worker_sa.email}" \
+        --env-json "$PORTAL_ENV_JSON"
     EOT
   }
 

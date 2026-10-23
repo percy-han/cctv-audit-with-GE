@@ -186,7 +186,8 @@ locals {
     "roles/serviceusage.serviceUsageAdmin", # google_project_service; X-Goog-User-Project quota header
     "roles/browser",                        # data.google_project (resourcemanager.projects.get)
     "roles/storage.admin",                  # staging bucket + its IAM; Terraform state; build source
-    "roles/run.admin",                      # Cloud Run service + invoker bindings
+    "roles/run.admin",                      # Cloud Run service + invoker bindings (incl. <p>-portal, iapEnabled)
+    "roles/iap.admin",                      # <p>-portal IAP access list (google_iap_web_cloud_run_service_iam_member); IAP resource IAM only, no project/SA IAM
     "roles/cloudscheduler.admin",           # watchdog job
     "roles/aiplatform.user",                # ReasoningEngine create/update/delete
     "roles/discoveryengine.admin",          # Gemini Enterprise engine + agent binding
