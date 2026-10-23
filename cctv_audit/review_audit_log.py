@@ -23,12 +23,16 @@ from typing import Any, Dict, List, Optional, Sequence
 
 logger = logging.getLogger("cctv_audit.review_audit_log")
 
-AUDIT_LOG_SCHEMA_VERSION = 1
+AUDIT_LOG_SCHEMA_VERSION = 2  # v2: + evidence_clip_url / evidence_clip_file_id / sheet_row_snapshot
 AUDIT_LOG_PREFIX = "audit_logs/reviews"
 PHASE_REQUESTED = "requested"
 PHASE_SHEET_WRITE_FAILED = "sheet_write_failed"
 
 _SAFE_SEGMENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_EVIDENCE_LINK_RE = re.compile(
+    r"(drive\.google\.com/(file/d/|open\?id=)|^gs://.+\.mp4|storage\.cloud\.google\.com/.+\.mp4)", re.IGNORECASE
+)
+_DRIVE_FILE_ID_RE = re.compile(r"(?:/file/d/|[?&]id=)([A-Za-z0-9_-]{10,})")
 
 
 class ReviewAuditLogError(RuntimeError):
@@ -101,6 +105,9 @@ def build_review_audit_record(
         return str(row[idx]) if len(row) > idx and row[idx] is not None else ""
 
     ts = (now or utc_now()).astimezone(_dt.timezone.utc)
+    cells = [("" if c is None else str(c)) for c in (row or [])]
+    evidence_url = next((c for c in cells if _EVIDENCE_LINK_RE.search(c)), "")
+    m = _DRIVE_FILE_ID_RE.search(evidence_url)
     return {
         "schema_version": AUDIT_LOG_SCHEMA_VERSION,
         "ts_utc": ts.isoformat().replace("+00:00", "Z"),
@@ -116,6 +123,11 @@ def build_review_audit_record(
         "rule_id": _cell(3),
         "disposition": _cell(4),
         "severity": _cell(5),
+        # The evidence clip the supervisor actually judged (source video + timestamp alone is ambiguous).
+        "evidence_clip_url": evidence_url,
+        "evidence_clip_file_id": m.group(1) if m else "",
+        # Full Tab-1 row as it was when the decision was made (description, confidence, links, ...).
+        "sheet_row_snapshot": cells,
         "old_status": old_status,
         "new_status": new_status,
         "old_note": old_note,

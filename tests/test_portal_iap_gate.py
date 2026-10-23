@@ -651,7 +651,7 @@ def test_review_writes_audit_record_before_sheet_iap(tmp_path: Path) -> None:
     assert rec["job_id"] == "jobA" and rec["batch_id"] == "" and rec["store_job_id"] == ""
     assert rec["client_ip"] == "203.0.113.7" and rec["user_agent"] == "pytest-UA"
     assert rec["report_sheet_url"].endswith("/SheetAAAAAAAAAAAAA/edit")
-    assert rec["schema_version"] == 1 and rec["ts_utc"].endswith("Z")
+    assert rec["schema_version"] == 2 and rec["ts_utc"].endswith("Z")
     assert gw.rows[0][9] == "✅ CONFIRMED"
 
 
@@ -773,3 +773,26 @@ def test_default_audit_client_does_not_need_google_cloud_storage(monkeypatch):
     url = sent[0].full_url
     assert "ifGenerationMatch=0" in url and "uploadType=media" in url and "/b/bkt/o" in url
     assert sent[0].get_header("Authorization") == "Bearer tok"
+
+
+def test_audit_record_captures_the_evidence_clip_and_row_snapshot():
+    """The decision is about one evidence clip, not the whole source video: record its link/file id
+    and the full Tab-1 row (real Sheet layout: link is not at a fixed header index)."""
+    from cctv_audit.review_audit_log import AUDIT_LOG_SCHEMA_VERSION, build_review_audit_record
+
+    row = ["8d62e1", "cam.mp4", "00:15 (Slice#0 @00:15)", "A2", "CONFIRMED", "RED_LINE", 0.98,
+           "Staff_A did not wash hands", "https://drive.google.com/file/d/1AbCdEfGhIjKlMn_op-Q/view", "PENDING"]
+    rec = build_review_audit_record(
+        reviewer_email="a@x.com", reviewer_source="iap", job_id="8d62e1", batch_id="b1", store_job_id="8d62e1",
+        composite_key="k", row=row, old_status="PENDING", new_status="✅ CONFIRMED", old_note="", new_note="",
+        report_sheet_url="", client_ip="", user_agent="")
+    assert AUDIT_LOG_SCHEMA_VERSION == 2 and rec["schema_version"] == 2
+    assert rec["evidence_clip_url"] == "https://drive.google.com/file/d/1AbCdEfGhIjKlMn_op-Q/view"
+    assert rec["evidence_clip_file_id"] == "1AbCdEfGhIjKlMn_op-Q"
+    assert rec["sheet_row_snapshot"][7] == "Staff_A did not wash hands"
+    assert rec["sheet_row_snapshot"][6] == "0.98"
+    empty = build_review_audit_record(
+        reviewer_email="", reviewer_source="hmac_link", job_id="j", batch_id="", store_job_id="",
+        composite_key="k", row=["j", "v.mp4"], old_status="", new_status="", old_note="", new_note="",
+        report_sheet_url="", client_ip="", user_agent="")
+    assert empty["evidence_clip_url"] == "" and empty["evidence_clip_file_id"] == ""
