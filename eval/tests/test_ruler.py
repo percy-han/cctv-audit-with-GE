@@ -189,6 +189,22 @@ class ScoreRunTest(unittest.TestCase):
         self.assertEqual(sr.classify_temporal_mode(ice_item, ice_item["parts"][0]), "WINDOW")
         self.assertEqual(sr.part_window_sec("WINDOW"), 60)
 
+        # Cross-contamination chains under merged "1.5 Handwashing" clause (R02/R03) must be WINDOW (±60s), not POINT (±20s).
+        r02_chain = {
+            "item_id": "R02",
+            "audit_clause": "1.5 Handwashing and Sanitation Standard",
+            "finding_verbatim": "Footage 3: 120040 Partner touches her hair and her spectacles and touches the ice maker machine without handwashing",
+            "parts": [{"part_id": "R02", "description": "Footage 3: 120040 Partner touches her hair and her spectacles and touches the ice maker machine without handwashing", "osd_times": ["12:00:40"]}],
+        }
+        r03_chain = {
+            "item_id": "R03",
+            "audit_clause": "1.5 Handwashing and Sanitation Standard",
+            "finding_verbatim": "Footage 4: 120723 Partner touches spit guard and resumes front bar production without handwashing",
+            "parts": [{"part_id": "R03", "description": "Footage 4: 120723 Partner touches spit guard and resumes front bar production without handwashing", "osd_times": ["12:07:23"]}],
+        }
+        self.assertEqual(sr.classify_temporal_mode(r02_chain, r02_chain["parts"][0]), "WINDOW")
+        self.assertEqual(sr.classify_temporal_mode(r03_chain, r03_chain["parts"][0]), "WINDOW")
+
         # Finding at +25s from label: must be REJECTED for POINT (±20s) but ACCEPTED for WINDOW (±60s).
         job_25s = {"job_id": "j", "completed_segments": {
             "a": {"filename": "a.mov", "segment_index": 0, "findings": [

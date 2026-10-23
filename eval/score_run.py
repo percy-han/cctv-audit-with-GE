@@ -70,6 +70,18 @@ POINT_ACTION_KEYWORDS: tuple[str, ...] = (
     "not rinse hand before applying handwashing gel",
 )
 
+CROSS_CONTAMINATION_CHAIN_KEYWORDS: tuple[str, ...] = (
+    "without handwashing",
+    "without washing hand",
+    "cross contamination",
+    "cross-contamination",
+    "resumes front bar",
+    "resume production",
+    "resume touches",
+    "未洗手",
+    "交叉污染",
+)
+
 
 def classify_temporal_mode(item: dict[str, Any], part: dict[str, Any] | None = None) -> str:
     """Temporal mode of a golden part; see ``temporal_mode_and_source``."""
@@ -101,9 +113,11 @@ def temporal_mode_and_source(item: dict[str, Any], part: dict[str, Any] | None =
         return "WINDOW", "heuristic"
     clause = str(item.get("audit_clause") or "").strip().lower()
     desc = str((part or {}).get("description") or item.get("finding_verbatim") or "").strip().lower()
-    if "1.5 handwashing" in clause:
-        return "POINT", "heuristic"
     if any(kw in desc for kw in POINT_ACTION_KEYWORDS):
+        return "POINT", "heuristic"
+    if any(kw in desc for kw in CROSS_CONTAMINATION_CHAIN_KEYWORDS):
+        return "WINDOW", "heuristic"
+    if "1.5 handwashing" in clause:
         return "POINT", "heuristic"
     return "WINDOW", "heuristic"
 
@@ -237,10 +251,12 @@ JUDGE_TEMPLATE = """You are an expert evaluator for retail tea store CCTV SOP au
 
 Scoring Rubric (evaluate strictly against the candidate findings above; do not hallucinate video content; differences in SOP clause numbering do not affect the score):
 - 1.0: At least one candidate describes the SAME moment, SAME person, and SAME violation behavior (wording may differ).
-  Example: If the label says "Soaping time is less than 20s", the candidate must explicitly note insufficient rubbing/lathering/soaping duration or handwashing step duration.
-- 0.5: A candidate points to the same moment, action, or object, but reports a different issue or only partially covers the labelled violation.
-  Example: If the label says "Soaping time is less than 20s", the candidate only states "improper handwashing / did not follow 5-step handwashing" without mentioning duration.
-- 0.0: No candidate describes this violation.
+  Example 1: If the label says "Soaping time is less than 20s", the candidate must explicitly note insufficient rubbing/lathering/soaping duration or handwashing step duration.
+  Example 2: If the label describes a multi-step cross-contamination chain (e.g., touching hair/spectacles/spit guard/cleaning tool and resuming work or touching equipment without handwashing), score 1.0 when a candidate captures both the contamination contact and resuming work / touching equipment without handwashing.
+- 0.5: A candidate points to the same moment, action, person, or object, but reports a different sub-description or only partially covers the labelled violation chain.
+  Example 1 (Sink action): If the label says "Soaping time is less than 20s", the candidate only states "improper handwashing / did not follow 5-step handwashing" without mentioning duration.
+  Example 2 (Cross-contamination / unwashed-hand chain): If the label says "Partner touches [hair / spectacles / spit guard] and [touches ice maker / resumes front bar production] without handwashing", score 0.5 when a candidate in the window captures the core unwashed-hand / glove / cross-contamination violation or the downstream equipment/ice/bar action around that timestamp (e.g., reports touching a face mask, mobile phone, pockets, or other unwashed surface and continuing work / donning gloves / handling ice or utensils without handwashing, or reports an improper action at the ice maker / bar in that window) even if the staff ID/pronoun (e.g., Staff_A vs. Staff_B, he/she/her) or the specific prior trigger object (spit guard vs. mask/phone, or hair/spectacles vs. unwashed surfaces/pockets) differs, or only one stage of the chain is described.
+- 0.0: No candidate describes this violation or any part of its causal chain.
 
 Return ONLY valid JSON with no extra text:
 {{"score": <0 or 0.5 or 1>, "explanation": "MATCH=<matched candidate ID(s), comma-separated, or NONE>; <one-sentence explanation in English quoting key evidence from the candidate>"}}"""
