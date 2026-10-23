@@ -326,7 +326,7 @@ class EvalRecordsTest(unittest.TestCase):
             ]
         }
         rec = mp.build_eval_monitoring_record(
-            project_id="example-project-000000",
+            project_id="study-project-496907",
             round_id="r01",
             run_id="r01_b",
             model_version="gemini-3.8-flash",
@@ -392,100 +392,6 @@ class EvalRecordsTest(unittest.TestCase):
             self.assertAlmostEqual(r_avg["metrics"]["overall_recall"], (0.60 + 0.7895) / 2, places=5)
             self.assertAlmostEqual(r_avg["metrics"]["findings_per_clip"], 2.5, places=5)
             self.assertAlmostEqual(r_avg["video_breakdown"]["a.mov"]["findings_count"], 2.5, places=2)
-
-        sample_golden = [
-            {
-                "item_id": "R02",
-                "sheet_row": 2,
-                "split": "dev",
-                "outlet_name": "1-Bau Cat",
-                "focus": "Handwashing",
-                "audit_clause": "4.2.1 Hand Washing Procedure",
-                "video_filenames": ["Footage 1.mov"],
-                "parts": [
-                    {
-                        "part_id": "R02_p0",
-                        "osd_times": ["12:17:45"],
-                        "description": "Not wash hand for at least 20 seconds",
-                    }
-                ],
-            }
-        ]
-        score_with_parts = {
-            **score_doc,
-            "items": [
-                {
-                    "item_id": "R02",
-                    "score": 1.0,
-                    "parts": [{"part_id": "R02_p0", "score": 1.0, "explanation": "MATCH=0; 命中"}],
-                }
-            ],
-        }
-        items_spec = mp.build_agent_platform_evaluation_items(
-            round_id="r01",
-            run_id="r01_run1",
-            sop_version="v2.6_r01",
-            model_version="gemini-3.8-flash",
-            score_doc=score_with_parts,
-            golden_items=sample_golden,
-            job_docs=job_docs,
-            agent_engine_id="5931521464169725952",
-        )
-        self.assertEqual(len(items_spec), 1)
-        self.assertEqual(items_spec[0]["part_id"], "R02_p0")
-        self.assertIn("✓ 命中 (1.0)", items_spec[0]["formatted_response"])
-        self.assertEqual(items_spec[0]["agent_engine_id"], "5931521464169725952")
-
-        from types import SimpleNamespace
-
-        fake_eval_client = mock.MagicMock()
-        fake_eval_client.evals.create_evaluation_item.return_value = SimpleNamespace(
-            name="projects/596821501265/locations/us-central1/evaluationItems/111"
-        )
-        fake_eval_client.evals.create_evaluation_set.return_value = SimpleNamespace(
-            name="projects/596821501265/locations/us-central1/evaluationSets/222"
-        )
-        fake_eval_client.evals.create_evaluation_experiment.return_value = SimpleNamespace(
-            name="projects/596821501265/locations/us-central1/evaluationExperiments/333"
-        )
-        fake_eval_client.evals.create_evaluation_run.return_value = SimpleNamespace(
-            name="projects/596821501265/locations/us-central1/evaluationRuns/444"
-        )
-        fake_storage_client = mock.MagicMock()
-        with (
-            mock.patch("vertexai.Client", return_value=fake_eval_client),
-            mock.patch("google.cloud.storage.Client", return_value=fake_storage_client),
-        ):
-            pub_res = mp.publish_agent_platform_evaluation(
-                project_id="example-project-000000",
-                gcs_bucket="gs://example-project-000000-tfstate",
-                round_id="r01",
-                run_id="r01_run1",
-                sop_version="v2.6_r01",
-                model_version="gemini-3.8-flash",
-                score_doc=score_with_parts,
-                golden_items=sample_golden,
-                job_docs=job_docs,
-                agent_engine_id="5931521464169725952",
-            )
-        self.assertEqual(
-            pub_res,
-            {
-                "experiment_name": "projects/596821501265/locations/us-central1/evaluationExperiments/333",
-                "evaluation_set_name": "projects/596821501265/locations/us-central1/evaluationSets/222",
-                "evaluation_run_name": "projects/596821501265/locations/us-central1/evaluationRuns/444",
-            },
-        )
-        exp_call_kwargs = fake_eval_client.evals.create_evaluation_experiment.call_args.kwargs
-        self.assertIn("Recall 79.0%", exp_call_kwargs["display_name"])
-        self.assertEqual(
-            exp_call_kwargs["labels"]["vertex-ai-evaluation-agent-engine-id"],
-            "5931521464169725952",
-        )
-        self.assertEqual(
-            exp_call_kwargs["labels"]["vertex-ai-evaluation-set-name"],
-            "projects/596821501265/locations/us-central1/evaluationSets/222",
-        )
 
     def test_run_sheet_triggered_eval_extracts_nested_metrics_from_mon_record(self):
         """Regression test: `run_sheet_triggered_eval` must extract `overall_recall`, `holdout_recall`,
@@ -620,7 +526,7 @@ class EvalRecordsTest(unittest.TestCase):
                 status_line="ok",
             )
             with (
-                patch.dict("os.environ", {"GCP_PROJECT": "example-project-000000", "STAGING_BUCKET": "bkt"}),
+                patch.dict("os.environ", {"GCP_PROJECT": "study-project-496907", "STAGING_BUCKET": "bkt"}),
                 patch.object(rgr.PromptManager, "load_config_for_tab", _fake_load_cfg),
                 patch.object(rgr, "load_golden_source", return_value=("sheet", fake_golden_bundle)),
                 patch.object(rgr, "folder_specs_from_golden", return_value=[{"job_id": "job_01"}]),
