@@ -56,7 +56,7 @@ variable "vertex_model_location" {
 }
 
 # ---- Name overrides. Empty = derived from name_prefix. Only for adopting names that existed before
-# ---- name_prefix did (see your first environment's tfvars); new stacks leave them empty.
+# ---- name_prefix did (see study-project-496907.tfvars); new stacks leave them empty.
 
 variable "artifact_repository_id" {
   description = "Image repository ID (created by bootstrap/; must equal its artifact_repository_id). Empty = <name_prefix>-images."
@@ -857,6 +857,8 @@ resource "terraform_data" "vertex_reasoning_engine" {
     data.google_service_account.audit_worker_sa.email,
     var.enable_standalone_cloud_run ? google_cloud_run_v2_service.cctv_audit_worker[0].uri : "",
     var.workspace_impersonate_user,
+    var.enable_google_chat_notification ? var.google_chat_webhook_url : "",
+    local.portal_url,
   ]
 
   provisioner "local-exec" {
@@ -877,6 +879,7 @@ resource "terraform_data" "vertex_reasoning_engine" {
         --workspace-dwd-service-account "${data.google_service_account.audit_worker_sa.email}" \
         --workspace-impersonate-user "${var.workspace_impersonate_user}" \
         --google-chat-webhook-url "${var.enable_google_chat_notification ? var.google_chat_webhook_url : ""}" \
+        --portal-base-url "${local.portal_url}" \
         --wait-and-bind-ge \
         --ge-engine-id "${local.ge_engine_id}" ${local.extra_ge_engine_flags} \
         --ge-app-display-name "${local.ge_app_display_name}" \
