@@ -15,7 +15,7 @@
 # (trigger below) or running output manual_deploy_command.
 #
 # Project whose image repository and worker SA were created by ../main.tf before this root existed
-# (the first environment). Once, with owner credentials, before the first pipeline run:
+# (study-project-496907). Once, with owner credentials, before the first pipeline run:
 #   1. here: adopt_existing = true in <project_id>.tfvars, then the three commands above. The repo
 #      and the worker SA are imported, not re-created; IAM grants that already exist are merged.
 #   2. in ..: terraform init -migrate-state -force-copy -backend-config=<project_id>.gcs.tfbackend
@@ -68,7 +68,7 @@ variable "display_label" {
 }
 
 # ---- Name overrides. Empty = derived from name_prefix. Only for adopting names that existed before
-# ---- name_prefix did (see the first environment's <env>.tfvars); new stacks leave them empty.
+# ---- name_prefix did (see study-project-496907.tfvars); new stacks leave them empty.
 
 variable "artifact_repository_id" {
   description = "Image repository ID; must equal artifact_repository_id in ../<env>.tfvars. Empty = <name_prefix>-images."
@@ -296,6 +296,15 @@ resource "google_service_account_iam_member" "deployer_act_as_worker" {
   member             = "serviceAccount:${google_service_account.deployer.email}"
 }
 
+# Allows the Cloud Build deploy pipeline (<p>-deployer) and deploy/init scripts to sign DWD JWTs on
+# <p>-worker via the IAM Credentials API (signJwt / signBlob) when verifying Domain-Wide Delegation
+# and auto-creating/populating the SOP Master Google Sheet during Stage B.
+resource "google_service_account_iam_member" "deployer_token_creator_on_worker" {
+  service_account_id = google_service_account.worker.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "serviceAccount:${google_service_account.deployer.email}"
+}
+
 # Push images, read tags, and manage the ReasoningEngine service agent's pull binding
 # (../main.tf reasoning_engine_image_puller) -- on this repository only.
 resource "google_artifact_registry_repository_iam_member" "deployer_repo_admin" {
@@ -334,6 +343,7 @@ resource "google_cloudbuild_trigger" "deploy_on_push" {
   depends_on = [
     google_project_iam_member.deployer,
     google_service_account_iam_member.deployer_act_as_worker,
+    google_service_account_iam_member.deployer_token_creator_on_worker,
     google_artifact_registry_repository_iam_member.deployer_repo_admin,
   ]
 }
@@ -346,6 +356,16 @@ output "deployer_service_account" {
 output "worker_service_account" {
   description = "Runtime identity of both tiers; its IAM is managed here, ../main.tf only reads it"
   value       = google_service_account.worker.email
+}
+
+output "workspace_dwd_client_id" {
+  description = "Client ID to enter in admin.google.com -> Security -> Access and data control -> API controls -> Manage Domain Wide Delegation -> Add new (one-time, never expires)"
+  value       = google_service_account.worker.unique_id
+}
+
+output "workspace_dwd_scopes" {
+  description = "OAuth scopes to authorise for workspace_dwd_client_id (comma-separated, paste as-is)"
+  value       = "https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/userinfo.profile"
 }
 
 output "image_repository" {

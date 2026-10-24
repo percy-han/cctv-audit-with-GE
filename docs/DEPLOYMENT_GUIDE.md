@@ -478,45 +478,53 @@ terraform output gemini_enterprise_console_url
 
 #### B2. 全网域委派授权（Workspace 超级管理员，一次）
 
-1. 拿到 Client ID 和范围（任选其一）：
+1. **自动打印的 Client ID 和 OAuth 范围**：
+   在阶段 A 执行 `bootstrap`（A3）和正式部署（A7/A8）结束时，Terraform 都会**自动打印** `workspace_dwd_client_id` 和 `workspace_dwd_scopes`。随时也可以用命令查看：
    ```bash
    terraform output workspace_dwd_client_id
    terraform output workspace_dwd_scopes
-   # 或者 bootstrap 之后就能查：
+   # 或者直接查服务账号 uniqueId：
    gcloud iam service-accounts describe <p>-worker@<PROJECT_ID>.iam.gserviceaccount.com --format='value(uniqueId)'
    ```
 2. `admin.google.com` → 安全（Security）→ 访问权限和数据控制（Access and data control）→ API 控制（API controls）→ 管理全网域委派（Manage Domain Wide Delegation）→ 添加（Add new）：
-   - 客户端 ID：上一步的数字
-   - OAuth 范围（原样粘贴 `workspace_dwd_scopes` 的值）：
+   - **客户端 ID（Client ID）**：粘贴上面打印出来的 21 位数字 `workspace_dwd_client_id`
+   - **OAuth 范围（OAuth Scopes）**：原样粘贴 `workspace_dwd_scopes` 的值：
      ```text
      https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/userinfo.profile
      ```
    - `drive`、`spreadsheets` 是必须的；`userinfo.profile` 只用于 Google Chat 通知里 `@` 发起人（没授权也不影响稽核，只是通知里显示纯邮箱）。
-3. 一般几分钟内生效。没生效时，GE 预检会提示 `Domain-Wide Delegation (DWD) is not yet active ...`。
+3. **怎么验证 DWD 有没有生效（一行命令预检）**：
+   添加完成后，直接执行下面的预检命令验证服务账号能否以机器人身份拿到 Drive/Sheets 令牌并检查云端硬盘配额：
+   ```bash
+   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+   .venv/bin/python scripts/init_sop_sheet.py --tfvars <env>.tfvars --check-dwd
+   ```
+   - **生效时**：打印 `✅ DWD PASSED: <p>-worker@<PROJECT_ID>.iam.gserviceaccount.com (Client ID: ...) -> cctv-bot@<customer-domain> (Drive quota: ... MB used / ... GB limit)`。
+   - **未生效或配置有误时**：直接指出具体原因（如 `unauthorized_client` 表示 DWD 还没生效或 Scope 漏填、`invalid_grant` 表示机器人账号不存在或未分许可），并给出修复命令，返回非 0 退出码。
 
 > [!NOTE]
 > Dashboard 的 Drive 权限检查也是靠这条 DWD 授权「以登录人自己的身份」查 Drive，所以**登录 Dashboard 的人必须是机器人账号同一个 Workspace 域里的用户**。
 
-#### B3. 创建 SOP 总控表（Google Sheet）
+#### B3. 自动创建并初始化 SOP 总控表（Google Sheet）并写回 `<env>.tfvars`
 
-总控表是 Drive 文件，Terraform 建不了，手动建一次。两种方式任选：
+只要 B2 的 `--check-dwd` 验证通过，**无需在浏览器里手工建表或导文件**，直接用一条命令让脚本通过 DWD 在机器人账号的 Google Drive 里自动新建 `CHAGEE_SOP_and_Model_Control_Tower` 总控表、写入全部 7 个标准页签与下拉菜单校验、共享给管理员或业务域，并自动把生成的 Sheet ID 写回 `<env>.tfvars`：
 
-**方式 1（推荐，浏览器导入，零命令行）**
+```bash
+.venv/bin/python scripts/init_sop_sheet.py \
+  --tfvars <env>.tfvars \
+  --check-dwd \
+  --create-sheet \
+  --share-with domain:<customer-domain> \
+  --update-tfvars
+```
 
-1. 新建空白 Google Sheet → 文件（File）→ 导入（Import）→ 上传（Upload）→ 选仓库里的 `sop/master_sheet.xlsx` → 导入位置选「替换电子表格（Replace spreadsheet）」→ 导入数据。
-2. 如果你是把 `.xlsx` 直接拖进 Drive 再打开的：文件名旁边有绿色 `.XLSX` 标记说明它还是 Excel 格式，Sheets API 读不了。点 文件 → 另存为 Google 表格（Save as Google Sheets），用新打开的那份（没有 `.XLSX` 标记）。
-3. 记下地址栏里的 Sheet ID（`/spreadsheets/d/<SheetID>/`）。
+- `--create-sheet`：若 `<env>.tfvars` 里的 `master_prompt_sheet_id` 为空或还是阶段 A 的 `gs://...` 种子路径，脚本会自动在机器人 Drive 下创建一张新 Google Sheet 并写入全部 7 个页签；若 `<env>.tfvars` 里已经填了某张 Google Sheet ID，则就地更新并校验该表。
+- `--share-with`：可传 `user:<邮箱>`、`group:<群组邮箱>` 或 `domain:<域名>`（可重复传多个），自动授予编辑者（Writer）权限，方便督导和管理员直接在浏览器打开编辑。
+- `--update-tfvars`：自动把新建的 Google Sheet ID 写回 `<env>.tfvars` 的 `master_prompt_sheet_id = "<SheetID>"`。
 
-**方式 2（命令行脚本写入）**
-
-1. 浏览器新建空白 Google Sheet，共享给 `<p>-worker@<PROJECT_ID>.iam.gserviceaccount.com`（编辑者）；DWD 已生效时也可以只共享给机器人账号。
-2. 执行：
-   ```bash
-   gcloud auth application-default login
-   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-   .venv/bin/python scripts/init_sop_sheet.py --sheet-id <SheetID> --tfvars <env>.tfvars
-   ```
-   `--tfvars` 会自动读出运行时服务账号和 `workspace_impersonate_user`；DWD 已生效就以机器人身份写，否则直接以服务账号身份写。表里已有同名页签时脚本不会覆盖，要覆盖加 `--overwrite`。只想先检查快照文件：`--dry-run`。
+> **备选方式（已有现成 Google Sheet 或浏览器手工导入）**：
+> - 如果客户已经有建好的空白 Google Sheet（已共享给机器人账号为编辑者），传 `--sheet-id <SheetID> --tfvars <env>.tfvars --overwrite --update-tfvars` 即可写入并更新配置。
+> - 如果想纯浏览器操作：新建空白 Google Sheet → 文件（File）→ 导入（Import）→ 上传 `sop/master_sheet.xlsx` → 选「替换电子表格（Replace spreadsheet）」，共享给机器人账号后把 Sheet ID 手工填入 `<env>.tfvars` 的 `master_prompt_sheet_id`。
 
 总控表的页签（来自 `sop/master_sheet.json`）：
 
@@ -531,11 +539,11 @@ terraform output gemini_enterprise_console_url
 
 > 程序也认旧的中文页签名（如 `Tab0_版本总控与回滚开关`、`Tab2_定时巡检配置表`），但新建请用上表的英文名，**不要改页签名和表头**。
 
-#### B4. 共享
+#### B4. 共享门店视频目录
 
 | 共享什么 | 给谁 | 权限 |
 | :--- | :--- | :--- |
-| SOP 总控表 | 机器人账号 | 编辑者（推荐：定时巡检要回写 `Tab2` 的 `Last_Run_Status`、测评要回写 `Tab3`、发现新模型要追加到 `Tab0` 候选列；只读稽核的话查看者也能跑） |
+| SOP 总控表 | 机器人账号 / 督导团队 | 用 B3 的 `--create-sheet --share-with` 创建时，机器人账号天然是所有者（Owner），且已自动共享给指定用户/域；若是手工建表，请共享给机器人账号为**编辑者** |
 | 门店视频根目录 / 各门店文件夹 | 机器人账号 | **编辑者**（报告表和证据切片要写回这个文件夹） |
 | 门店文件夹 / 报告表 | 每位要复核这家店的督导 | 至少查看者（决定他在 Dashboard 里能看哪家店） |
 | 测评用的黄金集视频目录 / 标注表 / 报告目录 | 机器人账号 | 见 4.5 |
@@ -543,18 +551,18 @@ terraform output gemini_enterprise_console_url
 > [!WARNING] 待验证
 > 视频放在**共享云端硬盘（Shared Drive）**还是普通「我的云端硬盘」共享文件夹，代码都支持（调用带 `supportsAllDrives`），但客户实际目录形态请在部署当天用一个真实门店文件夹跑一次预检确认。
 
-#### B5. 把总控表 ID 填回配置并重新部署
+#### B5. 执行 IaC 流水线完成绑定与部署
 
-编辑 `<env>.tfvars`：
+B3 的 `--update-tfvars` 已经自动把 `<env>.tfvars` 里的 `master_prompt_sheet_id` 和 `workspace_impersonate_user` 更新好了（确认无误即可）：
 
 ```hcl
-master_prompt_sheet_id     = "<SheetID>"                     # 裸 ID，或完整的 https://docs.google.com/spreadsheets/d/<ID>/... 链接
+master_prompt_sheet_id     = "<SheetID>"                     # B3 自动写入的 Google Sheet ID
 workspace_impersonate_user = "cctv-bot@<customer-domain>"
 ```
 
 `master_prompt_sheet_id` 在 `terraform plan` 阶段就会校验格式：误贴了 Drive **文件夹**链接会直接报错。
 
-然后**先预览再部署**（A6 → A7 的两条命令）。这次 plan 里正常应只看到 `terraform_data.vertex_reasoning_engine`、`terraform_data.portal_service[0]` replace 和 Cloud Run 服务 / 作业 in-place 更新。
+然后直接跑 **先预览（A6）再正式部署（A7）** 的两条 IaC 流水线命令，把总控表和机器人账号注入 `<p>-worker`、`<p>-worker-job`、`<p>-portal` 和 Vertex AI Agent Engine。这次 plan 里正常应只看到 `terraform_data.vertex_reasoning_engine`、`terraform_data.portal_service[0]` replace 和 Cloud Run 服务 / 作业 in-place 更新。
 
 > 改了 `master_prompt_sheet_id` 后，之前发出的 Dashboard 链接会失效（见 1.5），所以这一步要在正式使用前做。
 

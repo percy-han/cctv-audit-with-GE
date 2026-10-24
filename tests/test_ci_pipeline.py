@@ -439,9 +439,19 @@ def test_deployer_holds_no_role_that_can_change_iam() -> None:
         "every project-level grant to the deployer must come from deployer_project_roles"
     )
     sa_grants = [b for b in _hcl_blocks(boot, "resource", "google_service_account_iam_member") if deployer in b]
-    assert len(sa_grants) == 1, "the deployer's only service-account grant is actAs on the worker"
-    assert re.search(r"service_account_id\s*=\s*google_service_account\.worker\.name\s", sa_grants[0])
-    assert re.search(r'role\s*=\s*"roles/iam\.serviceAccountUser"', sa_grants[0])
+    assert len(sa_grants) == 2, "the deployer's only service-account grants are actAs and TokenCreator on the worker"
+    for grant in sa_grants:
+        assert re.search(r"service_account_id\s*=\s*google_service_account\.worker\.name\s", grant)
+    granted_sa_roles = {
+        m.group(1)
+        for g in sa_grants
+        for m in [re.search(r'role\s*=\s*"([^"]+)"', g)]
+        if m
+    }
+    assert granted_sa_roles == {
+        "roles/iam.serviceAccountUser",
+        "roles/iam.serviceAccountTokenCreator",
+    }
 
 
 def test_pipeline_stack_changes_no_project_or_service_account_iam() -> None:

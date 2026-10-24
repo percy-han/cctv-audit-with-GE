@@ -960,3 +960,93 @@ def test_resolve_chat_user_id_and_completion_notification_mention(monkeypatch):
         assert AuditConfig().enable_google_chat_notification is True
 
     gcp_mod._chat_user_id_cache.clear()
+
+
+def test_init_sop_sheet_check_dwd_and_create_sheet_update_tfvars(monkeypatch, tmp_path):
+    """Stage B IaC helpers: `check_dwd_status`, `create_master_spreadsheet`, and `update_tfvars_sheet_id`."""
+    import scripts.init_sop_sheet as init_mod
+
+    tfvars = tmp_path / "prod.tfvars"
+    tfvars.write_text(
+        'project_id = "demo-proj"\n'
+        'name_prefix = "cctvdry"\n'
+        'master_prompt_sheet_id = "gs://demo-proj-cctvdry-workspace/sop/master_sheet.xlsx"\n'
+        'workspace_impersonate_user = "cctv-bot@example.com"\n',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(init_mod, "_lookup_sa_unique_id", lambda sa: "112310606423705640938")
+
+    # 1. check_dwd_status fails with actionable Client ID + Scopes when DWD is unauthorized_client
+    def _fail_unauth(**kwargs):
+        raise RuntimeError("unauthorized_client: Client is unauthorized to retrieve access tokens")
+
+    monkeypatch.setattr(init_mod, "build_sheets_credentials", _fail_unauth)
+    with pytest.raises(RuntimeError) as exc_info:
+        init_mod.check_dwd_status("cctvdry-worker@demo-proj.iam.gserviceaccount.com", "cctv-bot@example.com")
+    msg = str(exc_info.value)
+    assert "112310606423705640938" in msg
+    assert "https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/userinfo.profile" in msg
+
+    # 2. check_dwd_status succeeds when Drive about().get returns valid storage quota
+    class _FakeDriveAbout:
+        def about(self):
+            return self
+
+        def get(self, **kwargs):
+            return _Req(
+                {
+                    "user": {"emailAddress": "cctv-bot@example.com", "displayName": "CCTV Bot"},
+                    "storageQuota": {"limit": str(30 * 1024 ** 3), "usage": str(128 * 1024 ** 2)},
+                }
+            )
+
+    monkeypatch.setattr(init_mod, "build_sheets_credentials", lambda **kw: object())
+    import googleapiclient.discovery as disc_mod
+
+    shared_perms: list[dict] = []
+
+    class _FakePerms:
+        def create(self, **kwargs):
+            shared_perms.append(kwargs)
+            return _Req({"id": "perm1"})
+
+    class _FakeDriveCreate(_FakeDriveAbout):
+        def permissions(self):
+            return _FakePerms()
+
+    class _FakeSpreadsheetsCreate:
+        def spreadsheets(self):
+            return self
+
+        def create(self, **kwargs):
+            return _Req({"spreadsheetId": "1AutoCreatedSopMasterSheetId0000001"})
+
+    def _fake_build(api, version, credentials=None, cache_discovery=False):
+        if api == "drive":
+            return _FakeDriveCreate()
+        return _FakeSpreadsheetsCreate()
+
+    monkeypatch.setattr(disc_mod, "build", _fake_build)
+    info = init_mod.check_dwd_status("cctvdry-worker@demo-proj.iam.gserviceaccount.com", "cctv-bot@example.com")
+    assert info["client_id"] == "112310606423705640938"
+    assert info["user_email"] == "cctv-bot@example.com"
+    assert info["storage_limit_bytes"] == 30 * 1024 ** 3
+
+    # 3. create_master_spreadsheet creates Sheet and shares with domain + user
+    new_sid = init_mod.create_master_spreadsheet(
+        object(),
+        title="CHAGEE_SOP_and_Model_Control_Tower",
+        share_with=["domain:example.com", "admin@example.com"],
+    )
+    assert new_sid == "1AutoCreatedSopMasterSheetId0000001"
+    assert len(shared_perms) == 2
+    assert shared_perms[0]["body"] == {"type": "domain", "role": "writer", "domain": "example.com"}
+    assert shared_perms[1]["body"] == {"type": "user", "role": "writer", "emailAddress": "admin@example.com"}
+
+    # 4. update_tfvars_sheet_id updates master_prompt_sheet_id in-place
+    init_mod.update_tfvars_sheet_id(tfvars, new_sid, impersonate_user="cctv-audit-bot@example.com")
+    parsed = init_mod.parse_tfvars(tfvars)
+    assert parsed["master_prompt_sheet_id"] == "1AutoCreatedSopMasterSheetId0000001"
+    assert parsed["workspace_impersonate_user"] == "cctv-audit-bot@example.com"
+

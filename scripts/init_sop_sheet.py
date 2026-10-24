@@ -61,7 +61,12 @@ LEGACY_TAB_RENAME_MAP: dict[str, str] = {
 _SHEET_URL_RE = re.compile(r"/spreadsheets/d/([A-Za-z0-9_-]+)")
 _TFVAR_LINE_RE = re.compile(r'^\s*([a-zA-Z0-9_]+)\s*=\s*"([^"]*)"')
 _SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+_USERINFO_SCOPE = "https://www.googleapis.com/auth/userinfo.profile"
+_DWD_SCOPES = (_DRIVE_SCOPE, _SHEETS_SCOPE)
+_ALL_RECOMMENDED_DWD_SCOPES = f"{_DRIVE_SCOPE},{_SHEETS_SCOPE},{_USERINFO_SCOPE}"
 _CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+DEFAULT_SHEET_TITLE = "CHAGEE_SOP_and_Model_Control_Tower"
 
 
 def build_master_sheet_payload() -> dict[str, Any]:
@@ -491,10 +496,9 @@ def make_gcs_gateway(service_account: str = "") -> Any:
 
     gw = GcsStorageGateway()
     if service_account:
-        import google.auth
         from google.auth import impersonated_credentials
 
-        source_creds, _ = google.auth.default(scopes=[_CLOUD_PLATFORM_SCOPE])
+        source_creds = _get_source_cloud_platform_credentials()
         gw._creds = impersonated_credentials.Credentials(
             source_credentials=source_creds,
             target_principal=service_account,
@@ -502,6 +506,39 @@ def make_gcs_gateway(service_account: str = "") -> Any:
             lifetime=3600,
         )
     return gw
+
+
+def _get_source_cloud_platform_credentials() -> Any:
+    """Return cloud-platform source credentials from GOOGLE_OAUTH_ACCESS_TOKEN, ADC, or gcloud CLI."""
+    import subprocess
+    import google.auth
+    from google.auth.transport.requests import Request
+    from google.oauth2 import credentials as oauth2_credentials
+
+    env_token = os.environ.get("GOOGLE_OAUTH_ACCESS_TOKEN", "").strip()
+    if env_token:
+        return oauth2_credentials.Credentials(token=env_token)
+
+    try:
+        creds, _ = google.auth.default(scopes=[_CLOUD_PLATFORM_SCOPE])
+        strip = getattr(creds, "with_quota_project", None)
+        if callable(strip):
+            creds = strip(None)
+        if not creds.valid:
+            creds.refresh(Request())
+        return creds
+    except Exception:
+        res = subprocess.run(
+            ["gcloud", "auth", "print-access-token"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        token = (res.stdout or "").strip()
+        if res.returncode == 0 and token:
+            return oauth2_credentials.Credentials(token=token)
+        raise
 
 
 def enable_versioning(gw: Any, gcs_uri: str) -> bool:
@@ -543,29 +580,31 @@ def upload_to_gcs(gw: Any, gcs_uri: str, tabs: list[dict[str, Any]]) -> tuple[st
 def build_sheets_credentials(
     service_account: str = "",
     impersonate_user: str = "",
+    scopes: tuple[str, ...] = (_SHEETS_SCOPE,),
+    strict_dwd: bool = False,
 ) -> Any:
-    """Build Sheets API credentials.
+    """Build Sheets/Drive API credentials.
 
-    When `service_account` is given, uses standard `cloud-platform` ADC (from plain
-    `gcloud auth application-default login`, avoiding Google's OAuth block on `--scopes=spreadsheets`)
-    to impersonate `service_account` via IAM Credentials API. If `impersonate_user` is also set,
-    attempts Domain-Wide Delegation (`subject=impersonate_user`) first and falls back to direct
-    service-account impersonation if DWD is not yet active.
+    When `service_account` is given, uses standard `cloud-platform` ADC (or `gcloud auth print-access-token`,
+    avoiding Google's OAuth block on `--scopes=spreadsheets`) to impersonate `service_account` via IAM
+    Credentials API. If `impersonate_user` is also set, attempts Domain-Wide Delegation
+    (`subject=impersonate_user`) first and falls back to direct service-account impersonation if DWD is
+    not yet active (unless `strict_dwd=True`).
     """
     import google.auth
     from google.auth import impersonated_credentials
     from google.auth.transport.requests import Request
 
     if not service_account:
-        creds, _ = google.auth.default(scopes=[_SHEETS_SCOPE])
+        creds, _ = google.auth.default(scopes=list(scopes))
         return creds
 
-    source_creds, _ = google.auth.default(scopes=[_CLOUD_PLATFORM_SCOPE])
+    source_creds = _get_source_cloud_platform_credentials()
     if impersonate_user:
         dwd_creds = impersonated_credentials.Credentials(
             source_credentials=source_creds,
             target_principal=service_account,
-            target_scopes=[_SHEETS_SCOPE],
+            target_scopes=list(scopes),
             subject=impersonate_user,
             lifetime=3600,
         )
@@ -573,6 +612,8 @@ def build_sheets_credentials(
             dwd_creds.refresh(Request())
             return dwd_creds
         except Exception as exc:
+            if strict_dwd:
+                raise
             print(
                 f"note: DWD refresh as {impersonate_user} not ready ({exc}); "
                 f"falling back to direct service account {service_account} (share the Sheet with {service_account} as Editor).",
@@ -582,11 +623,188 @@ def build_sheets_credentials(
     sa_creds = impersonated_credentials.Credentials(
         source_credentials=source_creds,
         target_principal=service_account,
-        target_scopes=[_SHEETS_SCOPE],
+        target_scopes=list(scopes),
         lifetime=3600,
     )
     sa_creds.refresh(Request())
     return sa_creds
+
+
+def _lookup_sa_unique_id(service_account: str) -> str:
+    """Best-effort lookup of the numeric OAuth2 Client ID (`uniqueId`) of `service_account`."""
+    if not service_account or "@" not in service_account:
+        return "<workspace_dwd_client_id>"
+    project_id = service_account.split("@", 1)[1].split(".iam.gserviceaccount.com", 1)[0]
+    try:
+        import urllib.request
+
+        source_creds = _get_source_cloud_platform_credentials()
+        url = f"https://iam.googleapis.com/v1/projects/{project_id}/serviceAccounts/{service_account}"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {source_creds.token}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            uid = str(data.get("uniqueId", "")).strip()
+            if uid:
+                return uid
+    except Exception:
+        pass
+    return "<workspace_dwd_client_id>"
+
+
+def check_dwd_status(service_account: str, impersonate_user: str) -> dict[str, Any]:
+    """Verify keyless Domain-Wide Delegation for `(service_account, impersonate_user)` against Drive & Sheets.
+
+    Returns a summary dict with `client_id`, `service_account`, `impersonate_user`, `user_email`,
+    `storage_limit_bytes`, `storage_usage_bytes` on success, or raises `RuntimeError` with an
+    operator-actionable remediation guide on failure.
+    """
+    if not service_account:
+        raise RuntimeError(
+            "Missing worker service account (`--service-account` or `project_id` + `name_prefix` in `--tfvars`)."
+        )
+    if not impersonate_user:
+        raise RuntimeError(
+            "Missing `workspace_impersonate_user` (`--impersonate-user` or `workspace_impersonate_user` in `--tfvars`)."
+        )
+    client_id = _lookup_sa_unique_id(service_account)
+    try:
+        creds = build_sheets_credentials(
+            service_account=service_account,
+            impersonate_user=impersonate_user,
+            scopes=_DWD_SCOPES,
+            strict_dwd=True,
+        )
+        from googleapiclient.discovery import build
+
+        drive_svc = build("drive", "v3", credentials=creds, cache_discovery=False)
+        about = drive_svc.about().get(fields="user(emailAddress,displayName),storageQuota").execute()
+    except Exception as exc:
+        raw = str(exc)
+        if "unauthorized_client" in raw:
+            raise RuntimeError(
+                f"❌ Domain-Wide Delegation (DWD) is NOT yet active for {service_account} (Client ID: {client_id}).\n"
+                "Remediation (Workspace Super Admin in https://admin.google.com ):\n"
+                "  1. Go to Security -> Access and data control -> API controls -> Manage Domain Wide Delegation -> Add new\n"
+                f"  2. Client ID:    {client_id}\n"
+                f"  3. OAuth Scopes: {_ALL_RECOMMENDED_DWD_SCOPES}\n"
+                f"  (Raw error: {raw})"
+            ) from exc
+        if "invalid_grant" in raw:
+            raise RuntimeError(
+                f"❌ Impersonated Workspace bot user {impersonate_user!r} cannot be used (`invalid_grant`).\n"
+                "Remediation:\n"
+                f"  1. Verify that user {impersonate_user!r} exists in https://admin.google.com -> Directory -> Users, is not suspended,\n"
+                "     and has an active Google Workspace license with Google Drive storage.\n"
+                "  2. Or update `workspace_impersonate_user` in `<env>.tfvars` to the actual bot email you created.\n"
+                f"  (Raw error: {raw})"
+            ) from exc
+        if "signBlob" in raw or "signJwt" in raw or "PERMISSION_DENIED" in raw:
+            raise RuntimeError(
+                f"❌ Caller lacks `roles/iam.serviceAccountTokenCreator` on {service_account} to sign DWD JWTs.\n"
+                "Remediation (Project Owner):\n"
+                f"  gcloud iam service-accounts add-iam-policy-binding {service_account} \\\n"
+                '    --member="user:$(gcloud config get-value account)" \\\n'
+                '    --role="roles/iam.serviceAccountTokenCreator"\n'
+                f"  (Raw error: {raw})"
+            ) from exc
+        raise RuntimeError(f"❌ DWD verification failed for {impersonate_user} via {service_account}: {raw}") from exc
+
+    quota = about.get("storageQuota") or {}
+    limit_bytes = int(quota.get("limit", 0) or 0)
+    usage_bytes = int(quota.get("usage", 0) or 0)
+    user_info = about.get("user") or {}
+    if quota.get("limit") is not None and limit_bytes <= 0:
+        raise RuntimeError(
+            f"❌ DWD token exchange succeeded for {impersonate_user}, but Drive storage quota is 0 bytes.\n"
+            f"Remediation: Assign a paid Google Workspace license with Drive storage to {impersonate_user} in admin.google.com."
+        )
+    return {
+        "client_id": client_id,
+        "service_account": service_account,
+        "impersonate_user": impersonate_user,
+        "user_email": user_info.get("emailAddress", impersonate_user),
+        "display_name": user_info.get("displayName", ""),
+        "storage_limit_bytes": limit_bytes,
+        "storage_usage_bytes": usage_bytes,
+    }
+
+
+def create_master_spreadsheet(
+    creds: Any,
+    title: str = DEFAULT_SHEET_TITLE,
+    share_with: list[str] | None = None,
+) -> str:
+    """Create a brand-new Google Sheet in the authenticated identity's Drive and optionally share it."""
+    from googleapiclient.discovery import build
+
+    sheets_svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    created = sheets_svc.spreadsheets().create(
+        body={"properties": {"title": title}},
+        fields="spreadsheetId",
+    ).execute()
+    sheet_id = str(created["spreadsheetId"]).strip()
+
+    if share_with:
+        drive_svc = build("drive", "v3", credentials=creds, cache_discovery=False)
+        for raw_target in share_with:
+            target = (raw_target or "").strip()
+            if not target:
+                continue
+            if target.startswith("domain:"):
+                perm_body = {
+                    "type": "domain",
+                    "role": "writer",
+                    "domain": target.split(":", 1)[1].strip(),
+                }
+            elif target.startswith("group:"):
+                perm_body = {
+                    "type": "group",
+                    "role": "writer",
+                    "emailAddress": target.split(":", 1)[1].strip(),
+                }
+            else:
+                email = target.split(":", 1)[1].strip() if target.startswith("user:") else target
+                perm_body = {
+                    "type": "user",
+                    "role": "writer",
+                    "emailAddress": email,
+                }
+            drive_svc.permissions().create(
+                fileId=sheet_id,
+                body=perm_body,
+                sendNotificationEmail=False,
+                supportsAllDrives=True,
+            ).execute()
+            print(f"shared SOP Sheet {sheet_id} with {target} (writer)")
+    return sheet_id
+
+
+def update_tfvars_sheet_id(tfvars_path: Path, sheet_id: str, impersonate_user: str = "") -> None:
+    """Update `master_prompt_sheet_id` (and optionally `workspace_impersonate_user`) in-place in `tfvars_path`."""
+    text = tfvars_path.read_text(encoding="utf-8")
+    updated, count = re.subn(
+        r'^(\s*master_prompt_sheet_id\s*=\s*)"[^"]*"',
+        rf'\g<1>"{sheet_id}"',
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if count == 0:
+        updated = updated.rstrip() + f'\nmaster_prompt_sheet_id = "{sheet_id}"\n'
+    if impersonate_user:
+        updated, user_count = re.subn(
+            r'^(\s*workspace_impersonate_user\s*=\s*)"[^"]*"',
+            rf'\g<1>"{impersonate_user}"',
+            updated,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        if user_count == 0:
+            updated = updated.rstrip() + f'\nworkspace_impersonate_user = "{impersonate_user}"\n'
+    tfvars_path.write_text(updated, encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -605,6 +823,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tfvars", type=Path, default=None, help="Optional <env>.tfvars to auto-derive worker service account and workspace_impersonate_user")
     parser.add_argument("--service-account", default="", help="Worker service account email to impersonate via IAM Credentials API (uses plain cloud-platform ADC)")
     parser.add_argument("--impersonate-user", default="", help="Optional Workspace bot email for DWD subject")
+    parser.add_argument("--check-dwd", action="store_true", help="Verify that Domain-Wide Delegation (DWD) is active and the bot user has Google Drive storage quota")
+    parser.add_argument("--create-sheet", action="store_true", help="Automatically create a new Google Sheet in the bot user's Google Drive via DWD and populate all SOP tabs")
+    parser.add_argument("--sheet-title", default=DEFAULT_SHEET_TITLE, help=f"Title for --create-sheet (default: {DEFAULT_SHEET_TITLE!r})")
+    parser.add_argument("--share-with", action="append", default=[], help="Email, group:<email>, or domain:<domain> to share the newly created Sheet with as Editor (repeatable)")
+    parser.add_argument("--update-tfvars", action="store_true", help="Write the created/target Sheet ID (and --impersonate-user if passed) into --tfvars master_prompt_sheet_id")
     parser.add_argument("--overwrite", action="store_true", help="Clear and rewrite tabs whose titles already exist")
     parser.add_argument("--dry-run", action="store_true", help="Validate the snapshot only; do not call the API")
     args = parser.parse_args(argv)
@@ -619,6 +842,22 @@ def main(argv: list[str] | None = None) -> int:
     tabs = load_snapshot(args.snapshot)
     print(f"snapshot OK: {[(t['title'], len(t['values']) - 1) for t in tabs]} (rows excl. header)")
 
+    if args.check_dwd:
+        sa_email, bot_user = resolve_impersonation_targets(args.tfvars, args.service_account, args.impersonate_user)
+        try:
+            dwd_info = check_dwd_status(sa_email, bot_user)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        limit_gb = dwd_info["storage_limit_bytes"] / (1024 ** 3) if dwd_info["storage_limit_bytes"] else 0.0
+        usage_mb = dwd_info["storage_usage_bytes"] / (1024 ** 2) if dwd_info["storage_usage_bytes"] else 0.0
+        print(
+            f"✅ DWD PASSED: {dwd_info['service_account']} (Client ID: {dwd_info['client_id']}) "
+            f"-> {dwd_info['user_email']} (Drive quota: {usage_mb:.1f} MB used / {limit_gb:.1f} GB limit)"
+        )
+        if not args.create_sheet and not args.sheet_id and not args.gcs_uri and args.export_xlsx is None:
+            return 0
+
     gcs_uri = resolve_gcs_sop_uri(args.gcs_uri) if args.gcs_uri else resolve_gcs_sop_uri(args.sheet_id)
     if args.gcs_uri and not gcs_uri:
         parser.error(f"--gcs-uri is not a gs:// URI or Cloud Storage URL: {args.gcs_uri!r}")
@@ -626,7 +865,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.export_xlsx is not None:
         export_xlsx(tabs, args.export_xlsx)
         print(f"exported xlsx: {args.export_xlsx}")
-        if not args.sheet_id and not gcs_uri:
+        if not args.sheet_id and not gcs_uri and not args.create_sheet:
             return 0
 
     if args.dry_run:
@@ -651,20 +890,61 @@ def main(argv: list[str] | None = None) -> int:
               "roles/storage.objectViewer (or objectAdmin) on the bucket; later edits only need re-uploading the .xlsx")
         return 0
 
-    if not args.sheet_id:
-        parser.error("either --sheet-id or --export-xlsx (or --dry-run / --local-only) is required")
-
-    sheet_id = extract_sheet_id(args.sheet_id)
     sa_email, bot_user = resolve_impersonation_targets(args.tfvars, args.service_account, args.impersonate_user)
 
     from googleapiclient.discovery import build
 
-    creds = build_sheets_credentials(service_account=sa_email, impersonate_user=bot_user)
+    if args.create_sheet and not args.sheet_id:
+        # Check if --tfvars already has a valid Google Sheet ID (not empty and not gs://)
+        existing_sheet_in_tfvars = ""
+        if args.tfvars is not None and args.tfvars.exists():
+            raw_tfv_sheet = parse_tfvars(args.tfvars).get("master_prompt_sheet_id", "").strip()
+            if raw_tfv_sheet and not resolve_gcs_sop_uri(raw_tfv_sheet):
+                try:
+                    existing_sheet_in_tfvars = extract_sheet_id(raw_tfv_sheet)
+                except ValueError:
+                    existing_sheet_in_tfvars = ""
+        if existing_sheet_in_tfvars:
+            sheet_id = existing_sheet_in_tfvars
+            print(f"using existing Google Sheet ID from {args.tfvars}: {sheet_id}")
+            creds = build_sheets_credentials(
+                service_account=sa_email,
+                impersonate_user=bot_user,
+                scopes=_DWD_SCOPES,
+            )
+            overwrite_tabs = True
+        else:
+            if not bot_user:
+                parser.error("--create-sheet requires workspace_impersonate_user (via --tfvars or --impersonate-user)")
+            creds = build_sheets_credentials(
+                service_account=sa_email,
+                impersonate_user=bot_user,
+                scopes=_DWD_SCOPES,
+                strict_dwd=True,
+            )
+            sheet_id = create_master_spreadsheet(
+                creds,
+                title=args.sheet_title,
+                share_with=args.share_with,
+            )
+            print(f"created new SOP Master Google Sheet in {bot_user}'s Drive: {sheet_id}")
+            overwrite_tabs = True
+    else:
+        if not args.sheet_id:
+            parser.error("either --sheet-id, --create-sheet, --check-dwd, or --export-xlsx (or --dry-run / --local-only) is required")
+        sheet_id = extract_sheet_id(args.sheet_id)
+        creds = build_sheets_credentials(service_account=sa_email, impersonate_user=bot_user)
+        overwrite_tabs = args.overwrite
+
     service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    write_tabs(service, sheet_id, tabs, args.overwrite)
+    write_tabs(service, sheet_id, tabs, overwrite_tabs)
     verify(service, sheet_id, tabs)
+    if args.update_tfvars and args.tfvars is not None:
+        update_tfvars_sheet_id(args.tfvars, sheet_id, impersonate_user=args.impersonate_user)
+        print(f"updated {args.tfvars}: master_prompt_sheet_id = \"{sheet_id}\"")
     print(f"done: https://docs.google.com/spreadsheets/d/{sheet_id}/edit")
-    print("next: share it with the bot account and set master_prompt_sheet_id in <env>.tfvars")
+    if not (args.update_tfvars and args.tfvars is not None):
+        print("next: share it with the bot account and set master_prompt_sheet_id in <env>.tfvars")
     return 0
 
 
