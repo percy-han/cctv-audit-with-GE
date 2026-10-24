@@ -207,15 +207,11 @@ python3 -m venv .venv-deploy && .venv-deploy/bin/pip install --require-hashes -r
 
 | 检查项 | 报 ❌ 时的原因 | 管理员操作步骤 |
 | :--- | :--- | :--- |
-| **`[1/3] GE 登录方式（Identity Provider）`** | 新项目第一次打开 GE，尚未选择登录身份源 | **方式 A（命令行自动设）**：重跑上面命令加上 `--fix-idp` 参数。<br>**方式 B（网页点一下）**：打开 `https://console.cloud.google.com/gemini-enterprise/settings?project=<PROJECT_ID>`（或 `Integration` 页面）$\rightarrow$ 勾选第一个 **`Use Google Identity`** $\rightarrow$ 点击底部保存。 |
-| **`[2/3] GE License 席位池与管理员持证`** | 新项目还没从 Billing Account 划拨 GE 席位，或当前管理员自己还没分到 1 个席位 | **① 从账单划拨席位到新项目**：打开 `https://console.cloud.google.com/gemini-enterprise/licenses?project=<PROJECT_ID>` $\rightarrow$ 点击 **Distribute licenses / 分配许可**，从公司 Billing Account 划拨席位到本项目（区域选 `global`），建议同时勾选 **Auto-assign licenses on sign-in（首次登录自动分配）**。<br>**② 给部署管理员自己绑 1 个席位**：打开 `https://console.cloud.google.com/gemini-enterprise/user-license?project=<PROJECT_ID>` $\rightarrow$ 点击 **Add users / 添加用户**，填入当前管理员自己的邮箱并保存，确认状态为 `Assigned`。 |
+| **`[1/3] GE 登录方式（Identity Provider）`** | 新项目第一次打开 GE，尚未选择登录身份源 | **IaC 部署时会自动将其设为 `Use Google Identity` (`GSUITE`)**。如果在预检阶段就想一起清零，可在上面的预检命令末尾加 `--fix-idp`，或在 `https://console.cloud.google.com/gemini-enterprise/settings?project=<PROJECT_ID>` 勾选 **`Use Google Identity`** 保存。 |
+| **`[2/3] GE License 席位池与管理员持证`** | 新项目还没从 Billing Account 划拨 GE 席位 | **① 从账单划拨席位到新项目（必做）**：打开 `https://console.cloud.google.com/gemini-enterprise/licenses?project=<PROJECT_ID>` $\rightarrow$ 点击 **Distribute licenses / 分配许可**，从公司 Billing Account 划拨席位到本项目（区域选 `global`），建议同时勾选 **Auto-assign licenses on sign-in（首次登录自动分配）**。<br>**② 给部署管理员自己绑 1 个席位**：打开 `https://console.cloud.google.com/gemini-enterprise/user-license?project=<PROJECT_ID>` $\rightarrow$ 点击 **Add users / 添加用户**，填入当前管理员自己的邮箱并保存，确认状态为 `Assigned`。 |
 | **`[3/3] 项目内已有 GE 应用`** | 提示当前项目是否已有现成 GE 应用 | 如果客户是在**已有 GE 的老项目**里部署，这里会列出他们现成的 GE 应用 ID；把该 ID 填进 `<env>.tfvars` 的 `extra_ge_engine_ids = ["<已有应用ID>"]`，Agent 就会直接挂进他们平时用的 GE 里，员工不用换新网址。 |
 
-**第 3 步：重跑一次 `check-ge-prereqs`**，确认输出 `🎉 预检全部通过！` 后，再进入第 3 节开始正式部署。
-
-> [!NOTE]
-> **为什么流水线跑完后管理员还要跑一行 `bind-ge`（见 B8）？**
-> 因为 Cloud Build 自动流水线用的是后台服务账号（`<p>-deployer@...gserviceaccount.com`），Google 不允许给服务账号绑“真人的 GE License”。所以如果 Cloud Build 建好基础架构后提示 `Registered new ADK Agent ... FAILED: active Gemini Enterprise license is not available`，只需由上面这位已持证的管理员跑一行 `bind-ge` 命令（见 B8），5 秒即可把 Agent 挂进 GE。
+**第 3 步：重跑一次 `check-ge-prereqs`（可加 `--fix-idp`）**，确认输出 `🎉 预检全部通过！` 后，再进入第 3 节开始正式部署。只要部署前项目中已有激活的 GE License，**Cloud Build 流水线（`<p>-deployer` 服务账号）会在部署过程中全自动完成 `Use Google Identity` 设置和 GE Agent + 快捷指令气泡（Prompt Chips）挂载**，无需人工再去网页或命令行手动挂载。
 
 ---
 

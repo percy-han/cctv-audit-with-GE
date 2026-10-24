@@ -698,6 +698,26 @@ def ensure_gemini_enterprise_and_bind_agent(
     de_base = f"https://discoveryengine.googleapis.com/v1alpha/projects/{project_id}/locations/global/collections/default_collection"
     engine_create_error = ""
 
+    # 0. Ensure project-level GE Identity Provider (`aclConfig`) is initialized to Google Identity (`GSUITE`)
+    #    if the project has never configured an IDP yet (leaves existing GSUITE or THIRD_PARTY untouched).
+    acl_url = f"https://discoveryengine.googleapis.com/v1alpha/projects/{project_id}/locations/global/aclConfig"
+    acl_res = _call("GET", acl_url, project_id=project_id, ignore_errors=True)
+    if not acl_res.get("_http_error") and "idpConfig" in acl_res:
+        current_idp = str(acl_res.get("idpConfig", {}).get("idpType", "")).strip()
+        if current_idp in ("", "IDP_TYPE_UNSPECIFIED"):
+            patched_acl = _call(
+                "PATCH",
+                acl_url,
+                body={
+                    "name": f"projects/{project_id}/locations/global/aclConfig",
+                    "idpConfig": {"idpType": "GSUITE"},
+                },
+                project_id=project_id,
+                ignore_errors=True,
+            )
+            if not patched_acl.get("_http_error"):
+                print(f"🔧 Initialized project `{project_id}` GE Identity Provider to Google Identity (GSUITE).")
+
     # 1. Ensure a backing DataStore exists if we need to create a new Engine. A DataStore ID that was
     #    just deleted (e.g. by destroy-stack) stays reserved for hours ("is being deleted"), so fall back
     #    to `<ge_engine_id>-store-v2` instead of leaving the app uncreatable until then.
