@@ -513,6 +513,162 @@ def ensure_engine_prompt_chips(
     return synced
 
 
+def _detect_gcloud_user_email() -> str:
+    try:
+        acct = subprocess.check_output(
+            ["gcloud", "config", "get-value", "account"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        if "@" in acct and not acct.endswith(".gserviceaccount.com"):
+            return acct
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return ""
+
+
+def check_ge_prerequisites(
+    project_id: str,
+    *,
+    admin_email: str = "",
+    fix_idp: bool = False,
+) -> dict[str, Any]:
+    """Pre-deployment check for Gemini Enterprise project prerequisites:
+    1. Identity Provider (`aclConfig.idpConfig.idpType == 'GSUITE'`).
+    2. GE License distribution in the project (`userStores/default_user_store/userLicenses`)
+       and active license assignment for the deploying admin (`admin_email`).
+    3. Existing GE apps (`engines`) in the project.
+    """
+    resolved_email = (admin_email or _detect_gcloud_user_email()).strip().lower()
+    loc_base = f"https://discoveryengine.googleapis.com/v1alpha/projects/{project_id}/locations/global"
+    acl_url = f"{loc_base}/aclConfig"
+    acl_res = _call("GET", acl_url, project_id=project_id, ignore_errors=True)
+
+    if acl_res.get("_http_error"):
+        code = acl_res["_http_error"]
+        body_str = str(acl_res.get("_error_body", ""))
+        print(
+            f"❌ [1/3] 无法读取项目 `{project_id}` 的 Gemini Enterprise 配置 (HTTP {code})。\n"
+            f"   👉 请先确认已启用 API：\n"
+            f"      gcloud services enable discoveryengine.googleapis.com --project={project_id}\n"
+            f"   原始错误：{body_str[:300]}",
+            file=sys.stderr,
+        )
+        return {
+            "ok": False,
+            "idp_ok": False,
+            "license_ok": False,
+            "idp_type": "",
+            "assigned_count": 0,
+            "admin_email": resolved_email,
+            "admin_licensed": False,
+            "existing_engines": [],
+        }
+
+    idp_type = str(acl_res.get("idpConfig", {}).get("idpType", "")).strip()
+    if idp_type in ("", "IDP_TYPE_UNSPECIFIED") and fix_idp:
+        patched = _call(
+            "PATCH",
+            acl_url,
+            body={
+                "name": f"projects/{project_id}/locations/global/aclConfig",
+                "idpConfig": {"idpType": "GSUITE"},
+            },
+            project_id=project_id,
+            ignore_errors=True,
+        )
+        if not patched.get("_http_error"):
+            idp_type = str(patched.get("idpConfig", {}).get("idpType", "GSUITE")).strip()
+            print(f"🔧 已自动将项目 `{project_id}` 的 GE 登录方式设置为 Google Identity (GSUITE)。")
+
+    idp_ok = idp_type == "GSUITE"
+    if idp_ok:
+        print(f"✅ [1/3] GE 登录方式（Identity Provider）：已配置为 Google Identity (GSUITE)")
+    else:
+        print(
+            f"❌ [1/3] GE 登录方式（Identity Provider）未配置（当前状态：{idp_type or '未设置'}）\n"
+            f"   👉 管理员操作步骤（网页 10 秒完成，或重跑本命令加 `--fix-idp` 自动设置）：\n"
+            f"      1) 打开控制台：https://console.cloud.google.com/gemini-enterprise/settings?project={project_id}\n"
+            f"         （或进入 Gemini Enterprise -> Integration 页面）\n"
+            f"      2) 在 \"Choose an identity provider\" 页面，勾选第一个：\"Use Google Identity\"\n"
+            f"      3) 点击底部确认/保存按钮。"
+        )
+
+    lic_url = f"{loc_base}/userStores/default_user_store/userLicenses?pageSize=1000"
+    lic_res = _call("GET", lic_url, project_id=project_id, ignore_errors=True)
+    user_licenses = lic_res.get("userLicenses", []) if not lic_res.get("_http_error") else []
+    assigned_users: list[str] = []
+    for item in user_licenses:
+        state = str(item.get("licenseAssignmentState", "")).upper()
+        principal = str(item.get("userPrincipal", "")).strip().lower()
+        if principal and state in ("ASSIGNED", "LICENSE_ASSIGNMENT_STATE_ASSIGNED", ""):
+            assigned_users.append(principal)
+
+    assigned_count = len(assigned_users)
+    admin_licensed = bool(resolved_email and resolved_email in assigned_users)
+    license_ok = assigned_count > 0 and (admin_licensed or not resolved_email)
+
+    if license_ok:
+        admin_note = f"，且当前管理员 `{resolved_email}` 已持证" if resolved_email else ""
+        print(f"✅ [2/3] GE License 校验通过：当前项目已分配 {assigned_count} 个席位{admin_note}")
+    else:
+        if assigned_count == 0:
+            reason = f"当前项目 `{project_id}` 尚未分配任何 Gemini Enterprise 席位（已分配席位数 = 0）"
+        else:
+            reason = (
+                f"当前项目已有 {assigned_count} 个已分配席位，但当前执行部署的管理员账号 "
+                f"`{resolved_email}` 名下没有有效 GE License"
+            )
+        target_admin_hint = resolved_email or "admin@<客户域名>"
+        print(
+            f"❌ [2/3] GE License 校验未通过：{reason}\n"
+            f"   👉 管理员操作步骤（网页 1 分钟完成）：\n"
+            f"      第一步（若本项目是新建 Project，先把公司账单里的 GE 席位划拨给本项目）：\n"
+            f"        1) 打开：https://console.cloud.google.com/gemini-enterprise/licenses?project={project_id}\n"
+            f"        2) 点击 \"Distribute licenses\" / \"分配许可\"（或 Manage Subscriptions），从公司 Billing Account\n"
+            f"           划拨席位到本项目（区域选 global），建议同时勾选 \"Auto-assign licenses on sign-in\"（首次登录自动分配）。\n"
+            f"      第二步（给执行部署的管理员本人绑 1 个 License，否则无法往 GE 里注册 Agent）：\n"
+            f"        1) 打开：https://console.cloud.google.com/gemini-enterprise/user-license?project={project_id}\n"
+            f"        2) 点击 \"Add users\" / \"添加用户\"，输入管理员邮箱 `{target_admin_hint}` 并保存，确认状态为 Assigned。"
+        )
+
+    eng_url = f"{loc_base}/collections/default_collection/engines"
+    eng_res = _call("GET", eng_url, project_id=project_id, ignore_errors=True)
+    engines = eng_res.get("engines", []) if not eng_res.get("_http_error") else []
+    existing_engine_ids: list[str] = []
+    for eng in engines:
+        eng_id = str(eng.get("name", "")).rsplit("/", 1)[-1]
+        if eng_id:
+            existing_engine_ids.append(eng_id)
+
+    if existing_engine_ids:
+        print(
+            f"ℹ️ [3/3] 当前项目已存在 GE 应用：{existing_engine_ids}\n"
+            f"   💡 如果客户员工日常已经在用上述某个 GE 应用，可在 `<env>.tfvars` 中配置 "
+            f"`extra_ge_engine_ids = {json.dumps(existing_engine_ids)}`，把 Agent 同步挂进现有应用。"
+        )
+    else:
+        print("ℹ️ [3/3] 当前项目尚无 GE 应用（部署时将自动新建 `<name_prefix>-ge`）。")
+
+    overall_ok = idp_ok and license_ok
+    if overall_ok:
+        print(f"\n🎉 预检全部通过！项目 `{project_id}` 已具备 Gemini Enterprise 部署与 Agent 注册条件。")
+    else:
+        print(
+            f"\n⚠️ 预检未通过：请先由管理员按上方提示完成网页设置后，重新运行 `check-ge-prereqs` 确认全部变 ✅，再启动部署。",
+            file=sys.stderr,
+        )
+    return {
+        "ok": overall_ok,
+        "idp_ok": idp_ok,
+        "license_ok": license_ok,
+        "idp_type": idp_type,
+        "assigned_count": assigned_count,
+        "admin_email": resolved_email,
+        "admin_licensed": admin_licensed,
+        "existing_engines": existing_engine_ids,
+    }
+
 
 def ensure_gemini_enterprise_and_bind_agent(
     project_id: str,
@@ -1137,11 +1293,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--location",
-        default=os.environ.get("ENGINE_LOCATION", ""),
-        required=not bool(os.environ.get("ENGINE_LOCATION")),
-        help="Vertex AI ReasoningEngine region (or set ENGINE_LOCATION)",
+        default=os.environ.get("ENGINE_LOCATION", "global"),
+        required=False,
+        help="Vertex AI ReasoningEngine region (or set ENGINE_LOCATION; defaults to 'global')",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_check_ge = sub.add_parser(
+        "check-ge-prereqs",
+        help="Pre-deployment check: verify GE Identity Provider (Use Google Identity) and GE License assignment",
+    )
+    p_check_ge.add_argument(
+        "--admin-email",
+        default="",
+        help="Deploying admin's Google email (auto-detected from `gcloud config get-value account` if omitted)",
+    )
+    p_check_ge.add_argument(
+        "--fix-idp",
+        action="store_true",
+        default=False,
+        help="Automatically set Identity Provider to Google Identity (GSUITE) if unset",
+    )
 
     p_create = sub.add_parser(
         "create",
@@ -1329,6 +1501,14 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(res, indent=2))
     elif args.cmd == "seed-object":
         seed_gcs_object(args.bucket, args.name, args.source, args.content_type)
+    elif args.cmd == "check-ge-prereqs":
+        res = check_ge_prerequisites(
+            args.project_id,
+            admin_email=args.admin_email,
+            fix_idp=args.fix_idp,
+        )
+        if not res["ok"]:
+            raise SystemExit(1)
     return 0
 
 

@@ -315,7 +315,7 @@ def test_no_project_tenant_or_region_literal_in_stack_code(path):
     if path == "cloudbuild.yaml":
         # Only the substitution defaults (first environment) may carry its names.
         code = code.split("substitutions:")[0] + code.split("options:")[1]
-    for literal in ("chagee-cctv", "cctv-staging",
+    for literal in ("study-project-496907", "596821501265", "percyhan", "chagee-cctv", "cctv-staging",
                     "asia-southeast1", "us-central1", "Asia/Singapore", '"cctv-audit"', "CHAGEE"):
         assert literal not in code, f"{path} still hard-codes {literal!r}"
 
@@ -361,6 +361,20 @@ def test_bootstrap_passes_every_stack_substitution_to_cloud_build():
         assert key in block
     assert "merge(local.build_substitutions" in boot
     assert "--substitutions=${join(" in boot
+
+
+@pytest.mark.parametrize("path", ["study-project-496907.tfvars", "bootstrap/study-project-496907.tfvars"])
+def test_first_environment_pins_its_legacy_names(path):
+    text = _tf(path)
+    assert 'name_prefix' in text and '"chagee-cctv-audit"' in text
+    assert 'artifact_repository_id = "cctv-audit"' in text
+    if path.startswith("bootstrap"):
+        assert 'deployer_account_id    = "chagee-cctv-deployer"' in text
+        assert 'display_label          = "Chagee CCTV"' in text
+    else:
+        assert 'staging_bucket_name    = "study-project-496907-cctv-staging-sg"' in text
+        assert 'ge_engine_id           = "chagee-cctv-enterprise"' in text
+        assert 'extra_ge_engine_ids = ["cctv-audit"]' in text
 
 
 @pytest.mark.parametrize("prefix,ok", [
@@ -895,3 +909,48 @@ def test_seed_object_never_overwrites_an_existing_object(tmp_path, monkeypatch, 
     monkeypatch.setattr(deploy.urllib.request, "urlopen", boom)
     with pytest.raises(SystemExit, match="HTTP 403"):
         deploy.seed_gcs_object("bkt", "sop/master_sheet.xlsx", str(src), "application/x")
+
+
+def test_check_ge_prereqs_reports_missing_idp_and_license_then_passes(monkeypatch, capsys):
+    """Pre-deployment GE check flags unset IDP and missing admin license, supports --fix-idp, and passes when ready."""
+    state = {
+        "idpType": "IDP_TYPE_UNSPECIFIED",
+        "licenses": [],
+        "engines": [{"name": "projects/my-project/locations/global/collections/default_collection/engines/existing-ge"}],
+    }
+
+    def fake_call(method, url, body=None, project_id="", ignore_errors=False):
+        if url.endswith("/aclConfig"):
+            if method == "PATCH":
+                state["idpType"] = body["idpConfig"]["idpType"]
+            return {"idpConfig": {"idpType": state["idpType"]}}
+        if "/userLicenses" in url:
+            return {"userLicenses": state["licenses"]}
+        if url.endswith("/engines"):
+            return {"engines": state["engines"]}
+        return {}
+
+    monkeypatch.setattr(deploy, "_call", fake_call)
+
+    # 1. Both IDP and license missing -> exit code 1 with actionable instructions
+    with pytest.raises(SystemExit) as exc:
+        deploy.main(["--project-id", "my-project", "check-ge-prereqs", "--admin-email", "admin@chagee.com.sg"])
+    assert exc.value.code == 1
+    out = capsys.readouterr()
+    assert "Use Google Identity" in out.out
+    assert "Distribute licenses" in out.out
+    assert "admin@chagee.com.sg" in out.out
+    assert "existing-ge" in out.out
+
+    # 2. --fix-idp sets GSUITE, and once admin has an ASSIGNED license, returns 0
+    state["licenses"] = [
+        {"userPrincipal": "admin@chagee.com.sg", "licenseAssignmentState": "ASSIGNED"},
+    ]
+    rc = deploy.main(
+        ["--project-id", "my-project", "check-ge-prereqs", "--admin-email", "admin@chagee.com.sg", "--fix-idp"]
+    )
+    assert rc == 0
+    out2 = capsys.readouterr()
+    assert state["idpType"] == "GSUITE"
+    assert "✅ [1/3]" in out2.out and "✅ [2/3]" in out2.out
+

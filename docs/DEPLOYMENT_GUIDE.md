@@ -175,13 +175,47 @@ gcloud org-policies describe constraints/iam.allowedPolicyMemberDomains --projec
 Terraform 启用 API 本身要靠 Service Usage API，建状态桶要靠 Cloud Storage API。新项目通常默认已开，保险起见先执行一次：
 
 ```bash
-gcloud services enable serviceusage.googleapis.com cloudresourcemanager.googleapis.com storage.googleapis.com --project=<PROJECT_ID>
+gcloud services enable serviceusage.googleapis.com cloudresourcemanager.googleapis.com storage.googleapis.com discoveryengine.googleapis.com --project=<PROJECT_ID>
 ```
 
 > [!IMPORTANT]
 > **全新项目还要补两件事**（试部署时都碰到了），具体命令在下文阶段 A 的「A5. 新项目：补齐权限与服务代理」，必须在 bootstrap 之后、第一次跑流水线（A6）之前做：
 > 1. 给 Cloud Build 默认服务账号 `<PROJECT_NUMBER>@cloudbuild.gserviceaccount.com` 授予 `roles/logging.logWriter`；
 > 2. 手动创建 Discovery Engine 和 Vertex AI 的服务代理（Terraform 要给它们授权，但新项目里它们还不存在）。
+
+### 2.4 部署前 GE 登录方式与 License 一键预检（客户管理员必做）
+
+**为什么要先查这一步？**
+客户的 Gemini Enterprise（GE）席位虽然买在公司的 **Billing Account（结算账号）** 上，但**如果是新开的 GCP Project**，默认会有两个卡点：
+1. 新 Project 还没选“员工用什么账号登录（Identity Provider）”；
+2. 新 Project 默认是 **0 个 GE 席位**（还没从公司账单账号划拨过来），且执行部署的管理员名下在该项目里还没有绑上 GE License。如果不提前设好，后面往 GE 里挂 Agent 时会被拒（报 `active Gemini Enterprise license is not available`）。
+
+**第 1 步：克隆代码并跑一键预检脚本**
+
+```bash
+git clone https://github.com/percy-han/cctv-audit-with-GE.git
+cd cctv-audit-with-GE
+gcloud auth login <管理员邮箱>
+gcloud config set project <PROJECT_ID>
+gcloud auth application-default login
+
+python3 -m venv .venv-deploy && .venv-deploy/bin/pip install --require-hashes -r deploy/requirements-deploy.txt
+.venv-deploy/bin/python deploy/deploy_reasoning_engine.py --project-id <PROJECT_ID> check-ge-prereqs --admin-email <管理员邮箱>
+```
+
+**第 2 步：根据预检输出处理（若报 ❌，管理员在网页 1 分钟点完）**
+
+| 检查项 | 报 ❌ 时的原因 | 管理员操作步骤 |
+| :--- | :--- | :--- |
+| **`[1/3] GE 登录方式（Identity Provider）`** | 新项目第一次打开 GE，尚未选择登录身份源 | **方式 A（命令行自动设）**：重跑上面命令加上 `--fix-idp` 参数。<br>**方式 B（网页点一下）**：打开 `https://console.cloud.google.com/gemini-enterprise/settings?project=<PROJECT_ID>`（或 `Integration` 页面）$\rightarrow$ 勾选第一个 **`Use Google Identity`** $\rightarrow$ 点击底部保存。 |
+| **`[2/3] GE License 席位池与管理员持证`** | 新项目还没从 Billing Account 划拨 GE 席位，或当前管理员自己还没分到 1 个席位 | **① 从账单划拨席位到新项目**：打开 `https://console.cloud.google.com/gemini-enterprise/licenses?project=<PROJECT_ID>` $\rightarrow$ 点击 **Distribute licenses / 分配许可**，从公司 Billing Account 划拨席位到本项目（区域选 `global`），建议同时勾选 **Auto-assign licenses on sign-in（首次登录自动分配）**。<br>**② 给部署管理员自己绑 1 个席位**：打开 `https://console.cloud.google.com/gemini-enterprise/user-license?project=<PROJECT_ID>` $\rightarrow$ 点击 **Add users / 添加用户**，填入当前管理员自己的邮箱并保存，确认状态为 `Assigned`。 |
+| **`[3/3] 项目内已有 GE 应用`** | 提示当前项目是否已有现成 GE 应用 | 如果客户是在**已有 GE 的老项目**里部署，这里会列出他们现成的 GE 应用 ID；把该 ID 填进 `<env>.tfvars` 的 `extra_ge_engine_ids = ["<已有应用ID>"]`，Agent 就会直接挂进他们平时用的 GE 里，员工不用换新网址。 |
+
+**第 3 步：重跑一次 `check-ge-prereqs`**，确认输出 `🎉 预检全部通过！` 后，再进入第 3 节开始正式部署。
+
+> [!NOTE]
+> **为什么流水线跑完后管理员还要跑一行 `bind-ge`（见 B8）？**
+> 因为 Cloud Build 自动流水线用的是后台服务账号（`<p>-deployer@...gserviceaccount.com`），Google 不允许给服务账号绑“真人的 GE License”。所以如果 Cloud Build 建好基础架构后提示 `Registered new ADK Agent ... FAILED: active Gemini Enterprise license is not available`，只需由上面这位已持证的管理员跑一行 `bind-ge` 命令（见 B8），5 秒即可把 Agent 挂进 GE。
 
 ---
 
