@@ -703,7 +703,7 @@ def test_init_script_upload_then_prompt_manager_reads_gcs_workbook(tmp_path, mon
 
     downloads_before = sum(1 for m, u in fake.calls if "alt=media" in u)
     cfg = asyncio.run(_load())
-    assert cfg.active_prompt_version == "Prompt_v2.5_Standard"
+    assert cfg.active_prompt_version == "Prompt_v1.0_Standard"
     assert cfg.active_model_version == "gemini-3.8-flash"
     assert len(cfg.rules) == 24 and cfg.rules[0].rule_id == "A1"
     assert sum(1 for m, u in fake.calls if "alt=media" in u) == downloads_before + 1  # Tab0 + rules: one download
@@ -711,9 +711,9 @@ def test_init_script_upload_then_prompt_manager_reads_gcs_workbook(tmp_path, mon
 
     # Customer edits in Excel: rewrite A1, drop (disable) the D2 row, switch the model pointer.
     def _edit(tabs):
-        rules = tabs["Prompt_v2.5_Standard"]
+        rules = tabs["Prompt_v1.0_Standard"]
         rules[1][6] = "【已修改】A1 新的检查要求"
-        tabs["Prompt_v2.5_Standard"] = [r for r in rules if not r or r[0] != "D2"]
+        tabs["Prompt_v1.0_Standard"] = [r for r in rules if not r or r[0] != "D2"]
         for row in tabs["Tab0_Version_Control"]:
             if row and row[0] == "Active_Model_Version":
                 row[1] = "gemini-2.5-flash"
@@ -741,7 +741,7 @@ def test_json_snapshot_workbook_and_default_config_path(monkeypatch):
     monkeypatch.setattr(pm_module.config, "master_prompt_sheet_id", "gs://store-videos/sop/master_sheet.json")
     pm = PromptManager(sheet_client=GoogleSheetsConfigClient(gcs_gateway=fake), known_valid_models={"gemini-3.8-flash"})
     cfg = asyncio.run(pm.load_active_config())
-    assert cfg.active_prompt_version == "Prompt_v2.5_Standard" and len(cfg.rules) == 24
+    assert cfg.active_prompt_version == "Prompt_v1.0_Standard" and len(cfg.rules) == 24
 
 
 def test_gcs_sop_object_guardrails():
@@ -969,7 +969,7 @@ def test_pinned_generation_download_and_prompt_manager(tmp_path):
     gen1 = fake.put("store-videos", "sop/master_sheet.xlsx", v1, ctype=gg.XLSX_CONTENT_TYPE)
 
     def _v2(tabs):
-        tabs["Prompt_v2.5_Standard"][1][6] = "【v2】A1 新规则"
+        tabs["Prompt_v1.0_Standard"][1][6] = "【v2】A1 新规则"
 
     gen2 = fake.put("store-videos", "sop/master_sheet.xlsx", _edit_workbook(v1, _v2), ctype=gg.XLSX_CONTENT_TYPE)
     assert gen1 != gen2

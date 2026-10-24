@@ -512,7 +512,7 @@ terraform output gemini_enterprise_console_url
   --update-tfvars
 ```
 
-- `--create-sheet`：若 `<env>.tfvars` 里的 `master_prompt_sheet_id` 为空或还是阶段 A 的 `gs://...` 种子路径，脚本会自动在机器人 Drive 下创建一张新 Google Sheet 并写入全部 7 个页签；若 `<env>.tfvars` 里已经填了某张 Google Sheet ID，则就地更新并校验该表。
+- `--create-sheet`：若 `<env>.tfvars` 里的 `master_prompt_sheet_id` 为空或还是阶段 A 的 `gs://...` 种子路径，脚本会自动在机器人 Drive 下创建一张新 Google Sheet 并写入全部 6 个页签；若 `<env>.tfvars` 里已经填了某张 Google Sheet ID，则就地更新并校验该表。
 - `--share-with`：可传 `user:<邮箱>`、`group:<群组邮箱>` 或 `domain:<域名>`（可重复传多个），自动授予编辑者（Writer）权限，方便督导和管理员直接在浏览器打开编辑。
 - `--update-tfvars`：自动把新建的 Google Sheet ID 写回 `<env>.tfvars` 的 `master_prompt_sheet_id = "<SheetID>"`。
 
@@ -524,9 +524,9 @@ terraform output gemini_enterprise_console_url
 
 | 页签 | 用途 |
 | :--- | :--- |
-| `Tab0_Version_Control` | 版本开关：`Active_Prompt_Version`（生效的规则页签名）、`Active_Model_Version`、`Fallback_Model_Version`，D 列 `Candidates` 是候选列表 |
-| `Prompt_v2.5_Standard` | 当前生产 SOP 规则（每行一条，9 列：`rule_id`、`name`、`category`、`severity`、`detection_type`、`requires_full_context`、`check_instruction`、`pass_criteria`、`fail_criteria`） |
-| `Prompt_v2.6_r01`、`Prompt_v2.6_r02` | 调优用的候选规则页签 |
+| `Tab0_Version_Control` | 版本开关：`Active_Prompt_Version`（生效的规则页签名，默认 `Prompt_v1.0_Standard`）、`Active_Model_Version`、`Fallback_Model_Version`，D 列 `Candidates` 是候选列表 |
+| `Prompt_v1.0_Standard` | 当前生产 SOP 规则（每行一条，9 列：`rule_id`、`name`、`category`、`severity`、`detection_type`、`requires_full_context`、`check_instruction`、`pass_criteria`、`fail_criteria`） |
+| `Prompt_v1.1_Standard` | 空白候选规则占位页签（仅含 9 列表头），供业务后续迭代新版本 SOP 或在 `Tab3_Golden_Eval` 做对比测评时粘贴使用 |
 | `Tab2_Scheduled_Jobs` | 定时巡检规则（见 4.2） |
 | `Tab3_Golden_Eval` | 黄金集测评触发（见 4.5） |
 | `Tab4_Spot_Check` | 专项抽检 / 新 SOP 测试（见 4.3） |
@@ -718,7 +718,7 @@ GE 新会话首页的两组 Prompt chips：
 
 适合：只想查某几条规则；或者新写了一条 SOP，正式合入前先拿真实视频试。
 
-1. 在总控表 `Tab4_Spot_Check` 里放要测的规则（表头和正式规则页签一样 9 列；可以从 `Prompt_v2.5_Standard` 复制行过来，或新写）。
+1. 在总控表 `Tab4_Spot_Check` 里放要测的规则（表头和正式规则页签一样 9 列；可以从 `Prompt_v1.0_Standard` 复制行过来，或新写）。
 2. 在 GE 进入稽核 Agent，点 Prompt chip **`[Spot-Check Tab4 Only (Non-Full)] Please audit store videos: `**，粘贴门店文件夹链接。
 3. 预检顶部会出现黄色提示 `⚠️ [Targeted Spot-Check / New SOP Test Mode (Non-Full Audit)]`，列出本次只查哪几条。点错了就别确认，改用全量提示语重发。`Tab4_Spot_Check` 为空时预检直接拦截，0 Token。
 4. 回复 `Confirm and start`。
@@ -818,11 +818,11 @@ GE 新会话首页的两组 Prompt chips：
 
 | 行（A 列） | B 列 `Active_Value` | 作用 |
 | :--- | :--- | :--- |
-| `Active_Prompt_Version` | 规则页签名，例如 `Prompt_v2.5_Standard` | 正式稽核用哪个规则页签 |
+| `Active_Prompt_Version` | 规则页签名，例如 `Prompt_v1.0_Standard` | 正式稽核用哪个规则页签 |
 | `Active_Model_Version` | 例如 `gemini-3.8-flash` | 正式稽核用哪个模型 |
 | `Fallback_Model_Version` | 例如 `gemini-3.8-flash` | 主模型探测失败时用的备用模型 |
 
-- **改规则**：复制一个规则页签改名（例如 `Prompt_v2.7_xxx`），修改内容，把 `Active_Prompt_Version` 改成新页签名即生效；改回旧名就是回滚。不用重新部署。Google Sheet 有 5 分钟缓存（GCS 上的 `.xlsx` 是 60 秒），所以最多 5 分钟后新任务按新规则跑。
+- **改规则**：在 `Prompt_v1.1_Standard` 占位页签里填入新规则（或复制一个规则页签改名，例如 `Prompt_v1.2_Standard`），修改内容，把 `Active_Prompt_Version` 改成新页签名即生效；改回旧名就是回滚。不用重新部署。Google Sheet 有 5 分钟缓存（GCS 上的 `.xlsx` 是 60 秒），所以最多 5 分钟后新任务按新规则跑。
 - **改模型**：在 `Active_Model_Version` 下拉里选。生产请用 `gemini-3.8-flash`。
 - **新模型**：把模型名加到 `Tab0` 的 D 列 `Candidates`（用 `|` 分隔），下一个 15 分钟刻度后会出现在下拉和 `Tab3` 的 `Model_Version` 里。系统扫描到新模型时也只会追加到候选列表（`Candidate_Models_Discovered`），**绝不自动切换**生效模型。
 - 新模型 / 新规则建议先用 4.5 测评或 4.3 专项抽检验证，再改 `Tab0`。

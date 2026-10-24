@@ -52,12 +52,17 @@ TAB0_TITLE = "Tab0_Version_Control"
 LEGACY_TAB0_TITLE = "Tab0_版本总控与回滚开关"
 LEGACY_TAB_RENAME_MAP: dict[str, str] = {
     "Tab0_版本总控与回滚开关": "Tab0_Version_Control",
-    "Prompt_v2.5_V10全量17条标准版": "Prompt_v2.5_Standard",
-    "Prompt_v2.5_归档基准": "Prompt_v2.5_Standard",
+    "Prompt_v2.5_V10全量17条标准版": "Prompt_v1.0_Standard",
+    "Prompt_v2.5_Standard": "Prompt_v1.0_Standard",
+    "Prompt_v2.5_归档基准": "Prompt_v1.0_Standard",
     "Tab2_定时巡检配置表": "Tab2_Scheduled_Jobs",
     "Tab3_黄金集评测工作台": "Tab3_Golden_Eval",
     "Tab4_专项测试表": "Tab4_Spot_Check",
 }
+OBSOLETE_PROMPT_TABS: tuple[str, ...] = (
+    "Prompt_v2.6_r01",
+    "Prompt_v2.6_r02",
+)
 _SHEET_URL_RE = re.compile(r"/spreadsheets/d/([A-Za-z0-9_-]+)")
 _TFVAR_LINE_RE = re.compile(r'^\s*([a-zA-Z0-9_]+)\s*=\s*"([^"]*)"')
 _SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
@@ -104,7 +109,7 @@ def build_master_sheet_payload() -> dict[str, Any]:
                         "Active_Prompt_Version",
                         DEFAULT_PROMPT_TAB_TITLE,
                         "Active production SOP rule tab name (0.1s switch & rollback)",
-                        f"{DEFAULT_PROMPT_TAB_TITLE} | Prompt_v2.6_r01 | Prompt_v2.6_r02",
+                        f"{DEFAULT_PROMPT_TAB_TITLE} | Prompt_v1.1_Standard",
                     ],
                     [
                         "Active_Model_Version",
@@ -125,12 +130,10 @@ def build_master_sheet_payload() -> dict[str, Any]:
                 "values": [row[:] for row in standard_rows],
             },
             {
-                "title": "Prompt_v2.6_r01",
-                "values": [row[:] for row in standard_rows],
-            },
-            {
-                "title": "Prompt_v2.6_r02",
-                "values": [row[:] for row in standard_rows],
+                "title": "Prompt_v1.1_Standard",
+                "values": [
+                    list(SHEET_RULE_HEADER),
+                ],
             },
             {
                 "title": TAB2_SCHEDULED_TITLE,
@@ -422,14 +425,27 @@ def write_tabs(service: Any, sheet_id: str, tabs: list[dict[str, Any]], overwrit
     ).execute()
 
     # A brand-new spreadsheet starts with an empty "Sheet1"; drop it so Tab0 is the first tab.
+    target_titles = {t["title"] for t in tabs}
     placeholder = [
         sid for title, sid in existing.items()
-        if title in ("Sheet1", "工作表1") and title not in {t["title"] for t in tabs}
+        if title in ("Sheet1", "工作表1") and title not in target_titles
     ]
     if placeholder and len(existing) == 1:
         service.spreadsheets().batchUpdate(
             spreadsheetId=sheet_id, body={"requests": [{"deleteSheet": {"sheetId": placeholder[0]}}]}
         ).execute()
+
+    if overwrite:
+        obsolete_ids = [
+            sid
+            for title, sid in existing.items()
+            if title in OBSOLETE_PROMPT_TABS and title not in target_titles
+        ]
+        if obsolete_ids:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={"requests": [{"deleteSheet": {"sheetId": sid}} for sid in obsolete_ids]},
+            ).execute()
 
     # Apply native Google Sheets dropdown & formula validations across Tab0, Prompt_*, and Tab2.
     _import_cctv_audit()

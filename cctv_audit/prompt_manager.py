@@ -85,7 +85,7 @@ TAB0_TITLE = "Tab0_Version_Control"
 TAB2_SCHEDULED_TITLE = "Tab2_Scheduled_Jobs"
 TAB3_EVAL_TITLE = "Tab3_Golden_Eval"
 TAB4_SPOT_CHECK_TITLE = "Tab4_Spot_Check"
-DEFAULT_PROMPT_TAB_TITLE = "Prompt_v2.5_Standard"
+DEFAULT_PROMPT_TAB_TITLE = "Prompt_v1.0_Standard"
 
 TAB0_ALIASES: tuple[str, ...] = (
     "Tab0_Version_Control",
@@ -109,9 +109,15 @@ TAB4_ALIASES: tuple[str, ...] = (
     "Spot_Check",
     "专项测试表",
 )
+PROMPT_STANDARD_ALIASES: tuple[str, ...] = (
+    "Prompt_v1.0_Standard",
+    "Prompt_v2.5_Standard",
+    "Prompt_v2.5_V10全量17条标准版",
+)
 PROMPT_TAB_ALIASES: dict[str, str] = {
+    "Prompt_v1.0_Standard": "Prompt_v2.5_V10全量17条标准版",
     "Prompt_v2.5_Standard": "Prompt_v2.5_V10全量17条标准版",
-    "Prompt_v2.5_V10全量17条标准版": "Prompt_v2.5_Standard",
+    "Prompt_v2.5_V10全量17条标准版": "Prompt_v1.0_Standard",
     "Prompt_v2.5_Archive_Baseline": "Prompt_v2.5_归档基准",
     "Prompt_v2.5_归档基准": "Prompt_v2.5_Archive_Baseline",
 }
@@ -123,7 +129,7 @@ def _alias_candidates_for_tab(tab_name: str) -> list[str]:
     if not cleaned:
         return []
     out: list[str] = [cleaned]
-    for group in (TAB0_ALIASES, TAB2_ALIASES, TAB3_ALIASES, TAB4_ALIASES):
+    for group in (TAB0_ALIASES, TAB2_ALIASES, TAB3_ALIASES, TAB4_ALIASES, PROMPT_STANDARD_ALIASES):
         if cleaned in group:
             for item in group:
                 if item not in out:
@@ -136,7 +142,7 @@ def _alias_candidates_for_tab(tab_name: str) -> list[str]:
 
 def _populate_workbook_tab_aliases(tabs: dict[str, list[list[str]]]) -> dict[str, list[list[str]]]:
     """Populates both canonical English and legacy Chinese tab keys on an in-memory workbook dict."""
-    for group in (TAB0_ALIASES, TAB2_ALIASES, TAB3_ALIASES, TAB4_ALIASES):
+    for group in (TAB0_ALIASES, TAB2_ALIASES, TAB3_ALIASES, TAB4_ALIASES, PROMPT_STANDARD_ALIASES):
         present = next((t for t in group if t in tabs), None)
         if present is not None:
             for alias in group:
@@ -285,7 +291,7 @@ VALID_EVAL_TRIGGER_ACTIONS: tuple[str, ...] = (
 DEFAULT_TAB3_SAMPLE_ROW: tuple[str, ...] = (
     "EVAL-EXAMPLE-01",
     "[Example] Golden Dataset Baseline Evaluation (Provide Golden Videos Folder, Human Labels Sheet, and Results Folder; set Trigger_Action to START_EVAL to run in background)",
-    "Prompt_v2.5_Standard",
+    "Prompt_v1.0_Standard",
     "gemini-3.8-flash",
     "https://drive.google.com/drive/folders/1ExampleGoldenVideosFolderIdReplaceMe",
     "https://docs.google.com/spreadsheets/d/1ExampleGoldenSheetIdReplaceMe0000/edit",
