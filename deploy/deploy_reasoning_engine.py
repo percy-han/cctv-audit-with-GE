@@ -165,6 +165,7 @@ def build_reasoning_engine_body(
     workspace_impersonate_user: str = "",
     workspace_dwd_service_account: str = "",
     google_chat_webhook_url: str = "",
+    portal_base_url: str = "",
     company_name: str = "",
     tenant_label: str = "",
     gcs_sop_uri: str = "",
@@ -202,7 +203,11 @@ def build_reasoning_engine_body(
     if workspace_impersonate_user:
         env_list.append({"name": "WORKSPACE_IMPERSONATE_USER", "value": workspace_impersonate_user})
     if google_chat_webhook_url:
+        env_list.append({"name": "ENABLE_GOOGLE_CHAT_NOTIFICATION", "value": "true"})
         env_list.append({"name": "GOOGLE_CHAT_WEBHOOK_URL", "value": google_chat_webhook_url})
+    if portal_base_url:
+        env_list.append({"name": "PORTAL_BASE_URL", "value": portal_base_url})
+        env_list.append({"name": "PORTAL_SERVICE_URL", "value": portal_base_url})
 
     deployment_spec: dict[str, Any] = {
         "resourceLimits": {"cpu": "4", "memory": "8Gi"},
@@ -1396,6 +1401,11 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("GOOGLE_CHAT_WEBHOOK_URL", ""),
         help="Optional Google Chat incoming webhook URL for job completion notifications",
     )
+    p_create.add_argument(
+        "--portal-base-url",
+        default=os.environ.get("PORTAL_BASE_URL", ""),
+        help="Optional IAP-protected supervisor portal base URL (<p>-portal)",
+    )
 
     p_bind = sub.add_parser("bind-ge", help="Ensure Gemini Enterprise Engine exists and bind ReasoningEngine")
     p_bind.add_argument("--reasoning-engine", required=True, help="Full ReasoningEngine resource name")
@@ -1464,6 +1474,7 @@ def main(argv: list[str] | None = None) -> int:
             gcp_location=args.gcp_location,
             workspace_impersonate_user=args.workspace_impersonate_user,
             google_chat_webhook_url=args.google_chat_webhook_url,
+            portal_base_url=args.portal_base_url,
             workspace_dwd_service_account=args.workspace_dwd_service_account,
             company_name=args.ge_company_name,
             tenant_label=args.ge_tenant_label,

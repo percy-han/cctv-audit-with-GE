@@ -338,7 +338,7 @@ def test_both_roots_derive_names_from_name_prefix():
 
 def test_reasoning_engine_triggers_are_unchanged_for_the_first_environment():
     """The trigger list decides whether an apply redeploys the ReasoningEngine; its inputs must
-    evaluate to exactly what they were before name_prefix, or the next prod apply redeploys it."""
+    evaluate to the expected stack inputs including Google Chat webhook and portal URL."""
     main = _tf("main.tf")
     start = main.index("triggers_replace = [")
     block = main[start: main.index("\n  ]", start)]
@@ -353,6 +353,8 @@ def test_reasoning_engine_triggers_are_unchanged_for_the_first_environment():
         "data.google_service_account.audit_worker_sa.email",
         'var.enable_standalone_cloud_run ? google_cloud_run_v2_service.cctv_audit_worker[0].uri : ""',
         "var.workspace_impersonate_user",
+        'var.enable_google_chat_notification ? var.google_chat_webhook_url : ""',
+        "local.portal_url",
     ]
 
 
@@ -712,9 +714,25 @@ def test_reasoning_engine_body_carries_gcs_sop_uri_only_when_set():
         gcp_location="europe-west4",
     )
     env = lambda body: {e["name"]: e["value"] for e in body["spec"]["deploymentSpec"]["env"]}  # noqa: E731
-    assert "GCS_SOP_URI" not in env(deploy.build_reasoning_engine_body(**common))
+    base_env = env(deploy.build_reasoning_engine_body(**common))
+    assert "GCS_SOP_URI" not in base_env
+    assert "ENABLE_GOOGLE_CHAT_NOTIFICATION" not in base_env
+    assert "GOOGLE_CHAT_WEBHOOK_URL" not in base_env
+    assert "PORTAL_BASE_URL" not in base_env
     uri = "gs://my-project-stack-a-workspace/sop/master_sheet.xlsx"
-    assert env(deploy.build_reasoning_engine_body(**common, gcs_sop_uri=uri))["GCS_SOP_URI"] == uri
+    full_env = env(
+        deploy.build_reasoning_engine_body(
+            **common,
+            gcs_sop_uri=uri,
+            google_chat_webhook_url="gs://my-project-stack-a-workspace/config/google_chat_webhook.txt",
+            portal_base_url="https://stack-a-portal-123.europe-west4.run.app",
+        )
+    )
+    assert full_env["GCS_SOP_URI"] == uri
+    assert full_env["ENABLE_GOOGLE_CHAT_NOTIFICATION"] == "true"
+    assert full_env["GOOGLE_CHAT_WEBHOOK_URL"] == "gs://my-project-stack-a-workspace/config/google_chat_webhook.txt"
+    assert full_env["PORTAL_BASE_URL"] == "https://stack-a-portal-123.europe-west4.run.app"
+    assert full_env["PORTAL_SERVICE_URL"] == "https://stack-a-portal-123.europe-west4.run.app"
 
 
 def _tf_block(main: str, header: str) -> str:
