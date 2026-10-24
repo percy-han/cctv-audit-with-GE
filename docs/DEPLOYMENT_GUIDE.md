@@ -344,38 +344,32 @@ enable_google_chat_notification = false
 
 这些配置文件**不含密钥**。用手动部署时它们只要在当前目录里即可（`.gitignore` 故意没有忽略它们，`gcloud builds submit` 会一起上传）；用推送即部署时要提交到 Git。
 
-#### A5. 新项目：补齐权限与服务代理，然后等 2 分钟
+#### A5. 新项目：确认服务代理与权限生效，然后等 1–2 分钟
 
-**① 新项目：如该账号存在，先授予 Cloud Build 默认服务账号日志写入权限**
+`bootstrap/main.tf` 已经自动完成了以下三件事（无需手工敲命令，但如果是旧版 `bootstrap` 可以用下面命令手工补齐）：
+
+1. **自动为 Cloud Build 默认服务账号授予日志权限**（`${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com` -> `roles/logging.logWriter`）。
+2. **自动创建 Discovery Engine 与 Vertex AI 两个 Google 托管服务代理**（`service-${PROJECT_NUMBER}@gcp-sa-discoveryengine.iam.gserviceaccount.com` 和 `service-${PROJECT_NUMBER}@gcp-sa-aiplatform-re.iam.gserviceaccount.com`）。
+3. **自动为 Discovery Engine 服务代理授予 `roles/discoveryengine.serviceAgent` 项目级角色**：
+   > [!IMPORTANT]
+   > 在全新 GCP 项目里，仅调用 `gcloud beta services identity create --service=discoveryengine.googleapis.com` **只会创建出服务账号本身，不会自动绑定 `roles/discoveryengine.serviceAgent` 角色**！如果少了这个绑定，用户在 Gemini Enterprise 对话框里调用 Agent 时会报 `400 PERMISSION_DENIED: Permission 'aiplatform.reasoningEngines.query' denied on resource ...`。新版 `bootstrap/main.tf` 已通过 `google_project_iam_member.discoveryengine_service_agent` 自动绑定该角色。
+
+如果是旧版 `bootstrap` 或手工核查，可执行：
 
 ```bash
 PROJECT_NUMBER=$(gcloud projects describe <PROJECT_ID> --format='value(projectNumber)')
-# 先看这个账号是否存在（bootstrap 启用 Cloud Build API 后由 Google 创建）
-gcloud iam service-accounts describe ${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com --project=<PROJECT_ID>
-# 存在就授权
+gcloud services enable discoveryengine.googleapis.com aiplatform.googleapis.com --project=<PROJECT_ID>
+gcloud beta services identity create --service=discoveryengine.googleapis.com --project=<PROJECT_ID>
+gcloud beta services identity create --service=aiplatform.googleapis.com --project=<PROJECT_ID>
+gcloud projects add-iam-policy-binding <PROJECT_ID> \
+  --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-discoveryengine.iam.gserviceaccount.com" \
+  --role="roles/discoveryengine.serviceAgent"
 gcloud projects add-iam-policy-binding <PROJECT_ID> \
   --member="serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
   --role="roles/logging.logWriter"
 ```
 
-> [!NOTE]
-> 试部署中观察到的现象：部署服务账号 `<p>-deployer` 已经有 `roles/logging.logWriter`（bootstrap 授予），但全新项目里第一次 `gcloud builds submit` 仍在 step 0 直接失败（`build step 0 "python@sha256:..." failed: step exited with non-zero status: 1`），给上面这个 Cloud Build 默认账号补了 `roles/logging.logWriter` 后就好了。确切原因（猜测与 `cloudbuild.yaml` 的 `logging: CLOUD_LOGGING_ONLY` 有关）**未经证实**，按观察到的现象处理。
-
-**② 手动创建两个 Google 服务代理（必做）**
-
-Terraform 要给 `service-<PROJECT_NUMBER>@gcp-sa-discoveryengine.iam.gserviceaccount.com`（worker 的调用权限）和 `service-<PROJECT_NUMBER>@gcp-sa-aiplatform-re.iam.gserviceaccount.com`（镜像拉取权限）授权，但新项目里光启用 API 不会马上创建这两个账号，apply 会报 HTTP 400 `Service account ... does not exist`。先启用 API 再显式创建：
-
-```bash
-gcloud services enable discoveryengine.googleapis.com aiplatform.googleapis.com --project=<PROJECT_ID>
-gcloud beta services identity create --service=discoveryengine.googleapis.com --project=<PROJECT_ID>
-gcloud beta services identity create --service=aiplatform.googleapis.com --project=<PROJECT_ID>
-```
-
-（这两个 API 本来也会由 `main.tf` 启用，这里提前启用不影响后续部署。）
-
-**③ 等 1–2 分钟**
-
-bootstrap 和上面刚授予的 IAM 权限需要时间生效。立刻跑流水线可能报 403 `storage.objects.get`，等一两分钟重试即可。
+**等 1–2 分钟**：bootstrap 刚授予的 IAM 权限需要时间生效。立刻跑流水线可能报 403 `storage.objects.get`，等一两分钟重试即可。
 
 #### A6. 预览（不改任何东西）
 

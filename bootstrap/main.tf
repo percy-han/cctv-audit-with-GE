@@ -176,6 +176,8 @@ locals {
     "iamcredentials.googleapis.com",
     "sheets.googleapis.com",
     "monitoring.googleapis.com",
+    "aiplatform.googleapis.com",
+    "discoveryengine.googleapis.com",
   ])
 
   # What ../main.tf and deploy/deploy_reasoning_engine.py call, narrowest predefined role per need.
@@ -205,6 +207,45 @@ resource "google_project_service" "pipeline" {
   project            = var.project_id
   service            = each.value
   disable_on_destroy = false
+}
+
+# Pre-create the Google-managed service agents for Discovery Engine (Gemini Enterprise) and Vertex AI,
+# and bind `roles/discoveryengine.serviceAgent` on the project. In a brand-new GCP project, enabling
+# the APIs or running `gcloud beta services identity create` creates the service account identity
+# `service-<PROJECT_NUMBER>@gcp-sa-discoveryengine.iam.gserviceaccount.com` WITHOUT automatically
+# binding `roles/discoveryengine.serviceAgent` (which carries `aiplatform.reasoningEngines.query`).
+# Without that role, Gemini Enterprise returns `400 PERMISSION_DENIED: Permission
+# 'aiplatform.reasoningEngines.query' denied` when a user queries the Agent.
+data "google_project" "current" {
+  project_id = var.project_id
+  depends_on = [google_project_service.pipeline]
+}
+
+resource "terraform_data" "service_agents" {
+  triggers_replace = [var.project_id]
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      gcloud beta services identity create --service=discoveryengine.googleapis.com --project="${var.project_id}" --quiet >/dev/null 2>&1 || true
+      gcloud beta services identity create --service=aiplatform.googleapis.com --project="${var.project_id}" --quiet >/dev/null 2>&1 || true
+    EOT
+  }
+
+  depends_on = [google_project_service.pipeline]
+}
+
+resource "google_project_iam_member" "discoveryengine_service_agent" {
+  project    = var.project_id
+  role       = "roles/discoveryengine.serviceAgent"
+  member     = "serviceAccount:service-${data.google_project.current.number}@gcp-sa-discoveryengine.iam.gserviceaccount.com"
+  depends_on = [terraform_data.service_agents]
+}
+
+resource "google_project_iam_member" "cloudbuild_default_log_writer" {
+  project    = var.project_id
+  role       = "roles/logging.logWriter"
+  member     = "serviceAccount:${data.google_project.current.number}@cloudbuild.gserviceaccount.com"
+  depends_on = [google_project_service.pipeline]
 }
 
 # --------------------------------------------------------------------------- image repository
