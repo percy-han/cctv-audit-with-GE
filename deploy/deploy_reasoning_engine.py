@@ -565,7 +565,8 @@ def check_ge_prerequisites(
             "existing_engines": [],
         }
 
-    idp_type = str(acl_res.get("idpConfig", {}).get("idpType", "")).strip()
+    idp_cfg = acl_res.get("idpConfig") if isinstance(acl_res.get("idpConfig"), dict) else {}
+    idp_type = str(idp_cfg.get("idpType", "")).strip()
     if idp_type in ("", "IDP_TYPE_UNSPECIFIED") and fix_idp:
         patched = _call(
             "PATCH",
@@ -578,7 +579,8 @@ def check_ge_prerequisites(
             ignore_errors=True,
         )
         if not patched.get("_http_error"):
-            idp_type = str(patched.get("idpConfig", {}).get("idpType", "GSUITE")).strip()
+            patched_cfg = patched.get("idpConfig") if isinstance(patched.get("idpConfig"), dict) else {}
+            idp_type = str(patched_cfg.get("idpType", "GSUITE")).strip() or "GSUITE"
             print(f"🔧 已自动将项目 `{project_id}` 的 GE 登录方式设置为 Google Identity (GSUITE)。")
 
     idp_ok = idp_type == "GSUITE"
@@ -702,8 +704,9 @@ def ensure_gemini_enterprise_and_bind_agent(
     #    if the project has never configured an IDP yet (leaves existing GSUITE or THIRD_PARTY untouched).
     acl_url = f"https://discoveryengine.googleapis.com/v1alpha/projects/{project_id}/locations/global/aclConfig"
     acl_res = _call("GET", acl_url, project_id=project_id, ignore_errors=True)
-    if not acl_res.get("_http_error") and "idpConfig" in acl_res:
-        current_idp = str(acl_res.get("idpConfig", {}).get("idpType", "")).strip()
+    if not acl_res.get("_http_error"):
+        idp_cfg = acl_res.get("idpConfig") if isinstance(acl_res.get("idpConfig"), dict) else {}
+        current_idp = str(idp_cfg.get("idpType", "")).strip()
         if current_idp in ("", "IDP_TYPE_UNSPECIFIED"):
             patched_acl = _call(
                 "PATCH",

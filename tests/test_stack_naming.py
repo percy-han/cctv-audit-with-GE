@@ -208,6 +208,8 @@ class _FakeDiscoveryEngine:
             if isinstance(owner, int):
                 return {"_http_error": owner, "_error_body": "err"}
             return {"name": name, "spec": {"serviceAccount": owner}}
+        if method == "GET" and url.endswith("/aclConfig"):
+            return {"name": url, "idpConfig": {"idpType": "GSUITE"}}
         if method == "GET" and "/dataStores/" in url:
             return {"name": url}
         if method == "GET" and url.endswith("/agents"):
@@ -768,6 +770,8 @@ def test_new_app_falls_back_to_v2_datastore_while_store_is_being_deleted(monkeyp
 
     def call(method, url, body=None, project_id="", ignore_errors=False):
         calls.append((method, url, body))
+        if method == "GET" and url.endswith("/aclConfig"):
+            return {"name": url, "idpConfig": {"idpType": "GSUITE"}}
         if method == "GET" and "/dataStores/" in url:
             return {"_http_error": 404, "_error_body": "nf"}
         if method == "POST" and "dataStoreId=stack-a-ge-store" in url and not url.endswith("-v2"):
