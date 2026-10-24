@@ -139,7 +139,7 @@ J 列下拉值：`PENDING`、`✅ CONFIRMED`、`❌ FALSE_POSITIVE`、`⚠️ FO
 | 10 | GE 许可 | 客户 IT / 业务方 | 给每位要用的督导分配 Gemini Enterprise 许可（席位）。督导账号都是 `@<customer-domain>`。 |
 | 10a | **部署项目里已开通 Gemini Enterprise 订阅 / 许可，且执行部署的管理员本人有一个有效 GE 许可** | 客户 IT | 流水线注册 GE Agent 时，Google 会检查调用身份有没有有效的 GE 许可；没有时 GE 应用照样建好，但 **Agent 建不出来**（只打 ⚠️ 警告，部署不报错）。补救办法见 B8。 |
 | 11 | Dashboard 准入名单 | 业务方 + 客户 IT | 决定 `portal_allowed_members`：整个域 `domain:<customer-domain>`，或一个 Google 群组 `group:<group>@<customer-domain>`，或逐个 `user:<email>`。**这只决定谁能登录**；能看哪家店还由各人的 Drive 权限决定。 |
-| 12 | Google Chat 群 + Webhook（可选） | 业务方 | 在要收通知的 Chat 群里创建 Incoming Webhook，把 URL 交给我方。 |
+| 12 | **Google Chat 通知群与 Incoming Webhook URL** | 业务方 | 提前建好要收稽核启动/完成通知的 Google Chat 群（Space），点击顶部群名称旁下拉菜单 $\rightarrow$ **应用和集成 (Apps & integrations)** $\rightarrow$ **Webhooks** $\rightarrow$ **添加 Webhook (Add webhooks)**，复制生成的 URL（`https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=...`）交给我方。阶段 B 会将该 URL 存入由阶段 A 自动创建的 `gs://<PROJECT_ID>-<p>-workspace/config/google_chat_webhook.txt` 并启用通知（见 B7）。 |
 | 13 | 黄金集标注表（可选，测评用） | 业务方 | 黄金集视频目录、人工标注表、测评报告目录，见 4.5。 |
 | 14 | 部署机器 | 我方 | 装好 `gcloud`、Terraform ≥ 1.9（`main.tf` 要求 `>= 1.9.0`）、Python 3.12+、`git`。也可以直接用 Cloud Shell。 |
 
@@ -556,7 +556,11 @@ workspace_impersonate_user = "cctv-bot@<customer-domain>"
 
 `master_prompt_sheet_id` 在 `terraform plan` 阶段就会校验格式：误贴了 Drive **文件夹**链接会直接报错。
 
-然后直接跑 **先预览（A6）再正式部署（A7）** 的两条 IaC 流水线命令，把总控表和机器人账号注入 `<p>-worker`、`<p>-worker-job`、`<p>-portal` 和 Vertex AI Agent Engine。这次 plan 里正常应只看到 `terraform_data.vertex_reasoning_engine`、`terraform_data.portal_service[0]` replace 和 Cloud Run 服务 / 作业 in-place 更新。
+#### B5. 配置 Google Chat 通知（推荐在跑阶段 B 部署流水线前一起配好）
+
+如果客户已经在准备阶段（§2.1 第 12 项）提供了 Google Chat 群的 Incoming Webhook URL，可以在跑阶段 B 的 IaC 流水线前一起配进 `<env>.tfvars`，这样一次部署就能同时生效 SOP 总控表和 Chat 通知（详见 **B7**）。
+
+然后直接跑 **先预览（A6）再正式部署（A7）** 的两条 IaC 流水线命令，把总控表、机器人账号和 Chat 通知配置注入 `<p>-worker`、`<p>-worker-job`、`<p>-portal` 和 Vertex AI Agent Engine。这次 plan 里正常应只看到 `terraform_data.vertex_reasoning_engine`、`terraform_data.portal_service[0]` replace 和 Cloud Run 服务 / 作业 in-place 更新。
 
 > 改了 `master_prompt_sheet_id` 后，之前发出的 Dashboard 链接会失效（见 1.5），所以这一步要在正式使用前做。
 
@@ -565,20 +569,21 @@ workspace_impersonate_user = "cctv-bot@<customer-domain>"
 - 发 **Drive 文件夹**：读 `master_prompt_sheet_id` 指向的 Google Sheet。
 - 发 **`gs://` 目录**：只要 `master_prompt_sheet_id` 不是 `gs://` 地址，就自动用 `gs://<PROJECT_ID>-<p>-workspace/sop/master_sheet.xlsx`，全程不调 Workspace。**两边的规则表是两份独立的文件**，改了一份不会同步另一份。
 
-#### B7. （可选）开启 Google Chat 通知
+#### B7. 开启 Google Chat 通知
 
-1. 在 Chat 群：群名旁下拉菜单 → 应用和集成（Apps & integrations）→ Webhooks → 新建，复制 URL。
-2. 推荐把 URL 存进 **Workspace 桶**（不要放 Staging 桶，30 天会被删），不把含 key/token 的 URL 写进配置文件：
+> **说明**：存放 Webhook 的 GCS 桶 `gs://<PROJECT_ID>-<p>-workspace`（即 `terraform output workspace_bucket_name`）**已经在阶段 A 部署时由 Terraform 全自动创建并授权给 `<p>-worker` 服务账号了**，无需手动建桶。
+
+1. 在 Google Chat 群：点击顶部群名旁下拉菜单 → **应用和集成（Apps & integrations）** → **Webhooks** → **添加 Webhook（Add webhooks）**，复制生成的 URL（`https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=...`）。
+2. 把 Webhook URL 存进阶段 A 已自动建好的 **Workspace 永久桶**（不要放 Staging 桶，Staging 桶 30 天会自动清理），避免把含 `key`/`token` 的密钥 URL 明文提交进 Git 配置文件：
    ```bash
    printf '%s' '<webhook URL>' | gcloud storage cp - gs://<PROJECT_ID>-<p>-workspace/config/google_chat_webhook.txt
    ```
-3. `<env>.tfvars`：
+3. 编辑 `<env>.tfvars`，开启通知并指向该 GCS 路径：
    ```hcl
    enable_google_chat_notification = true
    google_chat_webhook_url         = "gs://<PROJECT_ID>-<p>-workspace/config/google_chat_webhook.txt"
-   # 或者直接填 "https://chat.googleapis.com/v1/spaces/..."
    ```
-4. 预览 + 部署。之后单店稽核、定时巡检批次、黄金集测评都会在开始和完成时各推一张卡片。
+4. 执行 **预览（A6）+ 正式部署（A7）** 的 IaC 流水线命令。部署完成后，单店稽核（点击 `Confirm and start` 时与完成时）、定时巡检批次、黄金集测评都会往该 Google Chat 群自动推送带 `@发起人` 和 Dashboard 复核按钮的卡片通知。
 
 #### B8. GE 验收
 
