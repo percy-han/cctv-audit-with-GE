@@ -8,7 +8,7 @@
 
 ## 目录
 
-1. [系统架构](#1-系统架构)
+1. [部署必读红线与架构约束](#1-部署必读红线与架构约束)
 2. [部署前客户需要准备的东西](#2-部署前客户需要准备的东西)
 3. [部署步骤](#3-部署步骤)
 4. [业务团队使用手册](#4-业务团队使用手册)
@@ -17,85 +17,10 @@
 
 ---
 
-## 1. 系统架构
+## 1. 部署必读红线与架构约束
 
-### 1.1 一句话说明
-
-督导在 **Gemini Enterprise（下称 GE）** 里把门店视频所在的 Google Drive 文件夹链接（或 `gs://` 目录）发给稽核 Agent → Agent 先做预检 → 督导回复 `Confirm and start` → 后台 Cloud Run 逐段把视频交给 Gemini 视频模型分析 → 在同一个文件夹里生成报告表和 20 秒证据切片 → Google Chat 通知督导 → 督导在 **复核 Dashboard**（`<name_prefix>-portal`，Google 登录）里看证据、点「确认违规 / 误报 / 待调录像」，每一次操作都会写一条不可修改的审计记录到 GCS。
-
-### 1.2 组件清单
-
-所有资源名都由 `name_prefix`（下文简写 `<p>`）派生，同一个项目里换一个前缀就能再建一套互不影响的环境。
-
-| 组件 | 资源名 | 作用 |
-| :--- | :--- | :--- |
-| GE 应用 | `<p>-ge`（`ge_engine_id` 留空时） | 督导的对话入口。由部署流水线自动创建，并把稽核 Agent 挂进去。位置固定为 `global`。 |
-| GE 里的稽核 Agent | 默认显示名 `<品牌> Store CCTV AI Auditor [<p>]` | 对话页里的 Agent，带 2 组 Prompt chips（见 4.1）。 |
-| Agent Engine（ReasoningEngine） | `<p>-agent` | 负责对话：预检、确认、查进度。跑在 `reasoning_engine_location`。 |
-| Cloud Run 服务（worker） | `<p>-worker` | 干重活：下载视频、去音轨、切片、调 Gemini、写报告、发通知。0–20 个实例，每实例 4 vCPU / 16 GiB，每个实例同时只跑 1 个任务。 |
-| Cloud Run 作业 | `<p>-worker-job` | 定时巡检（Tab2）和黄金集测评（Tab3）用，单次最长 24 小时。 |
-| Cloud Run 服务（Dashboard） | `<p>-portal` | 督导复核 Dashboard。前面挂 Cloud Run 原生 IAP（Google 登录），再按 Google Drive 权限逐店放行。 |
-| Cloud Scheduler 看门狗 | `<p>-watchdog` | 每 2 分钟一次，把中途崩溃 / 心跳超时的任务从最后一个完成的切片接着跑。 |
-| Cloud Scheduler 定时刻度 | `<p>-scheduled-tick` | 每 15 分钟一次，读 Tab2 定时规则和 Tab3 测评触发，派发 Cloud Run 作业。 |
-| Staging 桶 | `<PROJECT_ID>-<p>-staging` | 任务状态 JSON、临时切片。**所有对象 30 天后自动删除。** 不能放视频 / 报告 / SOP。 |
-| Workspace 桶 | `<PROJECT_ID>-<p>-workspace` | 开了对象版本控制，没有按时间删除（只清理每个文件第 30 个之前的旧版本）。放：初始 SOP 表 `sop/master_sheet.xlsx`、复核审计日志 `audit_logs/reviews/...`、纯 GCS 模式下的视频 / 报告 / 证据、测评缓存与历史。 |
-| 镜像仓库 | `<p>-images` | 由 bootstrap 创建，tag 不可改写。 |
-| 部署服务账号 | `<p>-deployer@<PROJECT_ID>.iam.gserviceaccount.com` | Cloud Build 流水线用它执行 `terraform apply`。没有任何修改项目 IAM 的权限。 |
-| 运行时服务账号 | `<p>-worker@<PROJECT_ID>.iam.gserviceaccount.com` | worker、作业、Agent Engine、Dashboard 共用。通过「无密钥全网域委派（DWD）」以 Workspace 机器人账号身份读写 Drive / Sheets。 |
-
-### 1.3 数据流
-
-```mermaid
-flowchart TD
-    U["督导（@customer-domain 账号）"] -->|"发 Drive 文件夹链接 / Confirm and start"| GE["Gemini Enterprise 应用 (p-ge, global)"]
-    GE --> RE["Agent Engine / ReasoningEngine (p-agent)"]
-    RE -->|"OIDC 调用"| W["Cloud Run 服务 p-worker"]
-    SCH1["Cloud Scheduler p-watchdog (每 2 分钟)"] -->|"/internal/jobs/sweep"| W
-    SCH2["Cloud Scheduler p-scheduled-tick (每 15 分钟)"] -->|"/internal/jobs/scheduled-tick"| W
-    W -->|"Tab2 定时巡检 / Tab3 测评"| J["Cloud Run 作业 p-worker-job (最长 24h)"]
-    W --> M["Gemini 视频模型 (vertex_model_location, 默认 global)"]
-    J --> M
-    W -->|"无密钥 DWD，以机器人账号身份"| D["Google Drive / Sheets：视频、SOP 总控表、报告表、Evidence_Clips"]
-    J --> D
-    W --> S1["Staging 桶 (任务状态, 30 天删除)"]
-    W --> S2["Workspace 桶 (版本控制：SOP 种子表 / 审计日志 / GCS 模式数据)"]
-    W -->|"可选 Webhook"| C["Google Chat 群通知"]
-    C -->|"卡片按钮"| P["Cloud Run 服务 p-portal (IAP Google 登录)"]
-    GE -->|"完成回复里的 Workbench 链接"| P
-    P -->|"以登录人身份检查 Drive 权限"| D
-    P -->|"每次复核先写审计日志"| S2
-    P -->|"复核结果回写 J/K 列"| D
-```
-
-文字版：
-
-1. 督导在 GE 里选中稽核 Agent，发 Drive 文件夹链接（或 `gs://` 目录）。
-2. Agent Engine 做秒级预检（权限、分辨率、视频数量 / 时长、切片计划、生效规则和模型），**预检不消耗 Token**。
-3. 督导回复 `Confirm and start` 后，Agent Engine 用 OIDC 调用 `<p>-worker`，任务在后台跑，督导可以关掉页面。
-4. worker 把每个视频去音轨、切片，交给 Gemini 视频模型；每完成一个切片就写一次断点到 Staging 桶。worker 崩了，看门狗每 2 分钟扫一次，从断点续跑。
-5. 结果写回原 Drive 文件夹：报告表 `📊 AI_Audit_Report_and_Token_Ledger`（页签 `Tab1_Violation_Review`、`Tab2_Token_Ledger`）和证据子目录 `📁 Evidence_Clips`。纯 GCS 模式写 `📊 AI_Audit_Report_and_Token_Ledger.xlsx`。
-6. 开了 Google Chat 通知时，任务开始和完成各推一张卡片，完成卡片上有 `🖥️ Open HTML Supervisor Review Workbench` 按钮；GE 的完成回复里也有 `Open Supervisor Workbench` 链接。
-7. 督导点链接 → Google 登录（IAP）→ Dashboard 用**登录人自己的身份**去查他能不能打开这家店的报告表 → 能才放行 → 每次改状态 / 备注先写一条审计日志，写成功才回写报告表 J、K 列。
-
-### 1.4 报告表 Tab1 的列（复核依据）
-
-| 列 | 表头 |
-| :-: | :--- |
-| A | Audit ID |
-| B | Video Filename |
-| C | Violation Timestamp (MM:SS) |
-| D | SOP Rule ID |
-| E | AI Disposition |
-| F | Severity |
-| G | AI Confidence |
-| H | Violation Description & Timestamped Trajectory |
-| I | Evidence Clip Link (Click to Play) |
-| J | Supervisor Review Status (Dropdown) |
-| K | Supervisor Review Note |
-
-J 列下拉值：`PENDING`、`✅ CONFIRMED`、`❌ FALSE_POSITIVE`、`⚠️ FOLLOWUP`。程序按列的位置读 J、K，**不要插列、删列、调列顺序**。
-
-### 1.5 重要提醒（都是代码里写死的行为）
+> 💡 **系统架构图、13 个核心组件清单、端到端数据流、6 类跨系统账号职责表及报告列定义，已统一收敛在仓库首页 [`README.md`](../README.md#1-系统架构与数据流) 中。**
+> 下方仅列出执行部署与日常运维前必须确认的**硬性约束与红线行为**。
 
 > [!IMPORTANT]
 > **数据在哪里处理，请客户先确认合规。**
