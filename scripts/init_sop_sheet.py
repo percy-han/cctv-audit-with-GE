@@ -64,6 +64,7 @@ OBSOLETE_PROMPT_TABS: tuple[str, ...] = (
     "Prompt_v2.6_r02",
 )
 _SHEET_URL_RE = re.compile(r"/spreadsheets/d/([A-Za-z0-9_-]+)")
+_FOLDER_URL_RE = re.compile(r"/folders/([A-Za-z0-9_-]+)")
 _TFVAR_LINE_RE = re.compile(r'^\s*([a-zA-Z0-9_]+)\s*=\s*"([^"]*)"')
 _SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 _DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
@@ -204,6 +205,17 @@ def extract_sheet_id(value: str) -> str:
         return match.group(1)
     if "/" in value or not re.fullmatch(r"[A-Za-z0-9_-]{20,}", value):
         raise ValueError(f"not a Google Sheet ID or Sheet URL: {value!r}")
+    return value
+
+
+def extract_folder_id(value: str) -> str:
+    """Accept a bare Google Drive folder ID or a drive.google.com/drive/folders/<ID> URL."""
+    value = (value or "").strip()
+    match = _FOLDER_URL_RE.search(value)
+    if match:
+        return match.group(1)
+    if "/" in value or not re.fullmatch(r"[A-Za-z0-9_-]{10,}", value):
+        raise ValueError(f"not a Google Drive Folder ID or Folder URL: {value!r}")
     return value
 
 
@@ -752,8 +764,9 @@ def create_master_spreadsheet(
     creds: Any,
     title: str = DEFAULT_SHEET_TITLE,
     share_with: list[str] | None = None,
+    parent_folder: str = "",
 ) -> str:
-    """Create a brand-new Google Sheet in the authenticated identity's Drive and optionally share it."""
+    """Create a brand-new Google Sheet in the authenticated identity's Drive (optionally inside `parent_folder`) and share it."""
     from googleapiclient.discovery import build
 
     sheets_svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
@@ -763,9 +776,19 @@ def create_master_spreadsheet(
     ).execute()
     sheet_id = str(created["spreadsheetId"]).strip()
 
-    if share_with:
+    folder_id = extract_folder_id(parent_folder) if (parent_folder or "").strip() else ""
+    if folder_id or share_with:
         drive_svc = build("drive", "v3", credentials=creds, cache_discovery=False)
-        for raw_target in share_with:
+        if folder_id:
+            drive_svc.files().update(
+                fileId=sheet_id,
+                addParents=folder_id,
+                removeParents="root",
+                fields="id, parents",
+                supportsAllDrives=True,
+            ).execute()
+            print(f"moved SOP Sheet {sheet_id} into Drive folder {folder_id}")
+        for raw_target in share_with or []:
             target = (raw_target or "").strip()
             if not target:
                 continue
@@ -841,6 +864,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--impersonate-user", default="", help="Optional Workspace bot email for DWD subject")
     parser.add_argument("--check-dwd", action="store_true", help="Verify that Domain-Wide Delegation (DWD) is active and the bot user has Google Drive storage quota")
     parser.add_argument("--create-sheet", action="store_true", help="Automatically create a new Google Sheet in the bot user's Google Drive via DWD and populate all SOP tabs")
+    parser.add_argument("--parent-folder", default="", help="Optional Google Drive folder ID or URL (e.g. cctv-audit/SOP folder) to place the newly created SOP Sheet into")
     parser.add_argument("--sheet-title", default=DEFAULT_SHEET_TITLE, help=f"Title for --create-sheet (default: {DEFAULT_SHEET_TITLE!r})")
     parser.add_argument("--share-with", action="append", default=[], help="Email, group:<email>, or domain:<domain> to share the newly created Sheet with as Editor (repeatable)")
     parser.add_argument("--update-tfvars", action="store_true", help="Write the created/target Sheet ID (and --impersonate-user if passed) into --tfvars master_prompt_sheet_id")
@@ -942,6 +966,7 @@ def main(argv: list[str] | None = None) -> int:
                 creds,
                 title=args.sheet_title,
                 share_with=args.share_with,
+                parent_folder=args.parent_folder,
             )
             print(f"created new SOP Master Google Sheet in {bot_user}'s Drive: {sheet_id}")
             overwrite_tabs = True

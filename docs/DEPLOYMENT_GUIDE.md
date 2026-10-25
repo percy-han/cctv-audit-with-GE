@@ -135,12 +135,12 @@ J 列下拉值：`PENDING`、`✅ CONFIRMED`、`❌ FALSE_POSITIVE`、`⚠️ FO
 | 6 | 模型可用 | 我方 | 生产模型 `gemini-3.8-flash`；部署后在 GE 里跑一次预检确认可用（见 B8 / 4.1）。 |
 | 7 | Workspace 机器人账号 | Workspace 管理员 | 在 `<customer-domain>` 下新建一个普通用户，例如 `cctv-bot@<customer-domain>`，**分配带 Drive 存储空间的付费许可**（报告表和证据切片都存在它名下）。会占 1 个席位。 |
 | 8 | Workspace 超级管理员到场 | Workspace 管理员 | 阶段 B 在 `admin.google.com` 做一次全网域委派授权（约 5 分钟）。 |
-| 9 | 门店视频 Drive 目录 | 业务方 | 建议「一个门店一个文件夹」，视频直接放在门店文件夹里；定时巡检用一个根目录，下面每店一个子文件夹。把根目录（或每个门店文件夹）**共享给机器人账号，权限「编辑者」**。视频短边至少 720 像素，否则会被跳过。 |
+| 9 | **规划并创建 Google Drive 业务总目录（`cctv-audit`）** | 业务方 | 建议在 Google Drive 下建一个顶层总目录 `cctv-audit`，下面建 `SOP`、`evaluation`、`Video` 三个子目录（在 `Video` 下再按门店或按日期分目录，详见 **§2.5**）。只需把顶层 `cctv-audit` 目录**共享给机器人账号（权限「编辑者」）**一次，下面所有子目录自动继承权限。视频短边至少 720 像素，否则会被跳过。 |
 | 10 | GE 许可 | 客户 IT / 业务方 | 给每位要用的督导分配 Gemini Enterprise 许可（席位）。督导账号都是 `@<customer-domain>`。 |
 | 10a | **部署项目里已开通 Gemini Enterprise 订阅 / 许可，且执行部署的管理员本人有一个有效 GE 许可** | 客户 IT | 部署前执行 §2.4 的 `check-ge-prereqs` 预检确认项目已从公司 Billing Account 划拨 GE 席位且管理员持证；这样 Cloud Build 流水线会自动注册 GE 应用、Agent 与快捷指令气泡。若跳过导致未注册，补救办法见 B8。 |
 | 11 | Dashboard 准入名单 | 业务方 + 客户 IT | 决定 `portal_allowed_members`：整个域 `domain:<customer-domain>`，或一个 Google 群组 `group:<group>@<customer-domain>`，或逐个 `user:<email>`。**这只决定谁能登录**；能看哪家店还由各人的 Drive 权限决定。 |
 | 12 | **Google Chat 通知群与 Incoming Webhook URL** | 业务方 | 提前建好要收稽核启动/完成通知的 Google Chat 群（Space），点击顶部群名称旁下拉菜单 $\rightarrow$ **应用和集成 (Apps & integrations)** $\rightarrow$ **Webhooks** $\rightarrow$ **添加 Webhook (Add webhooks)**，复制生成的 URL（`https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=...`）交给我方。阶段 B 会将该 URL 存入由阶段 A 自动创建的 `gs://<PROJECT_ID>-<p>-workspace/config/google_chat_webhook.txt` 并启用通知（见 B5）。 |
-| 13 | 黄金集标注表（可选，测评用） | 业务方 | 黄金集视频目录、人工标注表、测评报告目录，见 4.5。 |
+| 13 | 黄金集标注表（可选，测评用） | 业务方 | 放入 `cctv-audit/evaluation/` 目录下（含黄金集视频子目录、人工标注表、测评报告输出目录，见 §2.5 与 §4.5）。 |
 | 14 | 部署机器 | 我方 | 装好 `gcloud`、Terraform ≥ 1.9（`main.tf` 要求 `>= 1.9.0`）、Python 3.12+、`git`。也可以直接用 Cloud Shell。 |
 
 ### 2.2 组织策略检查（客户 IT 执行，只读）
@@ -210,6 +210,36 @@ python3 -m venv .venv-deploy && .venv-deploy/bin/pip install --require-hashes -r
 | **`[3/3] 项目内已有 GE 应用`** | 提示当前项目是否已有现成 GE 应用 | 如果客户是在**已有 GE 的老项目**里部署，这里会列出他们现成的 GE 应用 ID；把该 ID 填进 `<env>.tfvars` 的 `extra_ge_engine_ids = ["<已有应用ID>"]`，Agent 就会直接挂进他们平时用的 GE 里，员工不用换新网址。 |
 
 **第 3 步：重跑一次 `check-ge-prereqs`（可加 `--fix-idp`）**，确认输出 `🎉 预检全部通过！` 后，再进入第 3 节开始正式部署。只要部署前项目中已有激活的 GE License，**Cloud Build 流水线（`<p>-deployer` 服务账号）会在部署过程中全自动完成 `Use Google Identity` 设置和 GE Agent + 快捷指令气泡（Prompt Chips）挂载**，无需人工再去网页或命令行手动挂载。
+
+### 2.5 规划并创建 Google Drive 业务目录树（业务方必做）
+
+为了避免 SOP 总控表、各门店视频、黄金集测评文件散落在不同地方（或者落进机器人账号自己的根目录导致业务方只能在「与我共享」里翻找），**强烈建议客户在部署前先在 Google Drive 里建好一个顶层总目录 `cctv-audit`**，并按以下标准结构规划子目录：
+
+```text
+📁 cctv-audit/                          <-- 顶层总目录：只需把这个总目录共享给机器人账号「编辑者 (Editor)」，子目录自动继承权限！
+├── 📁 SOP/                             <-- 存放《CHAGEE 门店 CCTV AI 稽核 SOP 总控表》（6 个标准页签）
+├── 📁 evaluation/                      <-- 存放黄金集测评资产（供 Tab3_Golden_Eval 使用）
+│   ├── 📄 CHAGEE_GoldenSet (人工标注表 Google Sheet)
+│   ├── 📁 golden_videos/               <-- 黄金集测试视频片段
+│   └── 📁 eval_reports/                <-- 历次自动生成的 5 页签测评报告与历史对比表
+└── 📁 Video/                           <-- 门店监控视频总目录（下级目录可按「门店」或「日期」任选一种组织）：
+    ├── [组织方式 A：按门店分目录 — 推荐用于日常全量巡检 & Tab2 定时自动巡检]
+    │   ├── 📁 Store_001_武康路店/
+    │   │   ├── 🎬 2026-10-25_bar_01.mp4
+    │   │   ├── 📄 [AI稽核报告] ...     <-- 稽核完成后，报告与 20 秒证据小视频自动生成在该门店目录内
+    │   │   └── 📁 Evidence_Clips/
+    │   └── 📁 Store_002_静安寺店/
+    │
+    └── [组织方式 B：按日期/批次分目录 — 推荐用于特定批次或 Tab4 专项抽检]
+        └── 📁 2026-10-25/
+            ├── 📁 Store_001_武康路店/
+            └── 📁 Store_002_静安寺店/
+```
+
+**为什么要在 Prerequisites 阶段先建好这个目录树？**
+1. **一次共享、永久省心**：业务方把顶层 `📁 cctv-audit` 文件夹共享给机器人账号（`cctv-bot@<customer-domain>`，权限选 **编辑者 / Editor**）一次，下面的 `SOP/`、`evaluation/`、`Video/` 及未来新增的门店子文件夹都会**自动继承机器人读写权限**，不会再出现“新建了一个门店文件夹忘了共享给机器人导致报 403”的问题。
+2. **总控表位置清晰固定**：在阶段 B（B3）初始化 SOP 总控表时，直接指定 `--parent-folder "<SOP 子目录链接>"`（或者由客户自己在 `📁 cctv-audit/SOP/` 下新建空白表格再跑脚本初始化），SOP 总控表就会稳稳当当放在客户的 `📁 cctv-audit/SOP/` 目录里。
+3. **门店级督导权限天然隔离**：如果有区域督导只管某几家店，只需在 `📁 Video/Store_xxx/` 子目录上单独共享给对应督导（查看者或编辑者），复核 Dashboard 就会自动按各人的 Drive 权限只展示他有权限看的门店。
 
 ---
 
@@ -488,26 +518,44 @@ terraform output gemini_enterprise_console_url
 > [!NOTE]
 > Dashboard 的 Drive 权限检查也是靠这条 DWD 授权「以登录人自己的身份」查 Drive，所以**登录 Dashboard 的人必须是机器人账号同一个 Workspace 域里的用户**。
 
-#### B3. 自动创建并初始化 SOP 总控表（Google Sheet）并写回 `<env>.tfvars`
+#### B3. 在 `cctv-audit/SOP` 目录下创建并初始化 SOP 总控表（Google Sheet）并写回 `<env>.tfvars`
 
-只要 B2 的 `--check-dwd` 验证通过，**无需在浏览器里手工建表或导文件**，直接用一条命令让脚本通过 DWD 在机器人账号的 Google Drive 里自动新建 `CHAGEE_SOP_and_Model_Control_Tower` 总控表、写入全部 6 个标准页签与下拉菜单校验、共享给管理员或业务域，并自动把生成的 Sheet ID 写回 `<env>.tfvars`：
+只要 B2 的 `--check-dwd` 验证通过，推荐由客户（或部署人员）把 SOP 总控表直接建在 §2.5 规划好的 **`📁 cctv-audit/SOP/`** 目录下。共有以下两种最常用的执行方式（任选其一）：
+
+**方式一（推荐：一行命令直接在客户的 `📁 cctv-audit/SOP/` 文件夹内自动建表并写回配置）**
+复制客户 Google Drive 里 `📁 cctv-audit/SOP` 文件夹的浏览器链接（或文件夹 ID），传给 `--parent-folder`：
 
 ```bash
 .venv/bin/python scripts/init_sop_sheet.py \
   --tfvars <env>.tfvars \
   --check-dwd \
   --create-sheet \
+  --parent-folder "<cctv-audit/SOP 文件夹的 URL 或 ID>" \
   --share-with domain:<customer-domain> \
   --update-tfvars
 ```
 
-- `--create-sheet`：若 `<env>.tfvars` 里的 `master_prompt_sheet_id` 为空或还是阶段 A 的 `gs://...` 种子路径，脚本会自动在机器人 Drive 下创建一张新 Google Sheet 并写入全部 6 个页签；若 `<env>.tfvars` 里已经填了某张 Google Sheet ID，则就地更新并校验该表。
-- `--share-with`：可传 `user:<邮箱>`、`group:<群组邮箱>` 或 `domain:<域名>`（可重复传多个），自动授予编辑者（Writer）权限，方便督导和管理员直接在浏览器打开编辑。
-- `--update-tfvars`：自动把新建的 Google Sheet ID 写回 `<env>.tfvars` 的 `master_prompt_sheet_id = "<SheetID>"`。
+**方式二（推荐：客户自己在 `📁 cctv-audit/SOP/` 下新建空白 Google Sheet，再用脚本一键灌入 6 个标准页签）**
+如果客户希望总控表的**文件所有者（Owner）是客户自己的管理员账号**而不是机器人账号：
+1. 客户在已共享给机器人的 `📁 cctv-audit/SOP/` 文件夹内，右键点击 **新建 → Google 表格（Google Sheets）**，复制浏览器地址栏里的表格链接；
+2. 执行以下命令灌入全部 6 个标准页签、下拉菜单校验，并自动把表格 ID 写回 `<env>.tfvars`：
+   ```bash
+   .venv/bin/python scripts/init_sop_sheet.py \
+     --tfvars <env>.tfvars \
+     --check-dwd \
+     --sheet-id "<客户新建的空白 Google Sheet URL 或 ID>" \
+     --overwrite \
+     --update-tfvars
+   ```
 
-> **备选方式（已有现成 Google Sheet 或浏览器手工导入）**：
-> - 如果客户已经有建好的空白 Google Sheet（已共享给机器人账号为编辑者），传 `--sheet-id <SheetID> --tfvars <env>.tfvars --overwrite --update-tfvars` 即可写入并更新配置。
-> - 如果想纯浏览器操作：新建空白 Google Sheet → 文件（File）→ 导入（Import）→ 上传 `sop/master_sheet.xlsx` → 选「替换电子表格（Replace spreadsheet）」，共享给机器人账号后把 Sheet ID 手工填入 `<env>.tfvars` 的 `master_prompt_sheet_id`。
+> **说明（如果不传 `--parent-folder` 也不传 `--sheet-id`，只传 `--create-sheet` 表会放在哪？）**
+> 若只传 `--create-sheet` 而不传 `--parent-folder`，脚本会把总控表创建在**机器人账号自己的云端硬盘根目录（My Drive）**下，并通过 `--share-with` 共享给客户域/用户。此时客户在自己的目录树里看不到它，只能去 Google Drive 左侧的 **「与我共享（Shared with me）」** 或通过命令行打印出来的 URL 打开。因此生产交付时**强烈建议加上 `--parent-folder` 或采用方式二**，让总控表直接落在客户的 `📁 cctv-audit/SOP/` 目录中。
+
+参数说明：
+- `--parent-folder`：配合 `--create-sheet` 使用，支持直接传 Google Drive 文件夹完整 URL（`https://drive.google.com/drive/folders/...`）或文件夹 ID，把新建的总控表直接放进该目录。
+- `--sheet-id`：针对已建好的空白或已有 Google Sheet（支持完整 URL 或 Sheet ID），配合 `--overwrite` 写入全部 6 个标准页签。
+- `--share-with`：可传 `user:<邮箱>`、`group:<群组邮箱>` 或 `domain:<域名>`（可重复传多个），自动授予编辑者（Writer）权限。
+- `--update-tfvars`：自动把目标 Google Sheet ID 写回 `<env>.tfvars` 的 `master_prompt_sheet_id = "<SheetID>"`。
 
 总控表的页签（来自 `sop/master_sheet.json`）：
 

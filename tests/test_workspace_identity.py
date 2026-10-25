@@ -1005,15 +1005,24 @@ def test_init_sop_sheet_check_dwd_and_create_sheet_update_tfvars(monkeypatch, tm
     import googleapiclient.discovery as disc_mod
 
     shared_perms: list[dict] = []
+    moved_files: list[dict] = []
 
     class _FakePerms:
         def create(self, **kwargs):
             shared_perms.append(kwargs)
             return _Req({"id": "perm1"})
 
+    class _FakeFiles:
+        def update(self, **kwargs):
+            moved_files.append(kwargs)
+            return _Req({"id": kwargs.get("fileId"), "parents": [kwargs.get("addParents")]})
+
     class _FakeDriveCreate(_FakeDriveAbout):
         def permissions(self):
             return _FakePerms()
+
+        def files(self):
+            return _FakeFiles()
 
     class _FakeSpreadsheetsCreate:
         def spreadsheets(self):
@@ -1033,13 +1042,17 @@ def test_init_sop_sheet_check_dwd_and_create_sheet_update_tfvars(monkeypatch, tm
     assert info["user_email"] == "cctv-bot@example.com"
     assert info["storage_limit_bytes"] == 30 * 1024 ** 3
 
-    # 3. create_master_spreadsheet creates Sheet and shares with domain + user
+    # 3. create_master_spreadsheet creates Sheet, moves into parent_folder, and shares with domain + user
+    assert init_mod.extract_folder_id("https://drive.google.com/drive/folders/1SopFolderId_abc123?usp=sharing") == "1SopFolderId_abc123"
     new_sid = init_mod.create_master_spreadsheet(
         object(),
         title="CHAGEE_SOP_and_Model_Control_Tower",
         share_with=["domain:example.com", "admin@example.com"],
+        parent_folder="https://drive.google.com/drive/folders/1SopFolderId_abc123",
     )
     assert new_sid == "1AutoCreatedSopMasterSheetId0000001"
+    assert len(moved_files) == 1
+    assert moved_files[0]["addParents"] == "1SopFolderId_abc123"
     assert len(shared_perms) == 2
     assert shared_perms[0]["body"] == {"type": "domain", "role": "writer", "domain": "example.com"}
     assert shared_perms[1]["body"] == {"type": "user", "role": "writer", "emailAddress": "admin@example.com"}
