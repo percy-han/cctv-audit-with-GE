@@ -66,7 +66,7 @@
 | 11 | Dashboard 准入名单 | 业务方 + 客户 IT | 决定 `portal_allowed_members`：整个域 `domain:<customer-domain>`，或一个 Google 群组 `group:<group>@<customer-domain>`，或逐个 `user:<email>`。**这只决定谁能登录**；能看哪家店还由各人的 Drive 权限决定。 |
 | 12 | **Google Chat 通知群与 Incoming Webhook URL** | 业务方 | 提前建好要收稽核启动/完成通知的 Google Chat 群（Space），点击顶部群名称旁下拉菜单 $\rightarrow$ **应用和集成 (Apps & integrations)** $\rightarrow$ **Webhooks** $\rightarrow$ **添加 Webhook (Add webhooks)**，复制生成的 URL（`https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=...`）交给我方。阶段 B 会将该 URL 存入由阶段 A 自动创建的 `gs://<PROJECT_ID>-<p>-workspace/config/google_chat_webhook.txt` 并启用通知（见 B5）。 |
 | 13 | 黄金集标注表（可选，测评用） | 业务方 | 放入 `cctv-audit/evaluation/` 目录下（含黄金集视频子目录、人工标注表、测评报告输出目录，见 §2.5 与 §4.5）。 |
-| 14 | 部署机器 | 我方 | 装好 `gcloud`、Terraform ≥ 1.9（`main.tf` 要求 `>= 1.9.0`）、Python 3.12+、`git`。也可以直接用 Cloud Shell。 |
+| 14 | **部署执行环境（推荐直接用 Cloud Shell）** | 客户 IT / 我方 | **强烈推荐直接在 GCP Console 顶部打开 Google Cloud Shell 执行**（免装 `gcloud` / Python、免配本地代理、自带管理员登录态，也支持右上角直接上传离线代码包）。若在本地电脑（Mac / Linux / WSL）执行，需装好 `gcloud`、Terraform ≥ 1.9（`main.tf` 要求 `>= 1.9.0`）、Python 3.12+、`git`。 |
 
 ### 2.2 组织策略检查（客户 IT 执行，只读）
 
@@ -113,14 +113,25 @@ gcloud services enable serviceusage.googleapis.com cloudresourcemanager.googleap
 1. 新 Project 还没选“员工用什么账号登录（Identity Provider）”；
 2. 新 Project 默认是 **0 个 GE 席位**（还没从公司账单账号划拨过来），且执行部署的管理员名下在该项目里还没有绑上 GE License。如果不提前设好，后面往 GE 里挂 Agent 时会被拒（报 `active Gemini Enterprise license is not available`）。
 
-**第 1 步：克隆代码并跑一键预检脚本**
+**第 1 步：打开 Cloud Shell（或本地终端），准备代码并跑一键预检脚本**
+
+- **方式 A（从 GitHub 克隆）**：
+  ```bash
+  git clone https://github.com/percy-han/cctv-audit-with-GE.git
+  cd cctv-audit-with-GE
+  ```
+- **方式 B（若使用离线代码包 `.zip` / `.tar.gz`）**：
+  在 GCP Console 右上角打开 **Cloud Shell** $\rightarrow$ 点击右上角 **`⋮`（更多） $\rightarrow$ Upload（上传）** 上传代码包，然后解压进入目录：
+  ```bash
+  mkdir -p ~/cctv-audit-with-GE && tar -xzf cctv-audit-with-GE.tar.gz -C ~/cctv-audit-with-GE && cd ~/cctv-audit-with-GE
+  # 若为 zip 包：unzip cctv-audit-with-GE.zip -d ~/cctv-audit-with-GE && cd ~/cctv-audit-with-GE
+  ```
+
+接着在代码根目录运行预检：
 
 ```bash
-git clone https://github.com/percy-han/cctv-audit-with-GE.git
-cd cctv-audit-with-GE
-gcloud auth login <管理员邮箱>
 gcloud config set project <PROJECT_ID>
-gcloud auth application-default login
+# 若在本地电脑而非 Cloud Shell 执行，需先跑：gcloud auth login <管理员邮箱> && gcloud auth application-default login
 
 python3 -m venv .venv-deploy && .venv-deploy/bin/pip install --require-hashes -r deploy/requirements-deploy.txt
 .venv-deploy/bin/python deploy/deploy_reasoning_engine.py --project-id <PROJECT_ID> check-ge-prereqs --admin-email <管理员邮箱>
@@ -181,11 +192,30 @@ python3 -m venv .venv-deploy && .venv-deploy/bin/pip install --require-hashes -r
 
 下文 `<env>` 表示这套环境的配置文件名（任意，例如 `prod`，**不能叫 `example`**），`<p>` 表示 `name_prefix`。所有命令都在**仓库根目录**（`main.tf` 所在目录）执行，除非写明 `cd bootstrap`。
 
+### 3.0 推荐在 Google Cloud Shell 中执行（一键环境准备）
+
+我们**优先推荐在 GCP Console 右上角直接打开 Google Cloud Shell 执行**（当然在本地 Mac / Linux / WSL 电脑上执行也完全支持）。用 Cloud Shell 的好处是：
+1. 免安装 `gcloud`、`git`、`python3`，打开即自带当前管理员登录态，不受公司办公网本地代理干扰；
+2. 如果使用离线代码包交付，直接在 Cloud Shell 右上角点 **`⋮` $\rightarrow$ Upload（上传）** 即可把代码包传上去；
+3. `gcloud builds submit` 提交后任务在 GCP 云端后台运行（约 15–25 分钟），就算浏览器标签页断开也不影响云端构建。
+
+在 Cloud Shell（或本地终端）进入代码根目录后，**先粘贴执行下面这段一键环境准备命令**（自动设置项目、关闭 Cloud Shell 容器内不通的 IPv6 防止 `terraform init/apply` 卡住，并在 Terraform 低于 1.9 时自动安装 `1.9.5`）：
+
 ```bash
-git clone https://github.com/percy-han/cctv-audit-with-GE.git
-cd cctv-audit-with-GE
-gcloud auth login
+cd ~/cctv-audit-with-GE   # 进入代码根目录
 gcloud config set project <PROJECT_ID>
+
+# 1) 关闭 Cloud Shell 容器内无路由的 IPv6（避免本地跑 bootstrap terraform apply 时报 cannot assign requested address）
+sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 2>/dev/null || true
+
+# 2) 确保 Terraform 版本 >= 1.9.0（若 Cloud Shell 自带版本较旧，自动下载 1.9.5 到 ~/.local/bin）
+if ! terraform version -json 2>/dev/null | python3 -c "import sys,json; v=json.load(sys.stdin).get('terraform_version','0.0'); sys.exit(0 if tuple(map(int,v.split('.')[:2]))>=(1,9) else 1)"; then
+  mkdir -p ~/.local/bin
+  curl -fsSL https://releases.hashicorp.com/terraform/1.9.5/terraform_1.9.5_linux_amd64.zip -o /tmp/tf.zip
+  unzip -o /tmp/tf.zip -d ~/.local/bin && rm -f /tmp/tf.zip
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+terraform -version
 ```
 
 ---
