@@ -1299,3 +1299,18 @@ def test_context_job_id_never_restarts_a_done_job(tmp_path):
             await svc.start_audit(user_id="u@example.com", job_id=done.job_id, session_id="S", job_id_from_context=True)
 
     asyncio.run(_run())
+
+
+def test_scheduled_eval_row_error_previous_report_property():
+    """Regression test: ScheduledEvalRowError provides both previous_status and previous_report."""
+    from cctv_audit.prompt_manager import ScheduledEvalRowError
+
+    err = ScheduledEvalRowError(
+        row_index=5,
+        eval_id="EVAL-V18",
+        trigger_action="IDLE",
+        error_message="❌ Config Error: duplicate Eval_ID",
+        previous_status="Ready",
+    )
+    assert err.previous_status == "Ready"
+    assert err.previous_report == "Ready"

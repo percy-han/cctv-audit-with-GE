@@ -353,6 +353,10 @@ class ScheduledEvalRowError(BaseModel):
     error_message: str
     previous_status: str = Field(default="")
 
+    @property
+    def previous_report(self) -> str:
+        return self.previous_status
+
 
 DEFAULT_VISUAL_SCAN_TARGETS: List[VisualScanTarget] = [
     VisualScanTarget(subject="Personnel", question="How many individuals appear in the frame? Describe each person's gender, hairstyle, attire/PPE traits, and assigned station."),

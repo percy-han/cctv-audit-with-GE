@@ -1585,12 +1585,20 @@ class ScheduledAuditEngine:
         invalid_eval_rows: List[int] = []
         for err in eval_errors:
             invalid_eval_rows.append(err.row_index)
-            if callable(update_eval_fn) and err.previous_report != err.error_message:
-                await update_eval_fn(
-                    err.row_index,
-                    trigger_action="FAILED",
-                    last_eval_report=err.error_message,
-                )
+            prev_report = getattr(err, "previous_status", getattr(err, "previous_report", ""))
+            if callable(update_eval_fn) and prev_report != err.error_message:
+                try:
+                    await update_eval_fn(
+                        err.row_index,
+                        trigger_action="FAILED",
+                        last_eval_report=err.error_message,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to write Tab3 validation error on row %s: %s",
+                        err.row_index,
+                        exc,
+                    )
 
         triggered_evals: List[Dict[str, Any]] = []
         for rule in eval_rules:
