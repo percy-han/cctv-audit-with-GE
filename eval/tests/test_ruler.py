@@ -560,6 +560,34 @@ class EvalRecordsTest(unittest.TestCase):
         self.assertEqual(res["total_tokens"], 420_000)
         self.assertEqual(res["spreadsheet_url"], "https://docs.google.com/spreadsheets/d/report_123/edit")
 
+    def test_genai_judge_fallback_retries_transient_429(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        calls = {"count": 0}
+
+        class _FakeModels:
+            def generate_content(self, **kwargs):
+                calls["count"] += 1
+                if calls["count"] < 3:
+                    raise RuntimeError("429 RESOURCE_EXHAUSTED: TPM quota exhausted")
+                return SimpleNamespace(text='{"score": 1.0, "explanation": "MATCH=F001; ok"}')
+
+        class _FakeClient:
+            def __init__(self, **kwargs):
+                self.models = _FakeModels()
+
+        with patch("google.genai.Client", _FakeClient):
+            out, _ = sr._genai_judge_fallback(
+                [{"case_id": "R08", "reference": "ref", "response": "resp"}],
+                "study-project-496907",
+                "gemini-3.1-pro-preview",
+                max_attempts=4,
+                base_delay_sec=0.0,
+            )
+        self.assertEqual(calls["count"], 3)
+        self.assertEqual(out, [(1.0, "MATCH=F001; ok")])
+
 
 if __name__ == "__main__":
     unittest.main()

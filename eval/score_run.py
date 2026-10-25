@@ -499,13 +499,38 @@ def near_misses(part: dict[str, Any], files: list[str], findings: list[Finding],
     return out
 
 
+def _is_transient_judge_error(exc: BaseException) -> bool:
+    """Returns True for rate-limit (429) or transient gateway/unavailable (500/502/503/504) errors."""
+    msg = f"{type(exc).__name__}: {exc}".upper()
+    return any(
+        tok in msg
+        for tok in (
+            "429",
+            "RESOURCE_EXHAUSTED",
+            "QUOTA",
+            "RATE_LIMIT",
+            "500",
+            "502",
+            "503",
+            "504",
+            "UNAVAILABLE",
+            "DEADLINE_EXCEEDED",
+            "INTERNAL",
+        )
+    )
+
+
 def _genai_judge_fallback(
     cases: list[dict[str, str]],
     project: str,
     judge_model: str,
     credentials: Any = None,
+    *,
+    max_attempts: int = 5,
+    base_delay_sec: float = 4.0,
 ) -> tuple[list[tuple[float | None, str]], Any]:
     """Direct ``google.genai`` judge fallback when ``agentplatform`` is not installed in the worker image."""
+    import time as _time
     from google import genai
     from google.genai import types as gt
 
@@ -521,23 +546,33 @@ def _genai_judge_fallback(
             reference=c["reference"],
             response=c["response"],
         )
-        try:
-            resp = client.models.generate_content(
-                model=judge_model,
-                contents=prompt_text,
-                config=gt.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json",
-                ),
-            )
-            raw_text = (resp.text or "").strip()
-            parsed = json.loads(raw_text)
-            raw_score = parsed.get("score")
-            score_val = float(raw_score) if raw_score is not None else None
-            expl = str(parsed.get("explanation") or "")
-            out.append((score_val, expl))
-        except Exception as exc:  # noqa: BLE001
-            out.append((None, f"JUDGE_ERROR: {type(exc).__name__}: {exc}"))
+        last_exc: Exception | None = None
+        for attempt in range(1, max(1, max_attempts) + 1):
+            try:
+                resp = client.models.generate_content(
+                    model=judge_model,
+                    contents=prompt_text,
+                    config=gt.GenerateContentConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json",
+                    ),
+                )
+                raw_text = (resp.text or "").strip()
+                parsed = json.loads(raw_text)
+                raw_score = parsed.get("score")
+                score_val = float(raw_score) if raw_score is not None else None
+                expl = str(parsed.get("explanation") or "")
+                out.append((score_val, expl))
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt < max_attempts and _is_transient_judge_error(exc):
+                    _time.sleep(base_delay_sec * (2 ** (attempt - 1)))
+                    continue
+                break
+        if last_exc is not None:
+            out.append((None, f"JUDGE_ERROR: {type(last_exc).__name__}: {last_exc}"))
     return out, None
 
 
