@@ -605,6 +605,18 @@ def is_agentic_not_enabled_error(exc: BaseException) -> bool:
     return any(AGENTIC_NOT_ENABLED_MARKER in text for text in texts)
 
 
+def is_deadline_exceeded_error(exc: BaseException) -> bool:
+    """True when `exc` is Vertex AI's 504 DEADLINE_EXCEEDED / Gateway Timeout or client TimeoutError."""
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return True
+    texts = (str(exc), str(getattr(exc, "message", "") or ""))
+    return any(
+        marker in text
+        for text in texts
+        for marker in ("504", "DEADLINE_EXCEEDED", "DeadlineExceeded", "Gateway Timeout")
+    )
+
+
 def mark_agentic_unsupported(model_name: str) -> None:
     """Remembers for this process that `model_name` rejects agentic video (see `wants_agentic_video`)."""
     if model_name:
@@ -737,25 +749,75 @@ class AgenticAuditor:
                     contents=[video_part, user_prompt],
                     gen_config=gen_config,
                     timeout_ms=timeout_ms,
+                    max_attempts=2 if sent_agentic else 4,
                 )
             except Exception as exc:
-                if not (sent_agentic and is_agentic_not_enabled_error(exc)):
+                if sent_agentic and is_agentic_not_enabled_error(exc):
+                    # `_is_transient_error` excludes this marker, so the 400 arrives after a single
+                    # attempt. Mark the model, rebuild the Part (now static) and call once more; any
+                    # failure of the static call propagates unchanged.
+                    mark_agentic_unsupported(model_name)
+                    logger.warning(
+                        "Model %s does not support agentic video; falling back to static sampling for the rest of this process",
+                        model_name,
+                    )
+                    video_part = build_video_part(segment, model_name)
+                    response = await generate_content_with_retry(
+                        model=model_name,
+                        contents=[video_part, user_prompt],
+                        gen_config=gen_config,
+                        timeout_ms=timeout_ms,
+                    )
+                elif sent_agentic and is_deadline_exceeded_error(exc):
+                    # Under temperature=0.0, a dense multi-person clip in AGENTIC mode can enter a
+                    # deterministic multi-round tool/thinking trajectory that exceeds Vertex AI's
+                    # 600s unary HTTP gateway limit (504 DEADLINE_EXCEEDED). First retry once in
+                    # AGENTIC mode with perturbed temperature=0.2 and bounded thinking_budget=8192;
+                    # if that also hits 504/deadline, fall back to static sampling for THIS segment
+                    # only (without marking the model unsupported for subsequent clips).
+                    logger.warning(
+                        "Model %s hit 504/deadline timeout in agentic mode on %s (seg #%d); "
+                        "retrying once in agentic mode with temperature=0.2 and thinking_budget=8192",
+                        model_name,
+                        segment.source_filename,
+                        segment.segment_index,
+                    )
+                    perturbed_cfg = gen_config.model_copy(
+                        update={
+                            "temperature": 0.2,
+                            "thinking_config": types.ThinkingConfig(thinking_budget=8192),
+                        }
+                    )
+                    try:
+                        response = await generate_content_with_retry(
+                            model=model_name,
+                            contents=[video_part, user_prompt],
+                            gen_config=perturbed_cfg,
+                            timeout_ms=timeout_ms,
+                            max_attempts=1,
+                        )
+                    except Exception as exc2:
+                        if not is_deadline_exceeded_error(exc2):
+                            raise
+                        logger.warning(
+                            "Model %s hit persistent 504/deadline timeout in agentic mode on %s (seg #%d); "
+                            "falling back to static sampling for this segment only",
+                            model_name,
+                            segment.source_filename,
+                            segment.segment_index,
+                        )
+                        static_part = build_video_part(
+                            segment, model_name, media_processing="static"
+                        )
+                        response = await generate_content_with_retry(
+                            model=model_name,
+                            contents=[static_part, user_prompt],
+                            gen_config=gen_config,
+                            timeout_ms=timeout_ms,
+                            max_attempts=2,
+                        )
+                else:
                     raise
-                # `_is_transient_error` excludes this marker, so the 400 arrives after a single
-                # attempt. Mark the model, rebuild the Part (now static) and call once more; any
-                # failure of the static call propagates unchanged.
-                mark_agentic_unsupported(model_name)
-                logger.warning(
-                    "Model %s does not support agentic video; falling back to static sampling for the rest of this process",
-                    model_name,
-                )
-                video_part = build_video_part(segment, model_name)
-                response = await generate_content_with_retry(
-                    model=model_name,
-                    contents=[video_part, user_prompt],
-                    gen_config=gen_config,
-                    timeout_ms=timeout_ms,
-                )
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         parsed: WindowResult = (

@@ -478,3 +478,59 @@ def test_other_errors_are_reraised_unchanged_and_static_mode_never_falls_back(mo
     assert agentic_auditor._AGENTIC_UNSUPPORTED_MODELS == {"gemini-3.1-pro-preview"}
     asyncio.run(_analyze("gemini-3.1-pro-preview"))
     assert calls[2].agentic is False
+
+
+def test_agentic_504_deadline_retries_perturbed_then_falls_back_to_static_for_that_segment_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: List[SimpleNamespace] = []
+
+    async def _fake_generate(*, model: str, contents: list, gen_config: Any, **kw: Any) -> SimpleNamespace:
+        part = contents[0]
+        calls.append(
+            SimpleNamespace(
+                model=model,
+                agentic=_is_agentic(part),
+                temperature=getattr(gen_config, "temperature", None),
+                thinking_budget=getattr(getattr(gen_config, "thinking_config", None), "thinking_budget", None),
+                max_attempts=kw.get("max_attempts"),
+            )
+        )
+        # Segment 0: first two calls (agentic temp=0.0 and agentic perturbed temp=0.2) hit 504 DEADLINE_EXCEEDED;
+        # third call (static fallback for segment 0) succeeds.
+        if len(calls) in (1, 2):
+            raise genai_errors.ServerError(
+                504,
+                {
+                    "error": {
+                        "code": 504,
+                        "message": "Deadline exceeded while waiting for model response",
+                        "status": "DEADLINE_EXCEEDED",
+                    }
+                },
+            )
+        return _ok_response()
+
+    monkeypatch.setattr(agentic_auditor, "generate_content_with_retry", _fake_generate)
+    auditor = AgenticAuditor(gemini_concurrency=5)
+
+    async def _analyze(idx: int):
+        return await auditor.analyze_segment(
+            audit_id="r91",
+            folder_id="folder",
+            segment=_segment(idx),
+            prompt_cfg=PromptModelConfig(active_model_version="gemini-3.8-flash", system_instruction="SYS"),
+        )
+
+    parsed0, _ = asyncio.run(_analyze(0))
+    assert parsed0.findings == []
+    assert [(c.agentic, c.temperature, c.thinking_budget, c.max_attempts) for c in calls] == [
+        (True, 0.0, None, 2),
+        (True, 0.2, 8192, 1),
+        (False, 0.0, None, 2),
+    ]
+    # Model is NOT marked unsupported globally; segment 1 still uses agentic mode!
+    assert agentic_auditor._AGENTIC_UNSUPPORTED_MODELS == set()
+    asyncio.run(_analyze(1))
+    assert calls[3].agentic is True
+    assert calls[3].temperature == 0.0

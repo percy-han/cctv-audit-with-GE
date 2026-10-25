@@ -415,38 +415,89 @@ CLIP_MAX_ATTEMPTS = 3
 CLIP_RETRY_BASE_SEC = 30.0
 
 
+def build_shared_ckpt_prefix(
+    *,
+    eval_id: str,
+    prompt_tab_name: str,
+    model_version: str,
+    golden_version: str,
+) -> str:
+    """Stable GCS checkpoint prefix shared across re-triggered runs of the same Tab3 row config."""
+    import hashlib
+
+    raw_key = (
+        f"{eval_id.strip()}|{prompt_tab_name.strip()}|"
+        f"{model_version.strip()}|{golden_version.strip()}"
+    )
+    digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:16]
+    return f"eval/ckpt_shared/{digest}"
+
+
 class ClipCheckpointStore:
     """Per-clip result store so a failed round resumes instead of redoing every clip.
 
     GCS-backed in Cloud Build (``gs://<bucket>/eval/runs/<run_id>/ckpt/``); local-dir-backed in tests.
+    When ``shared_prefix`` is set (e.g. ``eval/ckpt_shared/<hash>`` for Tab3 sheet-triggered runs),
+    completed clips are also mirrored to and read from ``shared_prefix`` so re-triggering ``START_EVAL``
+    with a new ``eval_task_id`` reuses completed clips from an interrupted run of the same config.
     One JSON per clip, written only after the clip's model call succeeded."""
 
-    def __init__(self, *, run_id: str, bucket_name: str | None, project: str | None,
-                 local_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        bucket_name: str | None,
+        project: str | None,
+        local_dir: Path | None = None,
+        shared_prefix: str | None = None,
+    ) -> None:
         self.prefix = f"eval/runs/{run_id}/ckpt"
+        self.shared_prefix = shared_prefix.strip("/") if shared_prefix else None
         self.bucket_name, self.project, self.local_dir = bucket_name, project, local_dir
 
     def _name(self, baseline_jid: str, file_id: str) -> str:
         return f"{self.prefix}/{baseline_jid}/{file_id}.json"
 
+    def _shared_name(self, baseline_jid: str, file_id: str) -> str | None:
+        if not self.shared_prefix:
+            return None
+        return f"{self.shared_prefix}/{baseline_jid}/{file_id}.json"
+
     def get(self, baseline_jid: str, file_id: str) -> dict[str, Any] | None:
-        name = self._name(baseline_jid, file_id)
+        candidates = [self._name(baseline_jid, file_id)]
+        shared_name = self._shared_name(baseline_jid, file_id)
+        if shared_name:
+            candidates.append(shared_name)
         if self.local_dir is not None:
-            path = self.local_dir / name
-            return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
-        blob = get_gcs_storage_client(project=self.project).bucket(self.bucket_name).blob(name)
-        return json.loads(blob.download_as_text()) if blob.exists() else None
+            for cand in candidates:
+                path = self.local_dir / cand
+                if path.exists():
+                    return json.loads(path.read_text(encoding="utf-8"))
+            return None
+        bucket = get_gcs_storage_client(project=self.project).bucket(self.bucket_name)
+        for cand in candidates:
+            blob = bucket.blob(cand)
+            if blob.exists():
+                return json.loads(blob.download_as_text())
+        return None
 
     def put(self, baseline_jid: str, file_id: str, doc: dict[str, Any]) -> None:
         name = self._name(baseline_jid, file_id)
+        shared_name = self._shared_name(baseline_jid, file_id)
         data = json.dumps(doc, ensure_ascii=False)
         if self.local_dir is not None:
-            path = self.local_dir / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(data, encoding="utf-8")
+            for target_name in [name, *([shared_name] if shared_name else [])]:
+                path = self.local_dir / target_name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(data, encoding="utf-8")
             return
-        get_gcs_storage_client(project=self.project).bucket(self.bucket_name).blob(name).upload_from_string(
-            data, content_type="application/json")
+        bucket = get_gcs_storage_client(project=self.project).bucket(self.bucket_name)
+        bucket.blob(name).upload_from_string(data, content_type="application/json")
+        if shared_name:
+            try:
+                bucket.blob(shared_name).upload_from_string(data, content_type="application/json")
+            except Exception as exc:
+                logger.warning("Non-fatal: failed to mirror checkpoint to %s: %s", shared_name, exc)
 
 
 async def analyze_clip_with_retry(auditor: AgenticAuditor, *, label: str, **kwargs: Any):
@@ -898,11 +949,22 @@ async def run_sheet_triggered_eval(
         logger.warning("Drive ingestor init skipped (%s); relying on cached GCS slices.", exc)
         ingestor = None
 
+    shared_ckpt_prefix = build_shared_ckpt_prefix(
+        eval_id=eval_id,
+        prompt_tab_name=str(prompt_cfg.active_prompt_version),
+        model_version=str(prompt_cfg.active_model_version),
+        golden_version=str(
+            getattr(golden, "version", "")
+            or getattr(golden, "source", "")
+            or golden_source_id
+        ),
+    )
     ckpt = ClipCheckpointStore(
         run_id=run_id,
         bucket_name=cfg.staging_bucket,
         project=cfg.gcp_project,
         local_dir=results_dir / f".ckpt_{run_id}" if skip_gcs_sync else None,
+        shared_prefix=shared_ckpt_prefix,
     )
     sem = asyncio.Semaphore(max(1, int(folder_concurrency)))
 

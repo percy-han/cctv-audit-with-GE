@@ -246,6 +246,45 @@ class ClipRetryAndResumeTest(unittest.TestCase):
             self.assertEqual(resumed["completed_segments"], full["completed_segments"])
             self.assertEqual(resumed["window_results"], full["window_results"])
 
+    def test_shared_prefix_reuses_checkpoints_across_retriggered_run_ids(self):
+        vids = [v["file_id"] for v in _one_folder()["videos"]]
+        with tempfile.TemporaryDirectory() as d:
+            shared = rgr.build_shared_ckpt_prefix(
+                eval_id="EVAL-EXAMPLE-01",
+                prompt_tab_name="Prompt_v1.0_Standard",
+                model_version="gemini-3.8-flash",
+                golden_version="golden_v1@9426fe9b52",
+            )
+            ckpt1 = rgr.ClipCheckpointStore(
+                run_id="run_attempt_1",
+                bucket_name=None,
+                project=None,
+                local_dir=Path(d),
+                shared_prefix=shared,
+            )
+
+            class DieOnLast(FakeAuditor):
+                async def analyze_segment(self, *, segment, **kw):
+                    if segment.source_file_id == vids[-1]:
+                        raise TimeoutError()
+                    return await super().analyze_segment(segment=segment, **kw)
+
+            with self.assertRaises(TimeoutError):
+                _run_folder(DieOnLast(), ckpt=ckpt1)
+
+            # A re-triggered run gets a brand-new run_id ("run_attempt_2"), but shares `shared_prefix`.
+            ckpt2 = rgr.ClipCheckpointStore(
+                run_id="run_attempt_2",
+                bucket_name=None,
+                project=None,
+                local_dir=Path(d),
+                shared_prefix=shared,
+            )
+            aud2 = _FlakyAuditor(forbid=set(vids[:-1]))
+            resumed = _run_folder(aud2, ckpt=ckpt2)
+            self.assertEqual(aud2.calls, [vids[-1]])
+            self.assertEqual(len(resumed["completed_segments"]), len(vids))
+
 
 class ScoreRunApiTest(unittest.TestCase):
     def test_rejects_even_passes_and_empty_dir(self):
