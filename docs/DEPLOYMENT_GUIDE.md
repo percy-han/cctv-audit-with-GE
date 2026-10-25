@@ -1,6 +1,6 @@
 # 门店 CCTV AI 稽核系统：部署与运维手册（客户版）
 
-> 适用代码版本：交付仓库 `cctv-audit-with-GE` 提交 `47dd609` 及之后版本。
+> 适用代码版本：交付仓库 `cctv-audit-with-GE` 最新主干版本（含 Dry-Run 全链路验证修复）。
 > 本手册中所有命令、变量名、输出名、文件名都按代码原样写出。尖括号 `<...>` 都是占位符，要换成你们自己的值，例如 `<PROJECT_ID>`、`<name_prefix>`、`<customer-domain>`。
 > 标有 **「待验证」** 的地方，是代码里看不出来、需要部署当天在你们环境里实际确认的。
 
@@ -132,14 +132,14 @@ J 列下拉值：`PENDING`、`✅ CONFIRMED`、`❌ FALSE_POSITIVE`、`⚠️ FO
 | 3 | 基础 API 预先启用 | 客户 IT / 我方 | 见 2.3。 |
 | 4 | 组织策略只读检查 | 客户 IT | 见 2.2，把 4 条命令的输出发给我方。 |
 | 5 | 数据驻留确认 | 业务方 + 客户 IT | 确认 1.5 里列的各处理地点可以接受；确认 `region`、`reasoning_engine_location`。 |
-| 6 | 模型可用 | 我方 | 生产模型 `gemini-3.8-flash`；部署后在 GE 里跑一次预检确认可用（见 3.13）。 |
+| 6 | 模型可用 | 我方 | 生产模型 `gemini-3.8-flash`；部署后在 GE 里跑一次预检确认可用（见 B8 / 4.1）。 |
 | 7 | Workspace 机器人账号 | Workspace 管理员 | 在 `<customer-domain>` 下新建一个普通用户，例如 `cctv-bot@<customer-domain>`，**分配带 Drive 存储空间的付费许可**（报告表和证据切片都存在它名下）。会占 1 个席位。 |
 | 8 | Workspace 超级管理员到场 | Workspace 管理员 | 阶段 B 在 `admin.google.com` 做一次全网域委派授权（约 5 分钟）。 |
 | 9 | 门店视频 Drive 目录 | 业务方 | 建议「一个门店一个文件夹」，视频直接放在门店文件夹里；定时巡检用一个根目录，下面每店一个子文件夹。把根目录（或每个门店文件夹）**共享给机器人账号，权限「编辑者」**。视频短边至少 720 像素，否则会被跳过。 |
 | 10 | GE 许可 | 客户 IT / 业务方 | 给每位要用的督导分配 Gemini Enterprise 许可（席位）。督导账号都是 `@<customer-domain>`。 |
-| 10a | **部署项目里已开通 Gemini Enterprise 订阅 / 许可，且执行部署的管理员本人有一个有效 GE 许可** | 客户 IT | 流水线注册 GE Agent 时，Google 会检查调用身份有没有有效的 GE 许可；没有时 GE 应用照样建好，但 **Agent 建不出来**（只打 ⚠️ 警告，部署不报错）。补救办法见 B8。 |
+| 10a | **部署项目里已开通 Gemini Enterprise 订阅 / 许可，且执行部署的管理员本人有一个有效 GE 许可** | 客户 IT | 部署前执行 §2.4 的 `check-ge-prereqs` 预检确认项目已从公司 Billing Account 划拨 GE 席位且管理员持证；这样 Cloud Build 流水线会自动注册 GE 应用、Agent 与快捷指令气泡。若跳过导致未注册，补救办法见 B8。 |
 | 11 | Dashboard 准入名单 | 业务方 + 客户 IT | 决定 `portal_allowed_members`：整个域 `domain:<customer-domain>`，或一个 Google 群组 `group:<group>@<customer-domain>`，或逐个 `user:<email>`。**这只决定谁能登录**；能看哪家店还由各人的 Drive 权限决定。 |
-| 12 | **Google Chat 通知群与 Incoming Webhook URL** | 业务方 | 提前建好要收稽核启动/完成通知的 Google Chat 群（Space），点击顶部群名称旁下拉菜单 $\rightarrow$ **应用和集成 (Apps & integrations)** $\rightarrow$ **Webhooks** $\rightarrow$ **添加 Webhook (Add webhooks)**，复制生成的 URL（`https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=...`）交给我方。阶段 B 会将该 URL 存入由阶段 A 自动创建的 `gs://<PROJECT_ID>-<p>-workspace/config/google_chat_webhook.txt` 并启用通知（见 B7）。 |
+| 12 | **Google Chat 通知群与 Incoming Webhook URL** | 业务方 | 提前建好要收稽核启动/完成通知的 Google Chat 群（Space），点击顶部群名称旁下拉菜单 $\rightarrow$ **应用和集成 (Apps & integrations)** $\rightarrow$ **Webhooks** $\rightarrow$ **添加 Webhook (Add webhooks)**，复制生成的 URL（`https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=...`）交给我方。阶段 B 会将该 URL 存入由阶段 A 自动创建的 `gs://<PROJECT_ID>-<p>-workspace/config/google_chat_webhook.txt` 并启用通知（见 B5）。 |
 | 13 | 黄金集标注表（可选，测评用） | 业务方 | 黄金集视频目录、人工标注表、测评报告目录，见 4.5。 |
 | 14 | 部署机器 | 我方 | 装好 `gcloud`、Terraform ≥ 1.9（`main.tf` 要求 `>= 1.9.0`）、Python 3.12+、`git`。也可以直接用 Cloud Shell。 |
 
@@ -169,7 +169,7 @@ gcloud org-policies describe constraints/iam.allowedPolicyMemberDomains --projec
 
 | API | 由谁启用 |
 | :--- | :--- |
-| `cloudbuild`、`artifactregistry`、`cloudresourcemanager`、`iam`、`iamcredentials`、`sheets`、`monitoring` | bootstrap（`bootstrap/main.tf`）自动启用 |
+| `cloudbuild`、`artifactregistry`、`cloudresourcemanager`、`iam`、`iamcredentials`、`sheets`、`monitoring`、`aiplatform`、`discoveryengine` | bootstrap（`bootstrap/main.tf`）自动启用 |
 | `aiplatform`、`artifactregistry`、`run`、`storage`、`iam`、`iamcredentials`、`drive`、`sheets`、`discoveryengine`、`monitoring`、`cloudscheduler`、`iap`（`enable_portal_iap = true` 时） | 主体部署（`main.tf`）自动启用 |
 
 Terraform 启用 API 本身要靠 Service Usage API，建状态桶要靠 Cloud Storage API。新项目通常默认已开，保险起见先执行一次：
@@ -178,10 +178,8 @@ Terraform 启用 API 本身要靠 Service Usage API，建状态桶要靠 Cloud S
 gcloud services enable serviceusage.googleapis.com cloudresourcemanager.googleapis.com storage.googleapis.com discoveryengine.googleapis.com --project=<PROJECT_ID>
 ```
 
-> [!IMPORTANT]
-> **全新项目还要补两件事**（试部署时都碰到了），具体命令在下文阶段 A 的「A5. 新项目：补齐权限与服务代理」，必须在 bootstrap 之后、第一次跑流水线（A6）之前做：
-> 1. 给 Cloud Build 默认服务账号 `<PROJECT_NUMBER>@cloudbuild.gserviceaccount.com` 授予 `roles/logging.logWriter`；
-> 2. 手动创建 Discovery Engine 和 Vertex AI 的服务代理（Terraform 要给它们授权，但新项目里它们还不存在）。
+> [!NOTE]
+> 新项目的另外三项底层初始化（为 Cloud Build 默认服务账号授 `roles/logging.logWriter`、创建 Discovery Engine / Vertex AI 服务代理、为 Discovery Engine 服务代理绑定 `roles/discoveryengine.serviceAgent`）**已全部合入 `bootstrap/main.tf` 自动完成**（见下文 A3 / A5）。
 
 ### 2.4 部署前 GE 登录方式与 License 一键预检（客户管理员必做）
 
@@ -287,30 +285,28 @@ cd ..
 
 bootstrap 会创建：
 
-- 部署服务账号 `<p>-deployer`，授予以下项目角色：`roles/serviceusage.serviceUsageAdmin`、`roles/browser`、`roles/storage.admin`、`roles/run.admin`、`roles/iap.admin`、`roles/cloudscheduler.admin`、`roles/aiplatform.user`、`roles/discoveryengine.admin`、`roles/logging.logWriter`；在 `<p>-worker` 这一个账号上的 `roles/iam.serviceAccountUser`；在镜像仓库上的 `roles/artifactregistry.admin`。
+- 部署服务账号 `<p>-deployer`，授予以下项目角色：`roles/serviceusage.serviceUsageAdmin`、`roles/browser`、`roles/storage.admin`、`roles/run.admin`、`roles/iap.admin`、`roles/cloudscheduler.admin`、`roles/aiplatform.user`、`roles/discoveryengine.admin`、`roles/logging.logWriter`；在 `<p>-worker` 这一个账号上的 `roles/iam.serviceAccountUser` 和 `roles/iam.serviceAccountTokenCreator`；在镜像仓库上的 `roles/artifactregistry.admin`。
 - 运行时服务账号 `<p>-worker`，授予项目级 `roles/aiplatform.user`，以及对自己的 `roles/iam.serviceAccountTokenCreator`（无密钥 DWD 签名用）。
+- 自动创建 Discovery Engine 与 Vertex AI 托管服务代理，并为 Discovery Engine 服务代理授予 `roles/discoveryengine.serviceAgent`、为 Cloud Build 默认服务账号授予 `roles/logging.logWriter`。
 - 镜像仓库 `<p>-images`（tag 不可改写）。
 
-输出：`deployer_service_account`、`worker_service_account`、`image_repository`、`deploy_trigger`、`manual_deploy_command`。
+输出：`deployer_service_account`、`worker_service_account`、`workspace_dwd_client_id`、`workspace_dwd_scopes`、`image_repository`、`deploy_trigger`、`manual_deploy_command`。
 
 > [!TIP]
-> bootstrap 做完，`<p>-worker` 账号就已经存在，**阶段 B 的 B1、B2（机器人账号、DWD 授权）可以从这里开始和阶段 A 并行做**。Client ID 可以这样查：
-> ```bash
-> gcloud iam service-accounts describe <p>-worker@<PROJECT_ID>.iam.gserviceaccount.com --format='value(uniqueId)'
-> ```
+> bootstrap 跑完就会直接输出 21 位数字 `workspace_dwd_client_id` 和 `workspace_dwd_scopes`，**阶段 B 的 B1、B2（建机器人账号、在 Workspace 超管后台配 DWD 授权）可以从这里开始和阶段 A 并行做**。
 
 #### A4. 填写主体配置 `<env>.tfvars`
 
-阶段 A 推荐的写法（阶段 B 再补 `master_prompt_sheet_id`）：
+阶段 A 推荐的写法（阶段 B 再自动填入 `master_prompt_sheet_id` 和开启 Google Chat 通知）：
 
 ```hcl
 project_id                = "<PROJECT_ID>"
 name_prefix               = "<p>"
 region                    = "<region>"                 # 例如 asia-southeast1
-reasoning_engine_location = "<agent-engine-region>"    # Agent Engine 所在区域
+reasoning_engine_location = "<agent-engine-region>"    # Agent Engine 所在区域（例如 us-central1）
 
 # 阶段 A 先留空：Drive 和 gs:// 任务都会用 Terraform 自动放进
-# gs://<PROJECT_ID>-<p>-workspace/sop/master_sheet.xlsx 的初始规则表。阶段 B 再改成 Google Sheet ID。
+# gs://<PROJECT_ID>-<p>-workspace/sop/master_sheet.xlsx 的初始规则表。阶段 B 脚本会自动填成 Google Sheet ID。
 master_prompt_sheet_id     = ""
 # 机器人账号建好后填；还没建可以先填 ""，阶段 B 再填并重新部署
 workspace_impersonate_user = "cctv-bot@<customer-domain>"
@@ -326,21 +322,14 @@ ge_tenant_label = "<brand>"     # Agent 描述和默认显示名里的品牌，�
 enable_portal_iap      = true
 portal_allowed_members = ["domain:<customer-domain>"]   # 或 "group:<group>@<customer-domain>" / "user:<email>"
 
-# Google Chat 通知（可选，见 B7）
+# Google Chat 通知（阶段 A 先设 false，阶段 B5 存入 Webhook 后改 true）
 enable_google_chat_notification = false
 ```
 
 每个变量的含义、默认值见 [附录 6.1](#61-变量参考tfvars)。注意：
 
 - `container_image` **不要写进 tfvars**，流水线会自动传入本次构建的镜像 digest。
-- `reasoning_engine_location`：请确认所选区域提供 Agent Engine。
-- `master_prompt_sheet_id = ""`：需要使用**包含「空值修复」的版本**。旧版本在这个值为空时，创建 Agent Engine 会报 `reasoning_engine.spec.deployment_spec.env[3].value; Message: Required field is not set.`（见 5.11）。如果手上是旧版本，阶段 A 临时填 Workspace 桶里的种子表即可（就是部署后 `terraform output gcs_sop_uri` 的值，可以提前按命名规则写出）：
-  ```hcl
-  master_prompt_sheet_id = "gs://<PROJECT_ID>-<p>-workspace/sop/master_sheet.xlsx"
-  ```
-
-> [!WARNING] 待验证
-> `asia-southeast1` 是否提供 Vertex AI Agent Engine，代码里没有写；`example.tfvars` 的注释举的例子是 `us-central1`。部署前请在控制台确认，或接受 Agent Engine 放在另一个区域（对话内容会在该区域处理）。
+- `reasoning_engine_location`：请确认所选区域提供 Vertex AI Agent Engine（推荐 `us-central1`）。
 
 这些配置文件**不含密钥**。用手动部署时它们只要在当前目录里即可（`.gitignore` 故意没有忽略它们，`gcloud builds submit` 会一起上传）；用推送即部署时要提交到 Git。
 
@@ -460,7 +449,7 @@ terraform output gemini_enterprise_console_url
    ```bash
    gcloud storage cp <本地测试视频.mp4> gs://<PROJECT_ID>-<p>-workspace/stores/test-store/
    ```
-   然后按 3.13 在 GE 里发 `gs://<PROJECT_ID>-<p>-workspace/stores/test-store/`，跑完在同一目录看到 `📊 AI_Audit_Report_and_Token_Ledger.xlsx` 和 `📁 Evidence_Clips/`。
+   然后按 4.1 在 GE 里发 `gs://<PROJECT_ID>-<p>-workspace/stores/test-store/`，跑完在同一目录看到 `📊 AI_Audit_Report_and_Token_Ledger.xlsx` 和 `📁 Evidence_Clips/`。
 
 ---
 
@@ -501,7 +490,7 @@ terraform output gemini_enterprise_console_url
 
 #### B3. 自动创建并初始化 SOP 总控表（Google Sheet）并写回 `<env>.tfvars`
 
-只要 B2 的 `--check-dwd` 验证通过，**无需在浏览器里手工建表或导文件**，直接用一条命令让脚本通过 DWD 在机器人账号的 Google Drive 里自动新建 `CHAGEE_SOP_and_Model_Control_Tower` 总控表、写入全部 7 个标准页签与下拉菜单校验、共享给管理员或业务域，并自动把生成的 Sheet ID 写回 `<env>.tfvars`：
+只要 B2 的 `--check-dwd` 验证通过，**无需在浏览器里手工建表或导文件**，直接用一条命令让脚本通过 DWD 在机器人账号的 Google Drive 里自动新建 `CHAGEE_SOP_and_Model_Control_Tower` 总控表、写入全部 6 个标准页签与下拉菜单校验、共享给管理员或业务域，并自动把生成的 Sheet ID 写回 `<env>.tfvars`：
 
 ```bash
 .venv/bin/python scripts/init_sop_sheet.py \
@@ -545,62 +534,48 @@ terraform output gemini_enterprise_console_url
 > [!WARNING] 待验证
 > 视频放在**共享云端硬盘（Shared Drive）**还是普通「我的云端硬盘」共享文件夹，代码都支持（调用带 `supportsAllDrives`），但客户实际目录形态请在部署当天用一个真实门店文件夹跑一次预检确认。
 
-#### B5. 执行 IaC 流水线完成绑定与部署
-
-B3 的 `--update-tfvars` 已经自动把 `<env>.tfvars` 里的 `master_prompt_sheet_id` 和 `workspace_impersonate_user` 更新好了（确认无误即可）：
-
-```hcl
-master_prompt_sheet_id     = "<SheetID>"                     # B3 自动写入的 Google Sheet ID
-workspace_impersonate_user = "cctv-bot@<customer-domain>"
-```
-
-`master_prompt_sheet_id` 在 `terraform plan` 阶段就会校验格式：误贴了 Drive **文件夹**链接会直接报错。
-
-#### B5. 配置 Google Chat 通知（推荐在跑阶段 B 部署流水线前一起配好）
-
-如果客户已经在准备阶段（§2.1 第 12 项）提供了 Google Chat 群的 Incoming Webhook URL，可以在跑阶段 B 的 IaC 流水线前一起配进 `<env>.tfvars`，这样一次部署就能同时生效 SOP 总控表和 Chat 通知（详见 **B7**）。
-
-然后直接跑 **先预览（A6）再正式部署（A7）** 的两条 IaC 流水线命令，把总控表、机器人账号和 Chat 通知配置注入 `<p>-worker`、`<p>-worker-job`、`<p>-portal` 和 Vertex AI Agent Engine。这次 plan 里正常应只看到 `terraform_data.vertex_reasoning_engine`、`terraform_data.portal_service[0]` replace 和 Cloud Run 服务 / 作业 in-place 更新。
-
-> 改了 `master_prompt_sheet_id` 后，之前发出的 Dashboard 链接会失效（见 1.5），所以这一步要在正式使用前做。
-
-#### B6. 双模说明
-
-- 发 **Drive 文件夹**：读 `master_prompt_sheet_id` 指向的 Google Sheet。
-- 发 **`gs://` 目录**：只要 `master_prompt_sheet_id` 不是 `gs://` 地址，就自动用 `gs://<PROJECT_ID>-<p>-workspace/sop/master_sheet.xlsx`，全程不调 Workspace。**两边的规则表是两份独立的文件**，改了一份不会同步另一份。
-
-#### B7. 开启 Google Chat 通知
+#### B5. 配置 Google Chat 通知群 Webhook（在跑阶段 B 部署流水线前一起配好）
 
 > **说明**：存放 Webhook 的 GCS 桶 `gs://<PROJECT_ID>-<p>-workspace`（即 `terraform output workspace_bucket_name`）**已经在阶段 A 部署时由 Terraform 全自动创建并授权给 `<p>-worker` 服务账号了**，无需手动建桶。
 
-1. 在 Google Chat 群：点击顶部群名旁下拉菜单 → **应用和集成（Apps & integrations）** → **Webhooks** → **添加 Webhook（Add webhooks）**，复制生成的 URL（`https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=...`）。
+1. 在准备接收稽核通知的 Google Chat 群（§2.1 第 12 项）：点击顶部群名旁下拉菜单 → **应用和集成（Apps & integrations）** → **Webhooks** → **添加 Webhook（Add webhooks）**，复制生成的 URL（`https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=...`）。
 2. 把 Webhook URL 存进阶段 A 已自动建好的 **Workspace 永久桶**（不要放 Staging 桶，Staging 桶 30 天会自动清理），避免把含 `key`/`token` 的密钥 URL 明文提交进 Git 配置文件：
    ```bash
    printf '%s' '<webhook URL>' | gcloud storage cp - gs://<PROJECT_ID>-<p>-workspace/config/google_chat_webhook.txt
    ```
-3. 编辑 `<env>.tfvars`，开启通知并指向该 GCS 路径：
+3. 编辑 `<env>.tfvars`，确认 B3 已写入 `master_prompt_sheet_id`，同时开启 Google Chat 通知并指向该 GCS 路径：
    ```hcl
+   master_prompt_sheet_id          = "<SheetID>"                     # B3 自动写入的 Google Sheet ID
+   workspace_impersonate_user      = "cctv-bot@<customer-domain>"
    enable_google_chat_notification = true
    google_chat_webhook_url         = "gs://<PROJECT_ID>-<p>-workspace/config/google_chat_webhook.txt"
    ```
-4. 执行 **预览（A6）+ 正式部署（A7）** 的 IaC 流水线命令。部署完成后，单店稽核（点击 `Confirm and start` 时与完成时）、定时巡检批次、黄金集测评都会往该 Google Chat 群自动推送带 `@发起人` 和 Dashboard 复核按钮的卡片通知。
+   `master_prompt_sheet_id` 在 `terraform plan` 阶段就会校验格式：误贴了 Drive **文件夹**链接会直接报错。
+
+#### B6. 执行 IaC 流水线完成绑定与部署
+
+直接跑 **先预览（A6）再正式部署（A7）** 的两条 IaC 流水线命令，一次部署同时把 SOP 总控表、机器人账号和 Google Chat 通知配置注入 `<p>-worker`、`<p>-worker-job`、`<p>-portal` 和 Vertex AI Agent Engine（`<p>-agent`）。这次 plan 里正常应只看到 `terraform_data.vertex_reasoning_engine`、`terraform_data.portal_service[0]` replace 和 Cloud Run 服务 / 作业 in-place 更新。
+
+> 改了 `master_prompt_sheet_id` 后，之前发出的 Dashboard 链接会失效（见 1.5），所以这一步要在正式使用前做。部署完成后，单店稽核（点击 `Confirm and start` 时与完成时）、定时巡检批次、黄金集测评都会往该 Google Chat 群自动推送带 `@发起人` 和 Dashboard 复核按钮的卡片通知。
+
+#### B7. 双模说明
+
+- 发 **Drive 文件夹**：读 `master_prompt_sheet_id` 指向的 Google Sheet。
+- 发 **`gs://` 目录**：只要 `master_prompt_sheet_id` 不是 `gs://` 地址，就自动用 `gs://<PROJECT_ID>-<p>-workspace/sop/master_sheet.xlsx`，全程不调 Workspace。**两边的规则表是两份独立的文件**，改了一份不会同步另一份。
 
 #### B8. GE 验收
 
 1. 打开 `terraform output gemini_enterprise_console_url` → 找到应用 `<p>-ge`，给督导分配 GE 许可。
 
-   > [!WARNING] 待验证
-   > GE 许可分配的控制台菜单路径以部署当天的控制台界面为准。
-
-2. **先确认 Agent 真的建出来了。** 流水线日志里如果有 `⚠️ Registered new ADK Agent in GE Engine ... FAILED: HTTP 400 ... The user cannot create an agent since an active Gemini Enterprise license is not available`，说明 GE 应用建好了，但 Agent 没建（部署本身仍显示成功）。用下面的命令查 `<p>-ge` 里有哪些 Agent：
+2. **确认 Agent 已自动挂载**：只要在部署前完成了 §2.4 的 `check-ge-prereqs` 预检（项目已划拨 GE 席位且管理员持证），Cloud Build 流水线已全自动创建好 GE 应用 `<p>-ge` 并挂载了稽核 Agent 及两组快捷指令气泡（Prompt Chips）。随时可用下面的命令核查 `<p>-ge` 里的 Agent：
    ```bash
    curl -s -H "Authorization: Bearer $(gcloud auth print-access-token)" \
      -H "X-Goog-User-Project: <PROJECT_ID>" \
      "https://discoveryengine.googleapis.com/v1alpha/projects/<PROJECT_ID>/locations/global/collections/default_collection/engines/<p>-ge/assistants/default_assistant/agents"
    # 返回里应有 displayName 为 "<品牌> Store CCTV AI Auditor [<p>]"（或你设置的 ge_agent_display_name）的条目
    ```
-   **没有 Agent 时的补救**（二选一）：
-   - **方式 1：由一位有有效 GE 许可的管理员在本地补注册**（他还需要对项目有 Discovery Engine 管理权限，例如 Owner）：
+   **如果在部署前跳过了 §2.4 导致流水线日志出现 `active Gemini Enterprise license is not available` 警告（应用已建、Agent 未建），补救方法**（二选一）：
+   - **方式 1：由一位有有效 GE 许可的管理员在本地一键补注册**（他还需要对项目有 Discovery Engine 管理权限，例如 Owner）：
      ```bash
      gcloud auth application-default login            # 用这位持证管理员的账号登录
      python3 -m venv .venv-deploy && .venv-deploy/bin/pip install --require-hashes -r deploy/requirements-deploy.txt
@@ -621,14 +596,11 @@ workspace_impersonate_user = "cctv-bot@<customer-domain>"
      `--project-id`、`--location` 是放在子命令 `bind-ge` **前面**的全局参数；`--ge-agent-display-name` 不传时会用代码里的通用默认名，所以一定要显式传成和部署时一致的名字。
    - **方式 2：持证管理员在 GE 控制台手工添加**：GE 应用 `<p>-ge` → Agents → 添加 Agent → 选 Vertex AI Agent Engine，选中 `<p>-agent`（菜单名以当天控制台为准）。手工添加的 Agent 不带流水线设置的描述、`starterPrompts` 和输入框提示（`customPlaceholderText`），之后可按方式 1 再跑一次补齐（方式 1 会按显示名 / 绑定的 Agent Engine 找到并更新这个 Agent）。
 
-   > [!WARNING] 待验证
-   > ① 服务账号（如 `<p>-deployer`）能否被分配 GE 许可，从而让流水线自己完成注册，目前不确定；② Agent 已存在时，后续由流水线（无许可的部署服务账号）执行的更新是否同样会被许可检查拦下，试部署未覆盖。如每次部署都出现上述 ⚠️ 警告，以 GE 里 Agent 实际表现为准，必要时按方式 1 重跑。
-
 3. 用一个督导账号打开 GE 网页端，在左侧 Agents 列表进入稽核 Agent（默认名 `<品牌> Store CCTV AI Auditor [<p>]`，以 `ge_agent_display_name` 为准）。
 4. 点 Prompt chip `[Full Daily Audit] Please audit store videos: `，在后面粘贴一个**真实门店 Drive 文件夹链接**。
 5. 预检应返回 `✅ Audit Mode: [Full Daily Audit]`、Preflight ID、视频数 / 时长 / 切片计划、生效规则页签和模型。权限或 SOP 表读不到会直接提示原因，且 0 Token。
-6. 回复 `Confirm and start`；过几分钟问 `What is the current progress?`。
-7. 完成后门店文件夹里出现 `📊 AI_Audit_Report_and_Token_Ledger` 和 `📁 Evidence_Clips`。
+6. 回复 `Confirm and start`；此时 Google Chat 通知群应立即收到一张「任务已启动」卡片；过几分钟可问 `What is the current progress?`。
+7. 完成后门店文件夹里出现 `📊 AI_Audit_Report_and_Token_Ledger` 和 `📁 Evidence_Clips`，且 Google Chat 群收到带复核工作台按钮的完成卡片。
 
 #### B9. Dashboard 验收
 
@@ -924,7 +896,7 @@ gcloud logging read 'resource.type="cloud_run_job" AND resource.labels.job_name=
 ### 5.9 Workspace 桶里的其他东西
 
 - `sop/master_sheet.xlsx`：种子 SOP 表（gs:// 任务用）；版本控制开着，可在控制台「版本历史记录」里恢复。
-- `config/google_chat_webhook.txt`：Webhook（如果用了 B7 的做法）。
+- `config/google_chat_webhook.txt`：Webhook（如果用了 B5 的做法）。
 - `eval/...`：测评缓存和历史账本。
 
 ### 5.10 删除环境（及后果）
@@ -970,10 +942,9 @@ gcloud storage rm -r gs://<PROJECT_ID>-tfstate/<p>/
 | 现象 | 原因 | 处理 |
 | :--- | :--- | :--- |
 | `gcloud builds submit` 刚 bootstrap 完就报 403 `storage.objects.get` | IAM 还没生效 | 等 1–2 分钟重试 |
-| 全新项目第一次构建在 step 0 失败：`build step 0 "python@sha256:..." failed: step exited with non-zero status: 1` | 观察到的现象：Cloud Build 默认服务账号缺 `roles/logging.logWriter`（确切原因未证实） | 按 A5 ① 给 `<PROJECT_NUMBER>@cloudbuild.gserviceaccount.com` 授予 `roles/logging.logWriter`，等 1–2 分钟重跑 |
-| apply 报 `Error 400: Service account service-<PROJECT_NUMBER>@gcp-sa-discoveryengine.iam.gserviceaccount.com does not exist`（或 `gcp-sa-aiplatform-re`） | 新项目里 Google 服务代理还没创建 | 按 A5 ② 执行两条 `gcloud beta services identity create`，再重跑 |
-| 创建 Agent Engine 报 `reasoning_engine.spec.deployment_spec.env[3].value; Message: Required field is not set.` | 旧版本在 `master_prompt_sheet_id = ""` 时把空值传给了 Agent Engine | 升级到包含该修复的版本；或临时把 `master_prompt_sheet_id` 设为 `terraform output gcs_sop_uri` 的值（`gs://<PROJECT_ID>-<p>-workspace/sop/master_sheet.xlsx`）后重跑 |
-| 构建成功，但日志有 `⚠️ Registered new ADK Agent in GE Engine ... FAILED ... active Gemini Enterprise license is not available`，GE 里找不到稽核 Agent | 调用身份（部署服务账号）没有有效的 GE 许可；GE 应用已建、Agent 未建 | 按 B8 第 2 步，由持证管理员本地运行 `bind-ge` 或在 GE 控制台手工添加 |
+| 全新项目第一次构建在 step 0 失败：`build step 0 "python@sha256:..." failed: step exited with non-zero status: 1` | 旧版 `bootstrap` 未给 Cloud Build 默认服务账号授 `roles/logging.logWriter` | 新版 `bootstrap/main.tf` 已自动授权；手工补齐见 A5 |
+| apply 报 `Error 400: Service account service-<PROJECT_NUMBER>@gcp-sa-discoveryengine.iam.gserviceaccount.com does not exist`（或 `gcp-sa-aiplatform-re`） | 旧版 `bootstrap` 未创建服务代理 | 新版 `bootstrap/main.tf` 已自动创建并绑定 `roles/discoveryengine.serviceAgent`；手工补齐见 A5 |
+| 构建成功，但日志有 `⚠️ Registered new ADK Agent in GE Engine ... FAILED ... active Gemini Enterprise license is not available`，GE 里找不到稽核 Agent | 部署前未按 §2.4 划拨项目 GE 席位并给管理员绑证 | 按 §2.4 划拨席位后，按 B8 第 2 步运行 `bind-ge` 或重新跑一次流水线 |
 | 构建报 `_ENV=example selects the templates ...` | `_ENV` 用了 `example` | 用自己的 `<env>` |
 | 构建报 `missing <env>.tfvars in ...` | 配置文件不在当前目录 / 名字不对 | 在仓库根目录执行，文件名与 `_ENV` 一致 |
 | 构建报 `<env>.tfvars does not set project_id = "..."` | tfvars 的 `project_id` 和 `--project` 不一致 | 改成同一个项目 |
@@ -1072,9 +1043,9 @@ gcloud storage rm -r gs://<PROJECT_ID>-tfstate/<p>/
 | `STAGING_BUCKET` | 同上 | Staging 桶 |
 | `MASTER_PROMPT_SHEET_ID` / `GCS_SOP_URI` | 同上 | SOP 来源 / Workspace 桶种子表 |
 | `WORKSPACE_IMPERSONATE_USER` / `WORKSPACE_DWD_SERVICE_ACCOUNT` | 同上 | 机器人账号 / 签 DWD 的服务账号 |
-| `ENABLE_GOOGLE_CHAT_NOTIFICATION` / `GOOGLE_CHAT_WEBHOOK_URL` | worker、作业 | 通知 |
+| `ENABLE_GOOGLE_CHAT_NOTIFICATION` / `GOOGLE_CHAT_WEBHOOK_URL` | worker、作业、Agent Engine | 通知 |
 | `AUDIT_LOG_BUCKET` | worker、作业、Dashboard | 审计日志桶（= Workspace 桶） |
-| `PORTAL_SERVICE_URL` / `PORTAL_BASE_URL` | worker、作业（`enable_portal_iap = true`）；`PORTAL_BASE_URL` 也在 Dashboard | Dashboard 地址；worker 据此 302 跳转并生成链接 |
+| `PORTAL_SERVICE_URL` / `PORTAL_BASE_URL` | worker、作业、Agent Engine（`enable_portal_iap = true`）；`PORTAL_BASE_URL` 也在 Dashboard | Dashboard 地址；worker 据此 302 跳转并生成链接 |
 | `PORTAL_MODE` | Dashboard = `iap` | worker 不设（= `hmac`） |
 | `PORTAL_PROJECT_NUMBER` | Dashboard | 用于推算 IAP audience |
 | `PORTAL_IAP_AUDIENCE` | 未设置 | 覆盖 IAP audience（见 5.11） |
