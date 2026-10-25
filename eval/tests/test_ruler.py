@@ -499,7 +499,7 @@ class EvalRecordsTest(unittest.TestCase):
             }
         ]
 
-        async def _fake_load_cfg(self, prompt_tab_name, model_version, sheet_id=None):
+        async def _fake_load_cfg(self, prompt_tab_name, model_version, sheet_id=None, **kwargs):
             return SimpleNamespace(
                 active_prompt_version=prompt_tab_name,
                 active_model_version=model_version,

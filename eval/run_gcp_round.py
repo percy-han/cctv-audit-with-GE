@@ -917,6 +917,7 @@ async def run_sheet_triggered_eval(
         prompt_tab_name=prompt_tab_name,
         model_version=model_version,
         sheet_id=effective_sheet_id,
+        probe_model=not bool(str(model_version or "").strip()),
     )
 
     safe_eval = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in eval_id)[:24] or "eval"

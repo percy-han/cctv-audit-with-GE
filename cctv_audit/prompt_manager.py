@@ -2709,7 +2709,7 @@ class PromptManager:
         client = await get_genai_client()
         await asyncio.wait_for(
             asyncio.to_thread(client.models.generate_content, model=candidate, contents="1"),
-            timeout=5.0,
+            timeout=20.0,
         )
         self._known_valid_models.add(candidate)
         return True
