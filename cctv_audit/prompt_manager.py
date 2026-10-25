@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import List, Optional, Protocol, Sequence
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .config import config, extract_spreadsheet_id
 from .gcp import get_genai_client
@@ -352,10 +352,15 @@ class ScheduledEvalRowError(BaseModel):
     trigger_action: str = Field(default="IDLE")
     error_message: str
     previous_status: str = Field(default="")
+    previous_report: str = Field(default="")
 
-    @property
-    def previous_report(self) -> str:
-        return self.previous_status
+    @model_validator(mode="after")
+    def _sync_previous_fields(self) -> "ScheduledEvalRowError":
+        if self.previous_status and not self.previous_report:
+            self.previous_report = self.previous_status
+        elif self.previous_report and not self.previous_status:
+            self.previous_status = self.previous_report
+        return self
 
 
 DEFAULT_VISUAL_SCAN_TARGETS: List[VisualScanTarget] = [

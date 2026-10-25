@@ -1302,7 +1302,7 @@ def test_context_job_id_never_restarts_a_done_job(tmp_path):
 
 
 def test_scheduled_eval_row_error_previous_report_property():
-    """Regression test: ScheduledEvalRowError provides both previous_status and previous_report."""
+    """Regression test: ScheduledEvalRowError syncs both previous_status and previous_report."""
     from cctv_audit.prompt_manager import ScheduledEvalRowError
 
     err = ScheduledEvalRowError(
@@ -1314,3 +1314,15 @@ def test_scheduled_eval_row_error_previous_report_property():
     )
     assert err.previous_status == "Ready"
     assert err.previous_report == "Ready"
+
+    err_from_report = ScheduledEvalRowError.model_validate(
+        {
+            "row_index": 6,
+            "eval_id": "EVAL-V22",
+            "trigger_action": "IDLE",
+            "error_message": "❌ Config Error: duplicate Eval_ID",
+            "previous_report": "Legacy Ready",
+        }
+    )
+    assert err_from_report.previous_status == "Legacy Ready"
+    assert err_from_report.previous_report == "Legacy Ready"
