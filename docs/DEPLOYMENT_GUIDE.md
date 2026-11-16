@@ -679,8 +679,8 @@ GE 新会话首页的两组 Prompt chips：
 | A | `Rule_ID` | 必填，全表唯一，例如 `SCHED-SG-01` |
 | B | `Rule_Name` | 名称，会显示在通知卡片上 |
 | C | `Root_Folder_URL` | 必填，根目录的 Drive 文件夹链接 / ID，或 `gs://桶/前缀`。不要填单个视频的 `/file/d/` 链接 |
-| D | `Trigger_Hour_UTC` | 必填，`00`–`23`，**UTC 时间**。新加坡 / 北京（UTC+8）22:00 → 填 `14` |
-| E | `Trigger_Minute_UTC` | 必填，只能 `00` / `15` / `30` / `45` |
+| D | `Trigger_Hour_SGT` | 必填，`00`–`23`，**新加坡当地时间（SGT, UTC+8）**，不用换算 UTC。想每天晚上 22:00 跑 → 直接填 `22` |
+| E | `Trigger_Minute_SGT` | 必填，只能 `00` / `15` / `30` / `45`（新加坡时间） |
 | F | `Lookback_Days` | 必填，`0.5`、`1`–`7`。只稽核这个时间窗内新上传、且没稽核过的视频（`0.5` = 12 小时） |
 | G | `Supervisor_Email` | 必填，负责督导邮箱，通知里 `@` 他 |
 | H | `Enabled` | `ENABLED` 生效 / `PAUSED` 暂停 |

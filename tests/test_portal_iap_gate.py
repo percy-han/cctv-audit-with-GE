@@ -831,3 +831,92 @@ def test_tab1_headers_match_written_data_columns():
     assert labelled["Evidence Clip Link (Click to Play)"].startswith("https://drive.google.com/file/d/")
     assert header[9] == "Supervisor Review Status (Dropdown)" and data[9] == "PENDING"
     assert header[10] == "Supervisor Review Note" and data[10] == "n"
+
+
+# ---- Unified portal homepage ------------------------------------------------------------------
+
+
+def test_portal_home_payload_lists_tasks_newest_first_with_review_status(tmp_path: Path) -> None:
+    from cctv_audit.portal import (
+        REVIEW_PROGRESS_COMPLETED,
+        REVIEW_PROGRESS_IN_PROGRESS,
+        REVIEW_PROGRESS_NA,
+        REVIEW_PROGRESS_UNREVIEWED,
+        load_portal_home_payload,
+    )
+    from cctv_audit.scheduled_auditor import ScheduledEvalTaskRecord
+
+    store = UserScopedJobStore(state_dir=tmp_path / "jobs")
+    now = time.time()
+    jobs = [
+        AuditJob(job_id="ge0001", user_id="a@x.com", folder_id="1FolderAAAAAAAAAA", state=JobState.DONE,
+                 report_sheet_url="https://docs.google.com/spreadsheets/d/1SheetAAAAAAAAAAAA/edit",
+                 violations_found=2, created_at=now - 300),
+        AuditJob(job_id="sc0002", user_id="b@x.com", folder_id="1FolderBBBBBBBBBB", state=JobState.DONE,
+                 report_sheet_url="https://docs.google.com/spreadsheets/d/1SheetBBBBBBBBBBBB/edit",
+                 violations_found=2, batch_id="batch-1", created_at=now - 200),
+        AuditJob(job_id="ru0003", user_id="a@x.com", folder_id="1FolderCCCCCCCCCC", state=JobState.RUNNING,
+                 created_at=now - 100),
+        AuditJob(job_id="cl0004", user_id="a@x.com", folder_id="1FolderDDDDDDDDDD", state=JobState.DONE,
+                 violations_found=0, created_at=now - 400),
+    ]
+    for j in jobs:
+        asyncio.run(store.save(j))
+
+    class _Gw:
+        async def read_report_sheet_data(self, folder_id: str, sheet: str):
+            if "AAAA" in sheet:
+                return [["ge0001", "v.mp4", "00:01", "A1", "", "", "", "", "", "PENDING", ""],
+                        ["ge0001", "v.mp4", "00:02", "A2", "", "", "", "", "", "PENDING", ""]], []
+            return [["sc0002", "v.mp4", "00:01", "A1", "", "", "", "", "", "✅ CONFIRMED", ""],
+                    ["sc0002", "v.mp4", "00:02", "A2", "", "", "", "", "", "PENDING", ""]], []
+
+    state = ScheduledStateStore(memory_store={})
+    rec = ScheduledEvalTaskRecord(
+        eval_task_id="ev-1", eval_id="EVAL-1", eval_name="Golden", row_index=2, prompt_tab_name="Prompt_v1.0_Standard",
+        model_version="gemini-x", golden_sheet_url="s", golden_source_id="s", supervisor_email="c@x.com",
+        state="DONE", created_at=now - 50, summary_text="Recall 90%",
+    )
+    state._memory[state.eval_task_key("ev-1")] = rec.model_dump_json()  # type: ignore[attr-defined]
+
+    payload = asyncio.run(load_portal_home_payload(job_store=store, state_store=state, gateway=_Gw()))
+    ids = [t["task_id"] for t in payload["tasks"]]
+    assert ids == ["ev-1", "ru0003", "sc0002", "ge0001", "cl0004"]
+    by_id = {t["task_id"]: t for t in payload["tasks"]}
+    assert by_id["ge0001"]["review_progress_status"] == REVIEW_PROGRESS_UNREVIEWED
+    assert by_id["sc0002"]["review_progress_status"] == REVIEW_PROGRESS_IN_PROGRESS
+    assert by_id["cl0004"]["review_progress_status"] == REVIEW_PROGRESS_COMPLETED
+    assert by_id["ru0003"]["review_progress_status"] == REVIEW_PROGRESS_NA
+    assert by_id["ev-1"]["task_type"] == "GOLDEN_EVAL" and by_id["ev-1"]["result_text"] == "Recall 90%"
+    assert by_id["sc0002"]["task_type"] == "SCHEDULED" and "batch=batch-1" in by_id["sc0002"]["portal_url"]
+    assert by_id["ge0001"]["task_type"] == "GE" and by_id["ge0001"]["portal_url"].startswith("/portal?job=ge0001")
+    assert by_id["ge0001"]["created_at_sgt"].endswith("SGT")
+    assert payload["links"] and payload["links"][0]["link_id"] == "LINK_GE"
+
+
+def test_portal_home_payload_filters_by_drive_access_in_iap_mode(tmp_path: Path) -> None:
+    from cctv_audit.portal import load_portal_home_payload
+
+    store = UserScopedJobStore(state_dir=tmp_path / "jobs")
+    for jid, fid in (("ok0001", "1FolderOKOKOKOKOK"), ("no0002", "1FolderNONONONONO")):
+        asyncio.run(store.save(AuditJob(job_id=jid, user_id="a@x.com", folder_id=fid, state=JobState.RUNNING)))
+
+    async def _checker(viewer: str, file_id: str) -> Tuple[bool, str]:
+        return ("OKOK" in file_id), "denied"
+
+    payload = asyncio.run(
+        load_portal_home_payload(
+            job_store=store, state_store=ScheduledStateStore(memory_store={}),
+            viewer_email="alice@customer.com", drive_checker=_checker,
+        )
+    )
+    assert [t["task_id"] for t in payload["tasks"]] == ["ok0001"]
+
+
+def test_portal_home_routes(monkeypatch: pytest.MonkeyPatch, client) -> None:
+    # HMAC mode without opt-in: homepage is refused (it lists signed links for every task).
+    assert client.get("/portal").status_code == 403
+    assert client.get("/api/portal/home").status_code == 403
+    monkeypatch.setenv("PORTAL_MODE", "iap")
+    assert client.get("/portal").status_code == 401
+    assert client.get("/api/portal/home").status_code == 401

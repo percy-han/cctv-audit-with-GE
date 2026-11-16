@@ -39,13 +39,23 @@ from .gcs_gateway import (
     is_gcs_target,
 )
 from .jobs import AuditJob
-from .portal_auth import DriveAccessChecker, denied_message, filter_visible_stores, require_store_access
+from .portal_auth import (
+    DriveAccessChecker,
+    denied_message,
+    filter_visible_stores,
+    portal_mode,
+    require_store_access,
+)
 from .review_audit_log import (
     PHASE_REQUESTED,
     PHASE_SHEET_WRITE_FAILED,
     ReviewAuditLogError,
+    SGT_TZ,
     audit_log_bucket,
     build_review_audit_record,
+    format_audit_record_for_ui,
+    format_ts_sgt,
+    list_review_audit_records_for_scope,
     write_review_audit_records,
 )
 
@@ -996,6 +1006,7 @@ def _build_findings_and_ledger_from_rows(
                 "staff_list": staff_list,
                 "initial_review_status": map_sheet_status_to_portal_code(raw_status),
                 "initial_review_note": raw_note,
+                "review_history": [],
             }
         )
 
@@ -1090,6 +1101,61 @@ def _fallback_rows_from_job(job: AuditJob) -> Tuple[List[List[Any]], List[List[A
     return tab1, tab2
 
 
+# Lightweight in-process cache of `(timestamp, reviewed_count, total_findings_count)` per job_id
+# so the unified `/portal` homepage can display `UNREVIEWED` / `IN_PROGRESS` / `COMPLETED` without
+# hitting Google Sheets on every refresh; invalidated immediately when `apply_portal_reviews` writes.
+_JOB_REVIEW_PROGRESS_CACHE: Dict[str, Tuple[float, int, int]] = {}
+_JOB_REVIEW_PROGRESS_TTL_SEC: float = 120.0
+_JOB_REVIEW_PROGRESS_MAX_ENTRIES: int = 2000
+
+
+def _remember_review_progress(job_id: str, reviewed: int, total: int) -> None:
+    """Stores `(reviewed, total)` for `job_id`, evicting expired (then oldest) entries past the cap."""
+    now = time.monotonic()
+    _JOB_REVIEW_PROGRESS_CACHE[job_id] = (now, int(reviewed), int(total))
+    if len(_JOB_REVIEW_PROGRESS_CACHE) > _JOB_REVIEW_PROGRESS_MAX_ENTRIES:
+        for key in [k for k, v in _JOB_REVIEW_PROGRESS_CACHE.items() if now - v[0] >= _JOB_REVIEW_PROGRESS_TTL_SEC]:
+            _JOB_REVIEW_PROGRESS_CACHE.pop(key, None)
+        overflow = len(_JOB_REVIEW_PROGRESS_CACHE) - _JOB_REVIEW_PROGRESS_MAX_ENTRIES
+        if overflow > 0:
+            for key, _v in sorted(_JOB_REVIEW_PROGRESS_CACHE.items(), key=lambda kv: kv[1][0])[:overflow]:
+                _JOB_REVIEW_PROGRESS_CACHE.pop(key, None)
+
+
+def _attach_review_history_to_findings(
+    findings: List[Dict[str, Any]],
+    audit_records: Sequence[Dict[str, Any]],
+) -> None:
+    """Attaches chronological `review_history` entries to each finding in `findings`."""
+    if not findings:
+        return
+    by_composite: Dict[str, List[Dict[str, Any]]] = {}
+    by_tuple: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
+    for rec in audit_records or []:
+        ck = str(rec.get("composite_key") or "").strip()
+        if ck:
+            by_composite.setdefault(ck, []).append(rec)
+        t_key = (
+            str(rec.get("video_filename") or "").strip(),
+            str(rec.get("timestamp_in_clip") or "").strip(),
+            str(rec.get("rule_id") or "").strip().upper(),
+        )
+        if any(t_key):
+            by_tuple.setdefault(t_key, []).append(rec)
+
+    for f in findings:
+        inc_id = str(f.get("incident_id") or "").strip()
+        hist = list(by_composite.get(inc_id, []))
+        if not hist:
+            t_key = (
+                str(f.get("video_filename") or "").strip(),
+                str(f.get("timestamp_raw") or "").strip(),
+                str(f.get("rule_id") or "").strip().upper(),
+            )
+            hist = list(by_tuple.get(t_key, []))
+        f["review_history"] = hist
+
+
 async def load_portal_payload(
     *,
     audit_service: Any = None,
@@ -1104,6 +1170,8 @@ async def load_portal_payload(
     sig: str = "",
     viewer_email: str = "",
     drive_checker: Optional[DriveAccessChecker] = None,
+    audit_bucket: Optional[str] = None,
+    audit_client: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Loads and validates the full JSON payload for `/portal` and `GET /api/portal/data`.
 
@@ -1335,6 +1403,27 @@ async def load_portal_payload(
         tab2_rows=tab2_rows,
         sop_catalog=sop_catalog,
     )
+
+    eff_audit_bucket = audit_bucket if audit_bucket is not None else audit_log_bucket()
+    if eff_audit_bucket and findings:
+        try:
+            audit_records = await asyncio.to_thread(
+                list_review_audit_records_for_scope,
+                bucket=eff_audit_bucket,
+                job_id=target_job.job_id,
+                batch_id=batch_id,
+                store_job_id=target_job.job_id,
+                lookback_days=int(max(0.0, time.time() - float(target_job.created_at or time.time())) // 86400) + 2,
+                client=audit_client,
+            )
+            _attach_review_history_to_findings(findings, audit_records)
+        except Exception as exc:
+            logger.debug("Non-fatal error loading review audit history for %s: %s", target_job.job_id, exc)
+
+    reviewed_cnt = sum(
+        1 for f in findings if str(f.get("initial_review_status") or "PENDING") != "PENDING"
+    )
+    _remember_review_progress(target_job.job_id, reviewed_cnt, len(findings))
 
     folder_url = (
         build_gcs_console_folder_url(target_job.folder_id)
@@ -1589,9 +1678,10 @@ async def apply_portal_reviews(
         ]
 
     # 2. Audit first: no audit log, no change.
+    req_records = _records(PHASE_REQUESTED)
     audit_objects: List[str] = []
     if bucket:
-        audit_objects = await asyncio.to_thread(writer, _records(PHASE_REQUESTED), bucket=bucket)
+        audit_objects = await asyncio.to_thread(writer, req_records, bucket=bucket)
     elif iap_mode:
         raise ReviewAuditLogError(
             "AUDIT_LOG_BUCKET is not configured on the portal service; review not applied."
@@ -1614,6 +1704,7 @@ async def apply_portal_reviews(
             except Exception as follow_exc:  # noqa: BLE001 - best effort; keep the original error
                 logger.error("Could not write sheet_write_failed audit records: %s", follow_exc)
         raise
+    _JOB_REVIEW_PROGRESS_CACHE.pop(target_job.job_id, None)
     return {
         "ok": True,
         "updated_count": updated_count,
@@ -1621,6 +1712,7 @@ async def apply_portal_reviews(
         "job_id": target_job.job_id,
         "report_sheet_url": target_job.report_sheet_url,
         "audit_log_objects": audit_objects,
+        "review_entries": [format_audit_record_for_ui(r) for r in req_records],
     }
 
 
@@ -2196,6 +2288,35 @@ _SUPERVISOR_PORTAL_HTML_TEMPLATE = r"""<!DOCTYPE html>
   .note-row input::placeholder { color: var(--ink-400); }
   .note-row input:focus { outline: none; border-color: var(--ink-700); }
 
+  /* 督导人工复核审计轨迹 (Per-Video Review Audit Trail) */
+  details.audit-trail {
+    margin-top: 10px; border-top: 1px dashed var(--line-strong); padding-top: 9px;
+  }
+  details.audit-trail > summary {
+    list-style: none; cursor: pointer; font-size: 11.5px; font-weight: 700; color: var(--ink-500);
+    display: flex; align-items: center; gap: 6px; user-select: none;
+  }
+  details.audit-trail > summary::-webkit-details-marker { display: none; }
+  details.audit-trail > summary::after { content: "▾"; font-size: 10px; margin-left: auto; transition: transform .2s; }
+  details.audit-trail[open] > summary::after { transform: rotate(180deg); }
+  .audit-list {
+    margin-top: 8px; display: flex; flex-direction: column; gap: 6px;
+    max-height: 180px; overflow-y: auto;
+  }
+  .audit-entry {
+    font-size: 11.5px; line-height: 1.5; color: var(--ink-700);
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 9px;
+  }
+  .audit-entry .ae-top {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
+    font-size: 11px; color: var(--ink-500); margin-bottom: 2px;
+  }
+  .audit-entry .ae-who { font-weight: 700; color: var(--ink-900); }
+  .audit-entry .ae-ts { font-variant-numeric: tabular-nums; color: var(--ink-400); }
+  .audit-entry .ae-chg { font-weight: 600; color: var(--ink-900); }
+  .audit-entry .ae-note { color: var(--ink-500); font-style: italic; margin-top: 2px; }
+
   .empty {
     margin-top: 32px; padding: 72px 32px; text-align: center;
     background: var(--surface); border: 1px dashed var(--line-strong); border-radius: var(--r-lg);
@@ -2381,6 +2502,7 @@ _SUPERVISOR_PORTAL_HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="head-actions">
+      <a class="btn btn-ghost-dark btn-sm" id="btn-portal-home" href="/portal" title="Return to Unified Portal Home">🏠 Portal Home</a>
       <button class="btn btn-ghost-dark btn-sm" id="btn-lang-toggle" onclick="toggleLang()" title="Switch UI Language (EN / 中文)">🌐 EN | 中文</button>
       <button class="btn btn-ghost-dark btn-sm" id="btn-sync-sheet" onclick="syncFromSheet()" title="Sync latest team review decisions from Google Sheet">🔄 Sync Sheet</button>
       <button class="btn btn-ghost-dark" id="btn-batch-confirm" onclick="batchConfirm()">Confirm All AI Hits</button>
@@ -2816,6 +2938,7 @@ function applyLangUI() {
     if (el) el.innerHTML = isZh() ? zhVal : enVal;
   };
   setTxt("hd-brand-title", "Store AI Video Audit · Supervisor Workbench", "门店 AI 视频稽核 · 督导复核台");
+  setTxt("btn-portal-home", "🏠 Portal Home", "🏠 统一门户首页");
   setTxt("hd-audit-lbl", "Audit", "稽核单");
   setTxt("hd-folder", "Store Folder ↗", "门店文件夹 ↗");
   setTxt("hd-sheet", "Source Sheet ↗", "源数据表 ↗");
@@ -2927,6 +3050,9 @@ async function syncFromSheet() {
         if (ff) {
           f.initial_review_status = ff.initial_review_status || "PENDING";
           f.initial_review_note = ff.initial_review_note || "";
+          if (Array.isArray(ff.review_history)) {
+            f.review_history = ff.review_history;
+          }
           review[f.id] = {
             status: f.initial_review_status,
             note: f.initial_review_note
@@ -2966,6 +3092,21 @@ async function persistReviewsToSheet(updatesList) {
     });
     if (resp.ok) {
       const res = await resp.json();
+      if (res && Array.isArray(res.review_entries) && res.review_entries.length) {
+        res.review_entries.forEach(entry => {
+          const targetF = F.find(x => x.incident_id === entry.composite_key);
+          if (targetF) {
+            if (!Array.isArray(targetF.review_history)) targetF.review_history = [];
+            targetF.review_history.push(entry);
+          }
+        });
+        renderSections();
+        if (activeId != null && document.getElementById("modal-video").classList.contains("open")) {
+          const modalHost = document.getElementById("mv-audit-trail-box");
+          const curF = F.find(x => x.id === activeId);
+          if (modalHost && curF) modalHost.innerHTML = renderAuditHistoryHtml(curF, true);
+        }
+      }
       if (res && res.persisted_to_sheet) {
         toast(tr("☁️ Synced review decision to Store Google Sheet", "☁️ 已实时同步回写至门店 Google Sheet 报告"));
       }
@@ -3316,6 +3457,62 @@ function stateFlag(status) {
     + labels[status].flag + '</span>';
 }
 
+function auditStatusLabel(rawStatus) {
+  const s = String(rawStatus || "PENDING").toUpperCase();
+  if (s.includes("CONFIRMED")) return tr("✅ Confirmed Violation", "✅ 确认违规");
+  if (s.includes("FALSE") || s.includes("DISMISSED")) return tr("❌ False Positive", "❌ 排除误报");
+  if (s.includes("FOLLOW")) return tr("⚠️ Follow-Up", "⚠️ 待调录像");
+  return tr("⏳ Pending", "⏳ 待复核");
+}
+
+function renderAuditHistoryHtml(f, isModal) {
+  const hist = Array.isArray(f.review_history) ? f.review_history : [];
+  if (!hist.length) {
+    if (isModal) {
+      return '<div id="mv-audit-trail-box"><h5>' + tr("Supervisor Review Audit Log", "督导人工复核审计记录") + '</h5>'
+        + '<div class="blk"><div class="tx muted" style="margin-top:0;font-size:12px">'
+        + tr("No supervisor status/note changes recorded yet.", "暂无督导人工状态或批注变更记录。")
+        + '</div></div></div>';
+    }
+    return '';
+  }
+  const itemsHtml = hist.map((h, idx) => {
+    const who = esc(h.reviewer_email || (isZh() ? "督导人员" : "Supervisor"));
+    const ts = esc(h.ts_sgt || h.ts_utc || "");
+    const oldSt = auditStatusLabel(h.old_status);
+    const newSt = auditStatusLabel(h.new_status);
+    const statusChanged = String(h.old_status || "") !== String(h.new_status || "");
+    const noteChanged = String(h.old_note || "") !== String(h.new_note || "");
+    let changeLine = "";
+    if (statusChanged) {
+      changeLine = '<div class="ae-chg">' + esc(oldSt) + ' → <b>' + esc(newSt) + '</b></div>';
+    }
+    let noteLine = "";
+    if (noteChanged) {
+      const nTxt = h.new_note ? (tr("Note: ", "批注：") + '"' + esc(h.new_note) + '"') : tr("(Cleared note)", "（清空批注）");
+      noteLine = '<div class="ae-note">' + nTxt + '</div>';
+    }
+    return '<div class="audit-entry">'
+      + '<div class="ae-top">'
+      +   '<span class="ae-who">#' + (idx + 1) + ' · 👤 ' + who + '</span>'
+      +   '<span class="ae-ts">' + ts + '</span>'
+      + '</div>'
+      + changeLine
+      + noteLine
+      + '</div>';
+  }).join("");
+
+  if (isModal) {
+    return '<div id="mv-audit-trail-box"><h5>'
+      + tr("Supervisor Review Audit Log (", "督导人工复核审计记录（") + hist.length + tr(")", " 条）")
+      + '</h5><div class="audit-list">' + itemsHtml + '</div></div>';
+  }
+  return '<details class="audit-trail" open>'
+    + '<summary>📝 ' + tr("Review Audit Log (", "督导复核审计记录（") + hist.length + tr(" change(s))", " 次变更）") + '</summary>'
+    + '<div class="audit-list">' + itemsHtml + '</div>'
+    + '</details>';
+}
+
 /* ---------- Evidence Card ---------- */
 function cardHtml(f) {
   const st = stateOf(f.id);
@@ -3384,6 +3581,7 @@ function cardHtml(f) {
     +     '<input type="text" placeholder="' + tr("Supervisor review note / manager instruction (auto-saved to Sheet)", "督导复核批注 / 店长整改要求（自动保存）") + '" value="' + esc(st.note) + '" '
     +       'oninput="setState(' + f.id + ', undefined, this.value, false)" />'
     +   '</div>'
+    +   renderAuditHistoryHtml(f, false)
     + '</div>'
     + '</article>';
 }
@@ -3584,6 +3782,7 @@ function openVideo(id) {
     +   '<div class="tx muted" style="font-size:11.5px">' + esc(f.doc_ref) + '</div>'
     + '</div></div>'
     + '<div><h5>' + tr("Rectification Advice", "整改建议") + '</h5><div class="advice">' + esc(st.note || fAdvice(f)) + '</div></div>'
+    + renderAuditHistoryHtml(f, true)
     + '<div class="foot-actions">'
     +   (st.status === "CONFIRMED_VIOLATION"
           ? '<button class="btn" disabled style="opacity:.5;cursor:default">' + tr("✓ Confirmed Violation", "✓ 已确认违规") + '</button>'
@@ -4370,3 +4569,606 @@ def render_supervisor_portal_html(payload: Dict[str, Any]) -> str:
         .replace("__PORTAL_AUDIT_ID__", audit_id)
         .replace("__PORTAL_JSON__", portal_json)
     )
+
+
+# =====================================================================================
+# Unified Portal Homepage (`GET /portal` without `job` / `batch`, and `GET /api/portal/home`)
+# =====================================================================================
+
+HOME_TASK_TYPE_GE = "GE"
+HOME_TASK_TYPE_SCHEDULED = "SCHEDULED"
+HOME_TASK_TYPE_GOLDEN = "GOLDEN_EVAL"
+
+REVIEW_PROGRESS_UNREVIEWED = "UNREVIEWED"
+REVIEW_PROGRESS_IN_PROGRESS = "IN_PROGRESS"
+REVIEW_PROGRESS_COMPLETED = "COMPLETED"
+REVIEW_PROGRESS_NA = "NA"
+REVIEW_PROGRESS_UNKNOWN = "UNKNOWN"
+
+HOME_MAX_JOBS = 200
+HOME_MAX_EVAL_TASKS = 50
+HOME_MAX_SHEET_PROBES = 40
+HOME_SHEET_PROBE_CONCURRENCY = 6
+
+
+def _fmt_epoch_sgt(ts: float) -> str:
+    """`YYYY-MM-DD HH:MM:SS SGT` (Asia/Singapore, UTC+8) for an epoch timestamp; '' for 0/None."""
+    try:
+        val = float(ts or 0.0)
+    except (TypeError, ValueError):
+        return ""
+    if val <= 0:
+        return ""
+    import datetime as _dt_mod
+
+    return _dt_mod.datetime.fromtimestamp(val, tz=SGT_TZ).strftime("%Y-%m-%d %H:%M:%S SGT")
+
+
+def _folder_url_for(folder_id: str) -> str:
+    fid = (folder_id or "").strip()
+    if not fid:
+        return ""
+    if is_gcs_target(fid):
+        return build_gcs_console_folder_url(fid)
+    if fid.startswith("http"):
+        return fid
+    return f"https://drive.google.com/drive/folders/{fid}"
+
+
+def compute_review_progress_status(job_state: str, reviewed: Optional[int], total: Optional[int]) -> str:
+    """Maps a job state + `(reviewed, total)` finding counts to the homepage supervisor review status."""
+    if str(job_state or "").upper() != "DONE":
+        return REVIEW_PROGRESS_NA
+    if reviewed is None or total is None:
+        return REVIEW_PROGRESS_UNKNOWN
+    if total <= 0 or reviewed >= total:
+        return REVIEW_PROGRESS_COMPLETED
+    if reviewed <= 0:
+        return REVIEW_PROGRESS_UNREVIEWED
+    return REVIEW_PROGRESS_IN_PROGRESS
+
+
+async def _probe_review_counts(gateway: Any, job: AuditJob) -> Optional[Tuple[int, int]]:
+    """Reads the store report Sheet `Tab 1` and returns `(reviewed, total)` for `job` (None on failure)."""
+    if gateway is None or not job.report_sheet_url:
+        return None
+    try:
+        tab1_rows, _ = await gateway.read_report_sheet_data(job.folder_id, job.report_sheet_url)
+    except Exception as exc:  # noqa: BLE001 - homepage stays usable when one Sheet is unreadable
+        logger.debug("Homepage review-progress probe failed for %s: %s", job.job_id, exc)
+        return None
+    rows = [r for r in (tab1_rows or []) if len(r) > 0 and str(r[0]).strip() == job.job_id] or list(
+        tab1_rows or []
+    )
+    total = len(rows)
+    reviewed = sum(
+        1
+        for r in rows
+        if map_sheet_status_to_portal_code(str(r[9]) if len(r) > 9 else "") != "PENDING"
+    )
+    return reviewed, total
+
+
+def _job_task_type(job: AuditJob) -> str:
+    return HOME_TASK_TYPE_SCHEDULED if (job.batch_id or "").strip() else HOME_TASK_TYPE_GE
+
+
+def _job_sop_scope(job: AuditJob) -> str:
+    scope = (job.active_prompt_version or job.target_prompt_tab or "").strip()
+    rule_ids = [r for r in (job.audited_rule_ids or []) if r]
+    if rule_ids:
+        ids = ", ".join(rule_ids[:12]) + (" …" if len(rule_ids) > 12 else "")
+        scope = f"{scope} [{ids}]" if scope else ids
+    return scope or config.default_prompt_version
+
+
+async def load_portal_home_payload(
+    *,
+    audit_service: Any = None,
+    job_store: Any = None,
+    state_store: Any = None,
+    gateway: Any = None,
+    viewer_email: str = "",
+    drive_checker: Optional[DriveAccessChecker] = None,
+    prompt_manager: Any = None,
+    max_sheet_probes: int = HOME_MAX_SHEET_PROBES,
+) -> Dict[str, Any]:
+    """Builds the unified `/portal` homepage payload: Tab5 quick links + the aggregated task list.
+
+    Task list = interactive GE audits + scheduled-inspection store jobs (`AuditJob`) + golden-set
+    evaluations (`ScheduledEvalTaskRecord`), newest `created_at` first. In `PORTAL_MODE=iap`
+    (`viewer_email` set) only tasks whose report / folder the viewer can open in Drive are listed.
+    """
+    if audit_service is not None:
+        if job_store is None:
+            job_store = getattr(audit_service, "jobs", None)
+        if state_store is None:
+            state_store = getattr(audit_service, "state_store", None)
+        if prompt_manager is None:
+            prompt_manager = getattr(audit_service, "prompt_manager", None)
+    if state_store is None:
+        from .scheduled_auditor import ScheduledStateStore
+
+        state_store = ScheduledStateStore()
+
+    # 1. Quick-access links (Tab5_Portal_Links).
+    links: List[Dict[str, Any]] = []
+    try:
+        if prompt_manager is not None and callable(getattr(prompt_manager, "load_portal_links", None)):
+            raw_links = await prompt_manager.load_portal_links()
+        else:
+            from .prompt_manager import parse_portal_links_from_rows
+
+            raw_links = parse_portal_links_from_rows([])
+        for item in raw_links:
+            if not item.enabled:
+                continue
+            links.append(
+                {
+                    "link_id": item.link_id,
+                    "title_zh": item.title_zh,
+                    "title_en": item.title_en,
+                    "target_url": item.target_url,
+                    "description": item.description,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 - links are optional decoration
+        logger.warning("Homepage quick links unavailable: %s", exc)
+
+    # 2. Audit jobs (GE + scheduled).
+    jobs: List[AuditJob] = []
+    if job_store is not None and callable(getattr(job_store, "list_all_jobs", None)):
+        try:
+            jobs = await job_store.list_all_jobs(limit=HOME_MAX_JOBS)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Homepage job listing failed: %s", exc)
+
+    # 3. Golden-set evaluations.
+    eval_tasks: List[Any] = []
+    try:
+        eval_tasks = await asyncio.to_thread(state_store.list_eval_tasks, limit=HOME_MAX_EVAL_TASKS)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Homepage eval task listing failed: %s", exc)
+
+    # 4. Per-viewer Drive visibility (IAP mode only).
+    if viewer_email:
+        candidates: List[Tuple[str, str, str]] = [
+            (f"job:{j.job_id}", j.report_sheet_url or "", j.folder_id) for j in jobs
+        ] + [
+            (f"eval:{t.eval_task_id}", t.report_sheet_url or "", t.results_folder_id or t.golden_videos_folder_id)
+            for t in eval_tasks
+        ]
+        visibility = await filter_visible_stores(viewer_email, candidates, checker=drive_checker) if candidates else {}
+        jobs = [j for j in jobs if visibility.get(f"job:{j.job_id}", (False, ""))[0]]
+        eval_tasks = [t for t in eval_tasks if visibility.get(f"eval:{t.eval_task_id}", (False, ""))[0]]
+
+    # 5. Supervisor review progress (cache first, then a bounded number of live Sheet probes).
+    now_mono = time.monotonic()
+    counts: Dict[str, Tuple[int, int]] = {}
+    to_probe: List[AuditJob] = []
+    for j in jobs:
+        if j.state.value.upper() != "DONE":
+            continue
+        if int(j.violations_found or 0) == 0 and not j.report_sheet_url:
+            counts[j.job_id] = (0, 0)
+            continue
+        hit = _JOB_REVIEW_PROGRESS_CACHE.get(j.job_id)
+        if hit is not None and now_mono - hit[0] < _JOB_REVIEW_PROGRESS_TTL_SEC:
+            counts[j.job_id] = (hit[1], hit[2])
+        elif j.report_sheet_url:
+            to_probe.append(j)
+    if to_probe and gateway is not None and max_sheet_probes > 0:
+        sem = asyncio.Semaphore(HOME_SHEET_PROBE_CONCURRENCY)
+
+        async def _probe(job: AuditJob) -> Tuple[str, Optional[Tuple[int, int]]]:
+            async with sem:
+                return job.job_id, await _probe_review_counts(gateway, job)
+
+        for jid, res in await asyncio.gather(*(_probe(j) for j in to_probe[:max_sheet_probes])):
+            if res is not None:
+                counts[jid] = res
+                _remember_review_progress(jid, res[0], res[1])
+
+    # 6. Rows.
+    tasks: List[Dict[str, Any]] = []
+    for j in jobs:
+        state = j.state.value.upper()
+        reviewed, total = counts.get(j.job_id, (None, None))  # type: ignore[assignment]
+        if j.batch_id:
+            portal_link = build_portal_url(batch_id=j.batch_id, store_job_id=j.job_id, base_url="")
+        else:
+            portal_link = build_portal_url(job_id=j.job_id, user_id=j.user_id, base_url="")
+        tasks.append(
+            {
+                "task_id": j.job_id,
+                "batch_id": j.batch_id or "",
+                "task_type": _job_task_type(j),
+                "folder_name": j.folder_name or (j.folder_id[:12] if j.folder_id else ""),
+                "folder_url": _folder_url_for(j.folder_id),
+                "video_count": (
+                    j.preflight_report.planned_segments_count
+                    if j.preflight_report is not None
+                    else len(j.completed_segments)
+                ),
+                "sop_scope": _job_sop_scope(j),
+                "model_version": j.active_model_version or "",
+                "state": state,
+                "violations_found": int(j.violations_found or 0),
+                "result_text": "",
+                "review_progress_status": compute_review_progress_status(state, reviewed, total),
+                "reviewed_count": reviewed,
+                "findings_total": total,
+                "initiator": j.user_id or "",
+                "created_at": float(j.created_at or 0.0),
+                "completed_at": float(j.completed_at or 0.0),
+                "created_at_sgt": _fmt_epoch_sgt(j.created_at),
+                "completed_at_sgt": _fmt_epoch_sgt(j.completed_at),
+                "portal_url": portal_link,
+                "sheet_url": j.report_sheet_url or "",
+                "error_message": (j.error_message or "")[:300],
+            }
+        )
+    for t in eval_tasks:
+        state = str(t.state or "").upper()
+        terminal = state in ("DONE", "FAILED")
+        tasks.append(
+            {
+                "task_id": t.eval_task_id,
+                "batch_id": "",
+                "task_type": HOME_TASK_TYPE_GOLDEN,
+                "folder_name": t.eval_name or t.eval_id,
+                "folder_url": t.golden_videos_folder_url or _folder_url_for(t.golden_videos_folder_id),
+                "video_count": None,
+                "sop_scope": t.prompt_tab_name,
+                "model_version": t.model_version,
+                "state": state,
+                "violations_found": None,
+                "result_text": (t.summary_text or t.error_message or "")[:300],
+                "review_progress_status": REVIEW_PROGRESS_NA,
+                "reviewed_count": None,
+                "findings_total": None,
+                "initiator": t.supervisor_email or "",
+                "created_at": float(t.created_at or 0.0),
+                "completed_at": float(t.updated_at or 0.0) if terminal else 0.0,
+                "created_at_sgt": _fmt_epoch_sgt(t.created_at),
+                "completed_at_sgt": _fmt_epoch_sgt(t.updated_at) if terminal else "",
+                "portal_url": "",
+                "sheet_url": t.report_sheet_url or "",
+                "error_message": (t.error_message or "")[:300],
+            }
+        )
+    tasks.sort(key=lambda r: r["created_at"], reverse=True)
+
+    return {
+        "viewer_email": viewer_email,
+        "portal_mode": portal_mode(),
+        "generated_at_sgt": _fmt_epoch_sgt(time.time()),
+        "links": links,
+        "tasks": tasks,
+    }
+
+
+_PORTAL_HOME_HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>CHAGEE · Store AI Audit Portal Home</title>
+<style>
+  :root {
+    --canvas:#F5F6F8; --surface:#FFFFFF; --sunk:#FAFBFC; --dark:#14171C;
+    --ink-900:#14171C; --ink-700:#3A4049; --ink-500:#697180; --ink-400:#969DA9;
+    --line:#E7E9ED; --line-strong:#D5D9E0;
+    --red:#C32B38; --red-soft:#FDF3F4; --amber:#A96410; --amber-soft:#FDF8EE;
+    --green:#0E7257; --green-soft:#EFF7F3; --slate:#F1F3F6; --blue:#1F5FBF; --blue-soft:#EEF4FD;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+         background:var(--canvas); color:var(--ink-900); font-size:14px; line-height:1.6; }
+  .wrap { max-width:1440px; margin:0 auto; padding:0 28px; }
+  header { background:var(--dark); color:#fff; position:sticky; top:0; z-index:10; }
+  header .wrap { display:flex; align-items:center; justify-content:space-between; gap:16px; min-height:64px; flex-wrap:wrap; }
+  .ident { display:flex; align-items:center; gap:14px; }
+  .logo { width:36px; height:36px; border-radius:10px; background:var(--red); display:grid; place-items:center; font-weight:800; }
+  h1 { font-size:16px; font-weight:700; }
+  .sub { font-size:12px; color:#9AA1AC; }
+  .btn { display:inline-flex; align-items:center; gap:6px; height:32px; padding:0 12px; border-radius:8px;
+         border:1px solid var(--line-strong); background:var(--surface); color:var(--ink-700); font:inherit;
+         font-size:12.5px; font-weight:600; cursor:pointer; text-decoration:none; white-space:nowrap; }
+  .btn:hover { background:var(--slate); }
+  .btn-dark { background:transparent; border-color:rgba(255,255,255,.25); color:#E7E9ED; }
+  .btn-dark:hover { background:rgba(255,255,255,.1); }
+  .btn-red { background:var(--red); border-color:var(--red); color:#fff; }
+  .btn-red:hover { background:#96131F; }
+  section { margin-top:26px; }
+  h2 { font-size:17px; font-weight:800; margin-bottom:12px; display:flex; align-items:center; gap:10px; }
+  h2 .hint { font-size:12px; font-weight:500; color:var(--ink-500); }
+  .links { display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:14px; }
+  .lcard { background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:16px 18px;
+           text-decoration:none; color:inherit; display:flex; flex-direction:column; gap:6px; transition:box-shadow .15s, border-color .15s; }
+  .lcard:hover { border-color:var(--red); box-shadow:0 6px 18px rgba(20,23,28,.08); }
+  .lcard .lt { font-size:15px; font-weight:800; }
+  .lcard .ld { font-size:12px; color:var(--ink-500); }
+  .lcard.disabled { opacity:.55; pointer-events:none; }
+  .lcard .lmiss { font-size:11.5px; color:var(--amber); font-weight:700; }
+  .panel { background:var(--surface); border:1px solid var(--line); border-radius:14px; }
+  .filters { display:flex; flex-wrap:wrap; gap:10px; padding:14px 16px; border-bottom:1px solid var(--line); align-items:center; }
+  .filters select, .filters input { height:32px; border:1px solid var(--line-strong); border-radius:8px; padding:0 8px;
+         font:inherit; font-size:12.5px; background:#fff; color:var(--ink-700); }
+  .filters input[type=search] { min-width:220px; }
+  .filters label.chk { font-size:12.5px; color:var(--ink-700); display:inline-flex; align-items:center; gap:5px; }
+  .count { margin-left:auto; font-size:12px; color:var(--ink-500); }
+  .tbl-wrap { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th { text-align:left; font-size:11.5px; font-weight:800; color:var(--ink-500); background:var(--sunk);
+       padding:10px 12px; border-bottom:1px solid var(--line); white-space:nowrap; position:sticky; top:0; }
+  td { padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+  tr:hover td { background:#FCFCFD; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px; }
+  .muted { color:var(--ink-500); }
+  .tag { display:inline-flex; align-items:center; gap:4px; height:22px; padding:0 9px; border-radius:999px;
+         font-size:11.5px; font-weight:700; white-space:nowrap; }
+  .t-ge { background:var(--blue-soft); color:var(--blue); }
+  .t-sch { background:var(--slate); color:var(--ink-700); }
+  .t-gold { background:var(--amber-soft); color:var(--amber); }
+  .s-run { background:var(--blue-soft); color:var(--blue); }
+  .s-done { background:var(--green-soft); color:var(--green); }
+  .s-fail { background:var(--red-soft); color:var(--red); }
+  .s-other { background:var(--slate); color:var(--ink-500); }
+  .r-un { background:var(--red-soft); color:var(--red); }
+  .r-ip { background:var(--amber-soft); color:var(--amber); }
+  .r-ok { background:var(--green-soft); color:var(--green); }
+  .r-na { background:var(--slate); color:var(--ink-400); }
+  .acts { display:flex; flex-direction:column; gap:6px; }
+  .empty { padding:48px; text-align:center; color:var(--ink-500); }
+  .err { color:var(--red); font-size:11.5px; margin-top:3px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="ident">
+      <div class="logo">CH</div>
+      <div>
+        <h1 id="h-title">Store AI Video Audit · Unified Portal</h1>
+        <div class="sub" id="h-sub">—</div>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="btn btn-dark" id="btn-lang" onclick="toggleLang()">🌐 EN | 中文</button>
+      <button class="btn btn-dark" id="btn-refresh" onclick="refreshData()">🔄 Refresh</button>
+    </div>
+  </div>
+</header>
+
+<main class="wrap" style="padding-bottom:48px">
+  <section>
+    <h2><span id="sec-links">Quick-Access Launchpad</span><span class="hint" id="sec-links-hint">Configured in Master SOP Sheet · Tab5_Portal_Links</span></h2>
+    <div class="links" id="links"></div>
+  </section>
+
+  <section>
+    <h2><span id="sec-tasks">Store Audit &amp; Review Task List</span><span class="hint" id="sec-tasks-hint">Newest first · times in Singapore Time (SGT, UTC+8)</span></h2>
+    <div class="panel">
+      <div class="filters">
+        <select id="f-type" onchange="render()"></select>
+        <select id="f-store" onchange="render()"></select>
+        <select id="f-sop" onchange="render()"></select>
+        <select id="f-state" onchange="render()"></select>
+        <select id="f-review" onchange="render()"></select>
+        <select id="f-init" onchange="render()"></select>
+        <label class="chk"><input type="checkbox" id="f-mine" onchange="render()" /> <span id="lbl-mine">Only Mine</span></label>
+        <input type="date" id="f-from" onchange="render()" />
+        <input type="date" id="f-to" onchange="render()" />
+        <input type="search" id="f-q" oninput="render()" />
+        <button class="btn" id="btn-reset" onclick="resetFilters()">Reset</button>
+        <span class="count" id="count"></span>
+      </div>
+      <div class="tbl-wrap"><table>
+        <thead><tr id="thead"></tr></thead>
+        <tbody id="tbody"></tbody>
+      </table></div>
+    </div>
+  </section>
+</main>
+
+<script type="application/json" id="home-data">
+__HOME_JSON__
+</script>
+<script>
+let DATA = JSON.parse(document.getElementById("home-data").textContent);
+const LANG_KEY = "chagee_portal_lang";
+let lang = "en";
+try {
+  const q = new URLSearchParams(location.search).get("lang");
+  const s = localStorage.getItem(LANG_KEY);
+  if (q === "zh" || q === "en") lang = q; else if (s === "zh" || s === "en") lang = s;
+} catch (e) {}
+const isZh = () => lang === "zh";
+const tr = (en, zh) => isZh() ? zh : en;
+const esc = s => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const safeUrl = u => /^(https?:\/\/|\/portal\?)/i.test(String(u || "")) ? String(u) : "";
+
+const TYPE_LABEL = {
+  GE: () => tr("GE Request", "GE 发起"),
+  SCHEDULED: () => tr("Scheduled Inspection", "自动巡检"),
+  GOLDEN_EVAL: () => tr("Golden Set Eval", "黄金测评集")
+};
+const TYPE_CLS = { GE: "t-ge", SCHEDULED: "t-sch", GOLDEN_EVAL: "t-gold" };
+function stateLabel(s) {
+  const m = {
+    RUNNING: tr("Running", "执行中"), PROBING: tr("Pre-checking", "预检中"), READY: tr("Awaiting Confirm", "待确认"),
+    DONE: tr("Succeeded", "成功"), FAILED: tr("Failed", "失败"), REJECTED: tr("Pre-check Blocked", "预检拦截")
+  };
+  return (m[s] || s || "—") + " · " + (s || "");
+}
+function stateCls(s) {
+  if (s === "DONE") return "s-done";
+  if (s === "FAILED" || s === "REJECTED") return "s-fail";
+  if (s === "RUNNING" || s === "PROBING") return "s-run";
+  return "s-other";
+}
+const REVIEW_LABEL = {
+  UNREVIEWED: () => tr("🔴 Unreviewed", "🔴 未复核"),
+  IN_PROGRESS: () => tr("🟡 In Review", "🟡 复核中"),
+  COMPLETED: () => tr("🟢 Review Done", "🟢 复核完成"),
+  UNKNOWN: () => tr("… Open to load", "… 进入后统计"),
+  NA: () => "—"
+};
+const REVIEW_CLS = { UNREVIEWED: "r-un", IN_PROGRESS: "r-ip", COMPLETED: "r-ok", UNKNOWN: "r-na", NA: "r-na" };
+
+function fillSelect(id, allLabel, values, labelFn) {
+  const el = document.getElementById(id);
+  const cur = el.value;
+  el.innerHTML = '<option value="">' + esc(allLabel) + '</option>'
+    + values.map(v => '<option value="' + esc(v) + '">' + esc(labelFn ? labelFn(v) : v) + '</option>').join("");
+  if ([...el.options].some(o => o.value === cur)) el.value = cur;
+}
+
+function buildFilters() {
+  const T = DATA.tasks || [];
+  const uniq = arr => [...new Set(arr.filter(Boolean))].sort();
+  fillSelect("f-type", tr("All Task Types", "全部任务类型"), ["GE", "SCHEDULED", "GOLDEN_EVAL"], v => TYPE_LABEL[v]());
+  fillSelect("f-store", tr("All Stores / Folders", "全部稽核目录"), uniq(T.map(t => t.folder_name)));
+  fillSelect("f-sop", tr("All SOP Scopes", "全部 SOP 范围"), uniq(T.map(t => t.sop_scope)));
+  fillSelect("f-state", tr("All AI Task States", "全部 AI 任务状态"), uniq(T.map(t => t.state)), v => stateLabel(v));
+  fillSelect("f-review", tr("All Review States", "全部人工复核状态"), ["UNREVIEWED", "IN_PROGRESS", "COMPLETED", "NA"], v => REVIEW_LABEL[v]());
+  fillSelect("f-init", tr("All Initiators", "全部发起人"), uniq(T.map(t => t.initiator)));
+  document.getElementById("f-q").placeholder = tr("Search job ID / store / SOP / initiator…", "搜索任务 ID / 门店 / SOP / 发起人…");
+}
+
+function applyLang() {
+  document.documentElement.lang = isZh() ? "zh-CN" : "en";
+  const set = (id, en, zh) => { const el = document.getElementById(id); if (el) el.textContent = tr(en, zh); };
+  set("h-title", "Store AI Video Audit · Unified Portal", "门店 AI 视频稽核 · 统一门户首页");
+  set("btn-lang", isZh() ? "🌐 中文 | EN" : "🌐 EN | 中文", isZh() ? "🌐 中文 | EN" : "🌐 EN | 中文");
+  set("btn-refresh", "🔄 Refresh", "🔄 刷新");
+  set("sec-links", "Quick-Access Launchpad", "快捷入口工作台");
+  set("sec-links-hint", "Configured in Master SOP Sheet · Tab5_Portal_Links", "在 SOP 总控表 Tab5_Portal_Links 中配置");
+  set("sec-tasks", "Store Audit & Review Task List", "门店稽核与复核任务列表");
+  set("sec-tasks-hint", "Newest first · times in Singapore Time (SGT, UTC+8)", "按发起时间倒序 · 时间为新加坡时间（SGT, UTC+8）");
+  set("lbl-mine", "Only Mine", "只看我的");
+  set("btn-reset", "Reset", "重置");
+  const who = DATA.viewer_email ? (tr("Signed in as ", "当前登录：") + DATA.viewer_email + " · ") : "";
+  document.getElementById("h-sub").textContent = who + tr("Updated ", "数据刷新于 ") + (DATA.generated_at_sgt || "");
+  document.getElementById("f-mine").parentElement.hidden = !DATA.viewer_email;
+  const heads = [
+    tr("Task ID", "任务 ID"), tr("Task Type", "任务类型"), tr("Audit Folder", "稽核目录"), tr("Videos", "视频规模"),
+    tr("SOP Scope & Model", "启用的 SOP 范围 & 模型"), tr("AI Task State", "AI 任务状态"), tr("AI Result", "AI 稽核结果"),
+    tr("Supervisor Review", "人工复核状态"), tr("Initiator", "任务发起人"), tr("Started / Finished (SGT)", "发起 / 结束时间 (SGT)"),
+    tr("Actions", "快捷操作")
+  ];
+  document.getElementById("thead").innerHTML = heads.map(h => "<th>" + esc(h) + "</th>").join("");
+}
+
+function renderLinks() {
+  const L = DATA.links || [];
+  document.getElementById("links").innerHTML = L.length ? L.map(l => {
+    const url = safeUrl(l.target_url);
+    const title = isZh() ? (l.title_zh || l.title_en) : (l.title_en || l.title_zh);
+    return '<a class="lcard' + (url ? '' : ' disabled') + '" href="' + esc(url || "#") + '" target="_blank" rel="noopener">'
+      + '<span class="lt">' + esc(title) + '</span>'
+      + '<span class="ld">' + esc(l.description || "") + '</span>'
+      + (url ? '' : '<span class="lmiss">' + tr("Link not configured yet — fill Target_URL in Tab5_Portal_Links", "尚未配置链接，请在 Tab5_Portal_Links 填写 Target_URL") + '</span>')
+      + '</a>';
+  }).join("") : '<div class="muted">' + tr("No quick links configured.", "暂未配置快捷入口。") + '</div>';
+}
+
+function dayStart(v) { return v ? new Date(v + "T00:00:00+08:00").getTime() / 1000 : null; }
+
+function matches(t) {
+  const g = id => document.getElementById(id).value;
+  if (g("f-type") && t.task_type !== g("f-type")) return false;
+  if (g("f-store") && t.folder_name !== g("f-store")) return false;
+  if (g("f-sop") && t.sop_scope !== g("f-sop")) return false;
+  if (g("f-state") && t.state !== g("f-state")) return false;
+  if (g("f-review") && t.review_progress_status !== g("f-review")) return false;
+  if (g("f-init") && t.initiator !== g("f-init")) return false;
+  if (document.getElementById("f-mine").checked && DATA.viewer_email
+      && String(t.initiator || "").toLowerCase() !== String(DATA.viewer_email).toLowerCase()) return false;
+  const from = dayStart(g("f-from")), to = dayStart(g("f-to"));
+  if (from !== null && t.created_at < from) return false;
+  if (to !== null && t.created_at >= to + 86400) return false;
+  const q = g("f-q").trim().toLowerCase();
+  if (q) {
+    const hay = [t.task_id, t.batch_id, t.folder_name, t.sop_scope, t.model_version, t.initiator, t.result_text].join(" ").toLowerCase();
+    if (!hay.includes(q)) return false;
+  }
+  return true;
+}
+
+function resultCell(t) {
+  if (t.task_type === "GOLDEN_EVAL") return esc(t.result_text || "—");
+  if (t.state !== "DONE") return t.error_message ? '<div class="err">' + esc(t.error_message) + '</div>' : "—";
+  const n = t.violations_found || 0;
+  return n ? ('<b style="color:var(--red)">' + n + '</b> ' + tr("finding(s)", "项疑似违规")) : tr("✓ No violations", "✓ 未检出违规");
+}
+
+function reviewCell(t) {
+  const k = t.review_progress_status || "NA";
+  const extra = (t.findings_total !== null && t.findings_total !== undefined && t.task_type !== "GOLDEN_EVAL" && k !== "NA")
+    ? '<div class="muted mono" style="margin-top:3px">' + (t.reviewed_count || 0) + " / " + t.findings_total + '</div>' : "";
+  return '<span class="tag ' + (REVIEW_CLS[k] || "r-na") + '">' + esc((REVIEW_LABEL[k] || REVIEW_LABEL.NA)()) + '</span>' + extra;
+}
+
+function render() {
+  const rows = (DATA.tasks || []).filter(matches);
+  document.getElementById("count").textContent = tr(rows.length + " task(s)", "共 " + rows.length + " 个任务");
+  const tb = document.getElementById("tbody");
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="11"><div class="empty">' + tr("No tasks match the current filters.", "当前筛选条件下没有任务。") + '</div></td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map(t => {
+    const portal = safeUrl(t.portal_url), sheet = safeUrl(t.sheet_url), folder = safeUrl(t.folder_url);
+    return '<tr>'
+      + '<td><div class="mono"><b>' + esc(t.task_id) + '</b></div>' + (t.batch_id ? '<div class="muted mono">' + tr("Batch ", "批次 ") + esc(t.batch_id) + '</div>' : '') + '</td>'
+      + '<td><span class="tag ' + (TYPE_CLS[t.task_type] || "t-sch") + '">' + esc((TYPE_LABEL[t.task_type] || (() => t.task_type))()) + '</span></td>'
+      + '<td>' + (folder ? '<a href="' + esc(folder) + '" target="_blank" rel="noopener">' + esc(t.folder_name || "—") + ' ↗</a>' : esc(t.folder_name || "—")) + '</td>'
+      + '<td class="mono">' + (t.video_count === null || t.video_count === undefined ? "—" : esc(t.video_count) + tr(" clips", " 段")) + '</td>'
+      + '<td><div>' + esc(t.sop_scope || "—") + '</div><div class="muted mono">' + esc(t.model_version || "") + '</div></td>'
+      + '<td><span class="tag ' + stateCls(t.state) + '">' + esc(stateLabel(t.state)) + '</span></td>'
+      + '<td>' + resultCell(t) + '</td>'
+      + '<td>' + reviewCell(t) + '</td>'
+      + '<td class="mono">' + esc(t.initiator || "—") + '</td>'
+      + '<td class="mono"><div>' + esc(t.created_at_sgt || "—") + '</div><div class="muted">' + esc(t.completed_at_sgt || "—") + '</div></td>'
+      + '<td><div class="acts">'
+      +   (portal ? '<a class="btn btn-red" href="' + esc(portal) + '">' + tr("🖥️ Open Review", "🖥️ 进入复核台") + '</a>' : '')
+      +   (sheet ? '<a class="btn" href="' + esc(sheet) + '" target="_blank" rel="noopener">' + tr("📊 Result Sheet ↗", "📊 结果 Sheet ↗") + '</a>' : '')
+      + '</div></td>'
+      + '</tr>';
+  }).join("");
+}
+
+function resetFilters() {
+  ["f-type", "f-store", "f-sop", "f-state", "f-review", "f-init", "f-from", "f-to", "f-q"].forEach(id => document.getElementById(id).value = "");
+  document.getElementById("f-mine").checked = false;
+  render();
+}
+
+function toggleLang() {
+  lang = isZh() ? "en" : "zh";
+  try { localStorage.setItem(LANG_KEY, lang); } catch (e) {}
+  applyLang(); buildFilters(); renderLinks(); render();
+}
+
+async function refreshData() {
+  try {
+    const resp = await fetch("/api/portal/home", { cache: "no-store" });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    DATA = await resp.json();
+    applyLang(); buildFilters(); renderLinks(); render();
+  } catch (e) { location.reload(); }
+}
+
+applyLang(); buildFilters(); renderLinks(); render();
+</script>
+</body>
+</html>
+"""
+
+
+def render_portal_home_html(payload: Dict[str, Any]) -> str:
+    """Renders the unified `/portal` homepage (quick links + filterable task list)."""
+    home_json = json.dumps(payload, ensure_ascii=False).replace("</", r"<\/")
+    return _PORTAL_HOME_HTML_TEMPLATE.replace("__HOME_JSON__", home_json)

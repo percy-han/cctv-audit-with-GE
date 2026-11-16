@@ -58,6 +58,7 @@ LEGACY_TAB_RENAME_MAP: dict[str, str] = {
     "Tab2_定时巡检配置表": "Tab2_Scheduled_Jobs",
     "Tab3_黄金集评测工作台": "Tab3_Golden_Eval",
     "Tab4_专项测试表": "Tab4_Spot_Check",
+    "Tab5_门户快捷入口": "Tab5_Portal_Links",
 }
 OBSOLETE_PROMPT_TABS: tuple[str, ...] = (
     "Prompt_v2.6_r01",
@@ -83,13 +84,16 @@ def build_master_sheet_payload() -> dict[str, Any]:
         DEFAULT_PROMPT_TAB_TITLE,
         DEFAULT_TAB3_SAMPLE_ROW,
         DEFAULT_TAB4_SAMPLE_ROW,
+        DEFAULT_TAB5_PORTAL_LINK_ROWS,
         EVAL_WORKBENCH_HEADERS,
+        PORTAL_LINK_HEADERS,
         SCHEDULED_RULE_HEADERS,
         SHEET_RULE_HEADER,
         TAB0_TITLE as PM_TAB0_TITLE,
         TAB2_SCHEDULED_TITLE,
         TAB3_EVAL_TITLE,
         TAB4_SPOT_CHECK_TITLE,
+        TAB5_PORTAL_LINKS_TITLE,
         rules_to_sheet_rows,
     )
 
@@ -176,6 +180,13 @@ def build_master_sheet_payload() -> dict[str, Any]:
                 "values": [
                     list(SHEET_RULE_HEADER),
                     list(DEFAULT_TAB4_SAMPLE_ROW),
+                ],
+            },
+            {
+                "title": TAB5_PORTAL_LINKS_TITLE,
+                "values": [
+                    list(PORTAL_LINK_HEADERS),
+                    *[list(r) for r in DEFAULT_TAB5_PORTAL_LINK_ROWS],
                 ],
             },
         ],
@@ -279,6 +290,11 @@ def load_snapshot(path: Path) -> list[dict[str, Any]]:
             if len(values[0]) not in (9, 10):
                 raise ValueError(
                     f"{path}: eval workbench tab {tab['title']!r} must have 9 or 10 columns, got {len(values[0])}"
+                )
+        elif tab["title"] in ("Tab5_Portal_Links", "Tab5_门户快捷入口"):
+            if len(values[0]) != 6:
+                raise ValueError(
+                    f"{path}: portal links tab {tab['title']!r} must have 6 columns, got {len(values[0])}"
                 )
         elif tab["title"] not in (TAB0_TITLE, LEGACY_TAB0_TITLE) and len(values[0]) != 9:
             raise ValueError(f"{path}: rules tab {tab['title']!r} must have 9 columns, got {len(values[0])}")

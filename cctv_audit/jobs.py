@@ -96,6 +96,10 @@ class AuditJob(BaseModel):
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
     heartbeat_at: float = Field(default_factory=time.time)
+    completed_at: float = Field(
+        default=0.0,
+        description="Timestamp when the job entered a terminal state (DONE, FAILED, REJECTED); 0.0 while running",
+    )
     preflight_report: Optional[InspectFolderResponse] = None
     completed_segments: Dict[str, SegmentCheckpoint] = Field(
         default_factory=dict,
@@ -368,7 +372,12 @@ class UserScopedJobStore:
         if not job.user_id:
             raise ValueError("user_id (supervisor email) is required for tenant isolation")
         now = time.time()
-        updated = job.model_copy(update={"updated_at": now, "heartbeat_at": now})
+        updates_dict: Dict[str, float] = {"updated_at": now, "heartbeat_at": now}
+        if job.is_terminal and not getattr(job, "completed_at", 0.0):
+            updates_dict["completed_at"] = now
+        elif not job.is_terminal and getattr(job, "completed_at", 0.0):
+            updates_dict["completed_at"] = 0.0
+        updated = job.model_copy(update=updates_dict)
         user_bucket = self._by_user.setdefault(job.user_id.lower(), {})
         user_bucket[updated.job_id] = updated
         if len(user_bucket) > self.MAX_JOBS_PER_USER:
@@ -452,6 +461,15 @@ class UserScopedJobStore:
         user_jobs = list(self._by_user.get(user_id.lower(), {}).values())
         user_jobs.sort(key=lambda j: j.updated_at, reverse=True)
         return user_jobs[:limit]
+
+    async def list_all_jobs(self, limit: int = 200) -> List[AuditJob]:
+        """Returns all jobs across all tenants sorted by `created_at` descending (newest first)."""
+        await asyncio.to_thread(self._sync_all_jobs_sync)
+        all_jobs: List[AuditJob] = []
+        for bucket in self._by_user.values():
+            all_jobs.extend(bucket.values())
+        all_jobs.sort(key=lambda j: (j.created_at, j.updated_at), reverse=True)
+        return all_jobs[:limit]
 
     def active_running_count(self) -> int:
         """Returns the number of jobs currently in RUNNING or non-stale PROBING state across all tenants."""

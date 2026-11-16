@@ -85,7 +85,9 @@ TAB0_TITLE = "Tab0_Version_Control"
 TAB2_SCHEDULED_TITLE = "Tab2_Scheduled_Jobs"
 TAB3_EVAL_TITLE = "Tab3_Golden_Eval"
 TAB4_SPOT_CHECK_TITLE = "Tab4_Spot_Check"
+TAB5_PORTAL_LINKS_TITLE = "Tab5_Portal_Links"
 DEFAULT_PROMPT_TAB_TITLE = "Prompt_v1.0_Standard"
+DEFAULT_SCHEDULE_TIMEZONE = "Asia/Singapore"
 
 TAB0_ALIASES: tuple[str, ...] = (
     "Tab0_Version_Control",
@@ -109,6 +111,12 @@ TAB4_ALIASES: tuple[str, ...] = (
     "Spot_Check",
     "专项测试表",
 )
+TAB5_ALIASES: tuple[str, ...] = (
+    "Tab5_Portal_Links",
+    "Tab5_门户快捷入口",
+    "Portal_Links",
+    "门户快捷入口",
+)
 PROMPT_STANDARD_ALIASES: tuple[str, ...] = (
     "Prompt_v1.0_Standard",
     "Prompt_v2.5_Standard",
@@ -129,7 +137,7 @@ def _alias_candidates_for_tab(tab_name: str) -> list[str]:
     if not cleaned:
         return []
     out: list[str] = [cleaned]
-    for group in (TAB0_ALIASES, TAB2_ALIASES, TAB3_ALIASES, TAB4_ALIASES, PROMPT_STANDARD_ALIASES):
+    for group in (TAB0_ALIASES, TAB2_ALIASES, TAB3_ALIASES, TAB4_ALIASES, TAB5_ALIASES, PROMPT_STANDARD_ALIASES):
         if cleaned in group:
             for item in group:
                 if item not in out:
@@ -142,7 +150,7 @@ def _alias_candidates_for_tab(tab_name: str) -> list[str]:
 
 def _populate_workbook_tab_aliases(tabs: dict[str, list[list[str]]]) -> dict[str, list[list[str]]]:
     """Populates both canonical English and legacy Chinese tab keys on an in-memory workbook dict."""
-    for group in (TAB0_ALIASES, TAB2_ALIASES, TAB3_ALIASES, TAB4_ALIASES, PROMPT_STANDARD_ALIASES):
+    for group in (TAB0_ALIASES, TAB2_ALIASES, TAB3_ALIASES, TAB4_ALIASES, TAB5_ALIASES, PROMPT_STANDARD_ALIASES):
         present = next((t for t in group if t in tabs), None)
         if present is not None:
             for alias in group:
@@ -154,6 +162,17 @@ def _populate_workbook_tab_aliases(tabs: dict[str, list[list[str]]]) -> dict[str
 
 
 SCHEDULED_RULE_HEADERS: tuple[str, ...] = (
+    "Rule_ID",
+    "Rule_Name",
+    "Root_Folder_URL",
+    "Trigger_Hour_SGT",
+    "Trigger_Minute_SGT",
+    "Lookback_Days",
+    "Supervisor_Email",
+    "Enabled",
+    "Last_Run_Status",
+)
+LEGACY_UTC_SCHEDULED_RULE_HEADERS: tuple[str, ...] = (
     "Rule_ID",
     "Rule_Name",
     "Root_Folder_URL",
@@ -175,8 +194,10 @@ LEGACY_SCHEDULED_RULE_HEADERS: tuple[str, ...] = (
     "Enabled",
     "Last_Run_Status",
 )
-VALID_TRIGGER_HOURS_UTC: tuple[str, ...] = tuple(f"{h:02d}" for h in range(24))
-VALID_TRIGGER_MINUTES_UTC: tuple[str, ...] = ("00", "15", "30", "45")
+VALID_TRIGGER_HOURS_SGT: tuple[str, ...] = tuple(f"{h:02d}" for h in range(24))
+VALID_TRIGGER_MINUTES_SGT: tuple[str, ...] = ("00", "15", "30", "45")
+VALID_TRIGGER_HOURS_UTC: tuple[str, ...] = VALID_TRIGGER_HOURS_SGT
+VALID_TRIGGER_MINUTES_UTC: tuple[str, ...] = VALID_TRIGGER_MINUTES_SGT
 VALID_LOOKBACK_DAYS_OPTIONS: tuple[str, ...] = ("0.5", "1", "2", "3", "4", "5", "6", "7")
 VALID_LOOKBACK_DAYS_VALUES: frozenset[float] = frozenset({0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0})
 VALID_ENABLED_DROPDOWN_OPTIONS: tuple[str, ...] = ("ENABLED", "PAUSED")
@@ -239,7 +260,10 @@ class ScheduledAuditRule(BaseModel):
     root_folder_url: str = Field(description="Google Drive root folder URL/ID or gs:// prefix")
     root_folder_id: str = Field(description="Normalized Google Drive folder ID or gs:// prefix")
     trigger_time: str = Field(default="02:00", description="Daily trigger time in HH:MM (24h)")
-    timezone: str = Field(default="UTC", description="IANA timezone name (defaults to UTC)")
+    timezone: str = Field(
+        default=DEFAULT_SCHEDULE_TIMEZONE,
+        description="IANA timezone name (defaults to Asia/Singapore, UTC+8)",
+    )
     lookback_days: float = Field(
         default=1.0, ge=0.01, le=30.0, description="Lookback window in days (0.5 to 7)"
     )
@@ -316,6 +340,69 @@ DEFAULT_TAB4_SAMPLE_ROW: tuple[str, ...] = (
     "Clean red-edged towel taken directly from the dedicated labeled sanitizing bucket used to wipe the ice maker interior; 3-color towels strictly segregated by zone",
     "Towel not taken from the dedicated sanitizing bucket (reused from counter/sink rim) or red/blue/yellow towels cross-used across zones",
 )
+
+PORTAL_LINK_HEADERS: tuple[str, ...] = (
+    "Link_ID",
+    "Title_ZH",
+    "Title_EN",
+    "Target_URL",
+    "Description",
+    "Enabled",
+)
+DEFAULT_TAB5_PORTAL_LINK_ROWS: tuple[tuple[str, ...], ...] = (
+    (
+        "LINK_GE",
+        "💬 打开 GE 发起稽核",
+        "💬 Launch Audit in GE",
+        "",
+        "Open Gemini Enterprise chat to start a store audit or Tab4 spot-check (paste your GE web app URL here)",
+        "ENABLED",
+    ),
+    (
+        "LINK_DRIVE_ROOT",
+        "📁 门店监控视频总目录",
+        "📁 Store CCTV Drive Root",
+        "",
+        "Open Google Drive root folder for store CCTV footage (if blank, auto-resolves from Tab2 Root_Folder_URL)",
+        "ENABLED",
+    ),
+    (
+        "LINK_CHAT_SPACE",
+        "🔔 Google Chat 稽核通知群",
+        "🔔 Google Chat Alert Space",
+        "",
+        "Open Google Chat space receiving start/completion/eval notifications (paste your Google Chat space URL here)",
+        "ENABLED",
+    ),
+    (
+        "LINK_SOP_SHEET",
+        "⚙️ SOP 与定时任务总控台",
+        "⚙️ Master SOP Control Sheet",
+        "",
+        "Open this Master SOP & Model Control Sheet (if blank, auto-resolves from MASTER_PROMPT_SHEET_ID)",
+        "ENABLED",
+    ),
+    (
+        "LINK_GOLDEN_RESULTS",
+        "📊 黄金集历史评测报告库",
+        "📊 Golden Set Eval Reports",
+        "",
+        "Open Google Drive folder storing 5-Tab Golden Set evaluation reports (if blank, auto-resolves from Tab3 Results_Folder_URL)",
+        "ENABLED",
+    ),
+)
+
+
+class PortalQuickLink(BaseModel):
+    """One quick-access card row configured in `Tab5_Portal_Links` of the Master SOP Sheet."""
+
+    row_index: int = Field(default=2, ge=2)
+    link_id: str = Field(description="Unique link identifier, e.g. LINK_GE")
+    title_zh: str = Field(default="", description="Chinese button title")
+    title_en: str = Field(default="", description="English button title")
+    target_url: str = Field(default="", description="Target URL (or auto-resolved fallback)")
+    description: str = Field(default="", description="Helper description shown on the launchpad card")
+    enabled: bool = Field(default=True)
 
 
 class ScheduledEvalRule(BaseModel):
@@ -1244,7 +1331,7 @@ def parse_scheduled_rules_with_diagnostics(
 
     Supports both:
     - The simplified UTC schema (`Trigger_Hour_UTC`, `Trigger_Minute_UTC`, `Lookback_Days`,
-      with default `UTC` timezone, hours `00`–`23`, minutes `00`/`15`/`30`/`45`, and
+      with default `Asia/Singapore` (SGT) timezone, hours `00`–`23`, minutes `00`/`15`/`30`/`45`, and
       lookback days `0.5` or `1`–`7` converted to `lookback_hours = days * 24.0`).
     - The legacy schema (`Trigger_Time`, `Timezone`, `Lookback_Hours`) for backward compatibility.
     """
@@ -1340,20 +1427,20 @@ def parse_scheduled_rules_with_diagnostics(
                     raise ValueError("hour out of range")
             except (TypeError, ValueError):
                 _fail(
-                    f"❌ Config Error: Trigger_Hour_UTC (Column D) '{col_d}' is invalid; select 00–23 (UTC hour) from dropdown"
+                    f"❌ Config Error: Trigger_Hour_SGT / Trigger_Hour_UTC (Column D) '{col_d}' is invalid; select 00–23 (Singapore time SGT hour) from dropdown"
                 )
                 continue
             try:
                 mm = int(raw_min)
-                if f"{mm:02d}" not in VALID_TRIGGER_MINUTES_UTC:
+                if f"{mm:02d}" not in VALID_TRIGGER_MINUTES_SGT:
                     raise ValueError("minute not in {00, 15, 30, 45}")
             except (TypeError, ValueError):
                 _fail(
-                    f"❌ Config Error: Trigger_Minute_UTC (Column E) '{col_e}' is invalid; select 00, 15, 30, or 45 from dropdown"
+                    f"❌ Config Error: Trigger_Minute_SGT / Trigger_Minute_UTC (Column E) '{col_e}' is invalid; select 00, 15, 30, or 45 from dropdown"
                 )
                 continue
             normalized_time = f"{hh:02d}:{mm:02d}"
-            tz_clean = "UTC"
+            tz_clean = DEFAULT_SCHEDULE_TIMEZONE
 
             raw_days = col_f if col_f != "" else "1"
             try:
@@ -1690,6 +1777,49 @@ def parse_scheduled_eval_rules_from_rows(
     return valid_rules
 
 
+def parse_portal_links_from_rows(rows: Sequence[Sequence[str]]) -> List[PortalQuickLink]:
+    """Parses `[Tab 5: Portal Quick Links]` (`Tab5_Portal_Links`) rows into `PortalQuickLink` items.
+
+    If `rows` is empty or has no data rows, returns the default 5 launchpad entries from `DEFAULT_TAB5_PORTAL_LINK_ROWS`.
+    """
+    source_rows: Sequence[Sequence[str]]
+    if not rows or len(rows) < 2:
+        source_rows = [list(PORTAL_LINK_HEADERS), *[list(r) for r in DEFAULT_TAB5_PORTAL_LINK_ROWS]]
+    else:
+        source_rows = rows
+
+    links: List[PortalQuickLink] = []
+    seen_ids: set[str] = set()
+    for idx, raw_row in enumerate(source_rows[1:], start=2):
+        padded = [str(c).strip() for c in raw_row] + [""] * max(0, 6 - len(raw_row))
+        link_id, title_zh, title_en, target_url, desc, enabled_raw = padded[:6]
+        if not any(padded[:5]):
+            continue
+        if not link_id:
+            link_id = f"LINK_CUSTOM_{idx}"
+        if link_id in seen_ids:
+            continue
+        seen_ids.add(link_id)
+        enabled_upper = (enabled_raw or "ENABLED").upper()
+        is_enabled = enabled_upper not in _FALSY_ENABLED_TOKENS or enabled_upper == ""
+        if enabled_raw.strip().upper() in ("FALSE", "PAUSED", "DISABLED", "NO", "0", "OFF", "暂停", "禁用", "N"):
+            is_enabled = False
+        links.append(
+            PortalQuickLink(
+                row_index=idx,
+                link_id=link_id,
+                title_zh=title_zh or title_en or link_id,
+                title_en=title_en or title_zh or link_id,
+                target_url=target_url,
+                description=desc,
+                enabled=is_enabled,
+            )
+        )
+    if not links:
+        return parse_portal_links_from_rows([])
+    return links
+
+
 def _nearest_quarter_minute(mm: int) -> str:
     quarters = (0, 15, 30, 45)
     best = min(quarters, key=lambda q: abs(q - mm))
@@ -1709,18 +1839,21 @@ def _nearest_lookback_days_str(hours_raw: str) -> str:
 
 def migrate_tab2_rows_to_utc_schema(rows: List[List[str]]) -> tuple[bool, List[List[str]]]:
     """Converts legacy `Tab2_定时巡检配置表` rows (`Trigger_Time`, `Timezone`, `Lookback_Hours`)
-    into the simplified UTC schema (`Trigger_Hour_UTC`, `Trigger_Minute_UTC`, `Lookback_Days`).
+    or `Trigger_Hour_UTC` rows into the unified Singapore time (`Asia/Singapore`, UTC+8) schema
+    (`Trigger_Hour_SGT`, `Trigger_Minute_SGT`, `Lookback_Days`).
 
     Returns `(changed, migrated_rows)`.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
     from zoneinfo import ZoneInfo
 
     if not rows:
         return True, [list(SCHEDULED_RULE_HEADERS)]
 
+    sgt_tz = ZoneInfo(DEFAULT_SCHEDULE_TIMEZONE)
     is_legacy = _is_legacy_tab2_header(rows[0])
     current_hdr = [str(c).strip() for c in rows[0][:9]]
+    is_utc_hdr = len(current_hdr) > 3 and current_hdr[3].upper() == "TRIGGER_HOUR_UTC"
     changed = current_hdr != list(SCHEDULED_RULE_HEADERS)
     out_rows: List[List[str]] = [list(SCHEDULED_RULE_HEADERS)]
 
@@ -1735,30 +1868,43 @@ def migrate_tab2_rows_to_utc_schema(rows: List[List[str]]) -> tuple[bool, List[L
             t_match = _TRIGGER_TIME_RE.match(col_d or "02:00")
             local_hh = int(t_match.group(1)) if t_match else 2
             local_mm = int(t_match.group(2)) if t_match else 0
-            tz_name = col_e or "Asia/Singapore"
+            tz_name = col_e or DEFAULT_SCHEDULE_TIMEZONE
             try:
                 tz = ZoneInfo(tz_name)
                 ref_local = datetime(2026, 10, 16, local_hh, local_mm, tzinfo=tz)
-                ref_utc = ref_local.astimezone(timezone.utc)
-                utc_hh_str = f"{ref_utc.hour:02d}"
-                utc_mm_str = _nearest_quarter_minute(ref_utc.minute)
+                ref_sgt = ref_local.astimezone(sgt_tz)
+                sgt_hh_str = f"{ref_sgt.hour:02d}"
+                sgt_mm_str = _nearest_quarter_minute(ref_sgt.minute)
             except Exception:
-                utc_hh_str = f"{local_hh:02d}"
-                utc_mm_str = _nearest_quarter_minute(local_mm)
+                sgt_hh_str = f"{local_hh:02d}"
+                sgt_mm_str = _nearest_quarter_minute(local_mm)
             lb_days_str = _nearest_lookback_days_str(col_f)
+        elif is_utc_hdr:
+            changed = True
+            try:
+                utc_hh = max(0, min(23, int(col_d or "2")))
+                utc_mm = int(col_e or "0")
+                ref_utc = datetime(2026, 10, 16, utc_hh, max(0, min(59, utc_mm)), tzinfo=ZoneInfo("UTC"))
+                ref_sgt = ref_utc.astimezone(sgt_tz)
+                sgt_hh_str = f"{ref_sgt.hour:02d}"
+                sgt_mm_str = _nearest_quarter_minute(ref_sgt.minute)
+            except ValueError:
+                sgt_hh_str = col_d
+                sgt_mm_str = col_e
+            lb_days_str = col_f or "1"
         else:
             try:
                 hh_val = max(0, min(23, int(col_d or "2")))
-                utc_hh_str = f"{hh_val:02d}"
+                sgt_hh_str = f"{hh_val:02d}"
             except ValueError:
-                utc_hh_str = col_d
+                sgt_hh_str = col_d
             try:
                 mm_val = int(col_e or "0")
-                utc_mm_str = f"{mm_val:02d}" if f"{mm_val:02d}" in VALID_TRIGGER_MINUTES_UTC else col_e
+                sgt_mm_str = f"{mm_val:02d}" if f"{mm_val:02d}" in VALID_TRIGGER_MINUTES_SGT else col_e
             except ValueError:
-                utc_mm_str = col_e
+                sgt_mm_str = col_e
             lb_days_str = col_f or "1"
-            if (utc_hh_str, utc_mm_str, lb_days_str) != (col_d, col_e, col_f):
+            if (sgt_hh_str, sgt_mm_str, lb_days_str) != (col_d, col_e, col_f):
                 changed = True
 
         norm_enabled = (
@@ -1774,8 +1920,8 @@ def migrate_tab2_rows_to_utc_schema(rows: List[List[str]]) -> tuple[bool, List[L
                 rule_id,
                 rule_name,
                 root_url,
-                utc_hh_str,
-                utc_mm_str,
+                sgt_hh_str,
+                sgt_mm_str,
                 lb_days_str,
                 sup_email,
                 norm_enabled,
@@ -1990,7 +2136,7 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": _one_of_list_rule(
                             VALID_TRIGGER_HOURS_UTC,
-                            "Select daily trigger hour (UTC, 00-23)",
+                            "Select daily trigger hour in Singapore time (SGT, UTC+8, 00-23) / 选择每天触发的小时（新加坡时间）",
                         ),
                     }
                 },
@@ -2005,7 +2151,7 @@ def build_master_sheet_validation_requests(
                         },
                         "rule": _one_of_list_rule(
                             VALID_TRIGGER_MINUTES_UTC,
-                            "Select trigger minute (UTC, only 00, 15, 30, 45 supported)",
+                            "Select trigger minute in Singapore time (SGT; only 00, 15, 30, 45) / 选择触发分钟（新加坡时间）",
                         ),
                     }
                 },
@@ -2153,6 +2299,28 @@ def build_master_sheet_validation_requests(
             ]
         )
 
+    # 5. Tab 5 (`Tab5_Portal_Links`, 6 columns A:F):
+    #    - Col F (index 5): Enabled dropdown (ENABLED, PAUSED)
+    tab5_id = next((title_to_id[t] for t in TAB5_ALIASES if t in title_to_id), None)
+    if tab5_id is not None:
+        requests.append(
+            {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": tab5_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": 100,
+                        "startColumnIndex": 5,
+                        "endColumnIndex": 6,
+                    },
+                    "rule": _one_of_list_rule(
+                        VALID_ENABLED_DROPDOWN_OPTIONS,
+                        "Select ENABLED or PAUSED",
+                    ),
+                }
+            }
+        )
+
     return requests
 
 
@@ -2176,6 +2344,7 @@ class GoogleSheetsConfigClient:
     TAB2_SCHEDULED_TITLE = TAB2_SCHEDULED_TITLE
     TAB3_EVAL_TITLE = TAB3_EVAL_TITLE
     TAB4_SPOT_CHECK_TITLE = TAB4_SPOT_CHECK_TITLE
+    TAB5_PORTAL_LINKS_TITLE = TAB5_PORTAL_LINKS_TITLE
 
     def __init__(self, gcs_gateway: Optional[object] = None) -> None:
         # Zero-GWS: `gs://` sheet IDs are read from GCS (`GcsStorageGateway.download_object_bytes`).
@@ -2383,6 +2552,36 @@ class GoogleSheetsConfigClient:
         valid_rules, _ = await self.read_scheduled_eval_rules_with_diagnostics(sheet_id)
         return valid_rules
 
+    async def read_portal_links(self, sheet_id: str) -> List[PortalQuickLink]:
+        """Reads `[Tab 5: Portal Quick Links]` (`Tab5_Portal_Links`) rows; returns default rows if the tab does not exist yet."""
+        if not sheet_id:
+            return parse_portal_links_from_rows([])
+        if sheet_id.startswith("gs://"):
+            try:
+                tabs = await self._read_gcs_workbook_tabs(sheet_id)
+                rows = tabs.get(self.TAB5_PORTAL_LINKS_TITLE, [])
+                return parse_portal_links_from_rows(rows)
+            except Exception as exc:
+                logger.info(
+                    "Portal links tab %s not present or unreadable on %s: %s",
+                    self.TAB5_PORTAL_LINKS_TITLE,
+                    sheet_id,
+                    exc,
+                )
+                return parse_portal_links_from_rows([])
+        try:
+            a1 = f"{self.TAB5_PORTAL_LINKS_TITLE}!A1:F50"
+            rows = await self._read_range(sheet_id, a1)
+            return parse_portal_links_from_rows(rows)
+        except Exception as exc:
+            logger.info(
+                "Portal links tab %s not present or unreadable on %s: %s",
+                self.TAB5_PORTAL_LINKS_TITLE,
+                sheet_id,
+                exc,
+            )
+            return parse_portal_links_from_rows([])
+
     async def update_scheduled_eval_row(
         self,
         sheet_id: str,
@@ -2491,7 +2690,7 @@ class GoogleSheetsConfigClient:
     async def ensure_master_sheet_validations(
         self, sheet_id: str, *, force: bool = False
     ) -> bool:
-        """Idempotently migrates legacy `Tab2_Scheduled_Jobs` rows to the UTC dropdown schema,
+        """Idempotently migrates legacy `Tab2_Scheduled_Jobs` rows to the Singapore-time (SGT) dropdown schema,
         migrates or auto-creates `Tab3_Golden_Eval` (10-column 3-path schema), and applies native
         Google Sheets `setDataValidation` rules across Tab 0, Prompt_*, Tab 2, and Tab 3.
 
@@ -2616,6 +2815,44 @@ class GoogleSheetsConfigClient:
                     },
                 ).execute(num_retries=3)
                 meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute(num_retries=3)
+                tab_titles = {
+                    str((s.get("properties") or {}).get("title") or "")
+                    for s in (meta.get("sheets") or [])
+                }
+
+            tab5_existing = next((t for t in TAB5_ALIASES if t in tab_titles), None)
+            if tab5_existing is None:
+                # Best-effort: a missing portal-links tab must never block the SOP validations.
+                try:
+                    svc.spreadsheets().batchUpdate(
+                        spreadsheetId=sheet_id,
+                        body={
+                            "requests": [
+                                {
+                                    "addSheet": {
+                                        "properties": {
+                                            "title": self.TAB5_PORTAL_LINKS_TITLE,
+                                            "gridProperties": {"frozenRowCount": 1},
+                                        }
+                                    }
+                                }
+                            ]
+                        },
+                    ).execute(num_retries=3)
+                    svc.spreadsheets().values().update(
+                        spreadsheetId=sheet_id,
+                        range=f"'{self.TAB5_PORTAL_LINKS_TITLE}'!A1",
+                        valueInputOption="RAW",
+                        body={
+                            "values": [
+                                list(PORTAL_LINK_HEADERS),
+                                *[list(r) for r in DEFAULT_TAB5_PORTAL_LINK_ROWS],
+                            ]
+                        },
+                    ).execute(num_retries=3)
+                    meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute(num_retries=3)
+                except Exception as tab5_exc:  # noqa: BLE001
+                    logger.warning("Could not auto-create %s on %s: %s", self.TAB5_PORTAL_LINKS_TITLE, sheet_id, tab5_exc)
 
             reqs = build_master_sheet_validation_requests(meta, model_versions=list(models))
             if reqs:
@@ -2637,6 +2874,7 @@ class GoogleSheetsConfigClient:
                 _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB2_SCHEDULED_TITLE}!A1:I200", None)
                 _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB3_EVAL_TITLE}!A1:J200", None)
                 _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB4_SPOT_CHECK_TITLE}!A1:I100", None)
+                _SHEET_RANGE_CACHE.pop(f"{sheet_id}:{self.TAB5_PORTAL_LINKS_TITLE}!A1:F50", None)
             return True
         except Exception as exc:
             logger.warning(
@@ -2860,7 +3098,7 @@ class PromptManager:
     async def ensure_master_sheet_validations(
         self, sheet_id: Optional[str] = None, *, force: bool = False
     ) -> bool:
-        """Ensures `Tab2_Scheduled_Jobs` is migrated to the UTC schema and native Google Sheets
+        """Ensures `Tab2_Scheduled_Jobs` is migrated to the Singapore-time (SGT) schema and native Google Sheets
         dropdown/formula validations are applied across the Master Config Sheet.
         """
         target_sheet_id = self._resolve_target_sheet_id(sheet_id)
@@ -3071,3 +3309,81 @@ class PromptManager:
             ),
             timeout=10.0,
         )
+
+    async def load_portal_links(
+        self, sheet_id: Optional[str] = None
+    ) -> List[PortalQuickLink]:
+        """Loads quick-access launchpad links from `[Tab 5: Portal Quick Links]` (`Tab5_Portal_Links`),
+        auto-filling default URLs for `LINK_SOP_SHEET`, `LINK_DRIVE_ROOT`, and `LINK_GOLDEN_RESULTS`
+        when `Target_URL` is left blank in the Sheet.
+        """
+        target_sheet_id = self._resolve_target_sheet_id(sheet_id)
+        links: List[PortalQuickLink] = []
+        if target_sheet_id and self._sheet_client is not None:
+            reader = getattr(self._sheet_client, "read_portal_links", None)
+            if callable(reader):
+                try:
+                    links = await asyncio.wait_for(reader(target_sheet_id), timeout=10.0)
+                except Exception as exc:
+                    logger.warning("Failed to read Tab5_Portal_Links from %s: %s", target_sheet_id, exc)
+        if not links:
+            links = parse_portal_links_from_rows([])
+
+        # Auto-resolve blank Target_URL for standard link IDs when possible
+        drive_root_fallback = ""
+        eval_results_fallback = ""
+        if config.eval_results_folder_id:
+            if config.eval_results_folder_id.startswith("http") or config.eval_results_folder_id.startswith("gs://"):
+                eval_results_fallback = config.eval_results_folder_id
+            else:
+                eval_results_fallback = f"https://drive.google.com/drive/folders/{config.eval_results_folder_id}"
+
+        need_drive_root = any(l.link_id == "LINK_DRIVE_ROOT" and not l.target_url for l in links)
+        need_eval_results = any(l.link_id == "LINK_GOLDEN_RESULTS" and not l.target_url for l in links)
+
+        if need_drive_root and target_sheet_id and self._sheet_client is not None:
+            try:
+                sched_rules = await self.load_scheduled_rules(target_sheet_id)
+                for sr in sched_rules:
+                    cand = (sr.root_folder_url or "").strip()
+                    if cand and "1Example" not in cand:
+                        drive_root_fallback = (
+                            cand
+                            if cand.startswith("http") or cand.startswith("gs://")
+                            else f"https://drive.google.com/drive/folders/{sr.root_folder_id}"
+                        )
+                        break
+            except Exception:
+                pass
+
+        if need_eval_results and not eval_results_fallback and target_sheet_id and self._sheet_client is not None:
+            try:
+                eval_rules = await self.load_scheduled_eval_rules(target_sheet_id)
+                for er in eval_rules:
+                    cand = (er.results_folder_url or "").strip()
+                    if cand and "1Example" not in cand:
+                        eval_results_fallback = (
+                            cand
+                            if cand.startswith("http") or cand.startswith("gs://")
+                            else f"https://drive.google.com/drive/folders/{er.results_folder_id}"
+                        )
+                        break
+            except Exception:
+                pass
+
+        sop_sheet_fallback = ""
+        if target_sheet_id and not target_sheet_id.startswith("gs://"):
+            sop_sheet_fallback = f"https://docs.google.com/spreadsheets/d/{target_sheet_id}/edit"
+
+        resolved: List[PortalQuickLink] = []
+        for item in links:
+            url = (item.target_url or "").strip()
+            if not url:
+                if item.link_id == "LINK_SOP_SHEET" and sop_sheet_fallback:
+                    url = sop_sheet_fallback
+                elif item.link_id == "LINK_DRIVE_ROOT" and drive_root_fallback:
+                    url = drive_root_fallback
+                elif item.link_id == "LINK_GOLDEN_RESULTS" and eval_results_fallback:
+                    url = eval_results_fallback
+            resolved.append(item.model_copy(update={"target_url": url}))
+        return resolved

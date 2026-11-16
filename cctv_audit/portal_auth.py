@@ -33,7 +33,9 @@ IAP_CERTS_URL = "https://www.gstatic.com/iap/verify/public_key"
 IAP_ISSUER = "https://cloud.google.com/iap"
 
 # Paths the IAP portal service serves; everything else answers 404 there.
-IAP_MODE_ALLOWED_PATHS = frozenset({"/portal", "/api/portal/data", "/api/portal/review", "/healthz"})
+IAP_MODE_ALLOWED_PATHS = frozenset(
+    {"/portal", "/api/portal/home", "/api/portal/data", "/api/portal/review", "/healthz"}
+)
 
 DRIVE_ACCESS_DENIED_MESSAGE = (
     "You don't have Google Drive access to this store's report. "

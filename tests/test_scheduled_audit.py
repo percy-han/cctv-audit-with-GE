@@ -1720,14 +1720,14 @@ def test_simplified_utc_schema_parsing_and_lookback_days_conversion() -> None:
     r1, r2 = valid_rules
     assert r1.rule_id == "SCHED-HALF-DAY"
     assert r1.trigger_time == "05:00"
-    assert r1.timezone == "UTC"
+    assert r1.timezone == "Asia/Singapore"
     assert r1.lookback_days == 0.5
     assert r1.lookback_hours == 12.0
     assert r1.enabled is True
 
     assert r2.rule_id == "SCHED-WEEKLY"
     assert r2.trigger_time == "09:45"
-    assert r2.timezone == "UTC"
+    assert r2.timezone == "Asia/Singapore"
     assert r2.lookback_days == 7.0
     assert r2.lookback_hours == 168.0
     assert r2.enabled is False
@@ -1915,11 +1915,11 @@ def test_migrate_tab2_rows_and_build_master_sheet_validations() -> None:
     changed, migrated = migrate_tab2_rows_to_utc_schema(legacy_rows)
     assert changed is True
     assert migrated[0] == list(SCHEDULED_RULE_HEADERS)
-    # 13:00 Asia/Singapore (UTC+8) -> 05:00 UTC, 24h -> "1" day
-    assert migrated[1][3:6] == ["05", "00", "1"]
+    # 13:00 Asia/Singapore stays 13:00 SGT (unified Singapore-time schema), 24h -> "1" day
+    assert migrated[1][3:6] == ["13", "00", "1"]
     assert migrated[1][7] == "ENABLED"
-    # 13:30 Asia/Singapore (UTC+8) -> 05:30 UTC, 12h -> "0.5" day, FALSE -> "PAUSED"
-    assert migrated[2][3:6] == ["05", "30", "0.5"]
+    # 13:30 Asia/Singapore stays 13:30 SGT, 12h -> "0.5" day, FALSE -> "PAUSED"
+    assert migrated[2][3:6] == ["13", "30", "0.5"]
     assert migrated[2][7] == "PAUSED"
 
     # Second run on already-migrated rows is idempotent (changed == False)
@@ -2376,3 +2376,43 @@ def test_tab3_eval_workbench_tick_lifecycle_and_preflight(
 
 
 
+
+
+def test_migrate_legacy_utc_tab2_header_converts_hours_to_sgt() -> None:
+    """Sheets still carrying the previous `Trigger_Hour_UTC` header are rewritten to SGT (+8h)."""
+    from cctv_audit.prompt_manager import (
+        LEGACY_UTC_SCHEDULED_RULE_HEADERS,
+        SCHEDULED_RULE_HEADERS,
+        migrate_tab2_rows_to_utc_schema,
+        parse_scheduled_rules_with_diagnostics,
+    )
+
+    rows = [
+        list(LEGACY_UTC_SCHEDULED_RULE_HEADERS),
+        ["SCHED-A", "a", "https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOpQrStUv", "05", "30", "1", "s@x.com", "ENABLED", ""],
+        ["SCHED-B", "b", "https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOpQrStUw", "18", "00", "1", "s@x.com", "PAUSED", ""],
+    ]
+    changed, migrated = migrate_tab2_rows_to_utc_schema(rows)
+    assert changed is True
+    assert migrated[0] == list(SCHEDULED_RULE_HEADERS)
+    assert migrated[1][3:5] == ["13", "30"]
+    assert migrated[2][3:5] == ["02", "00"]  # 18:00 UTC -> 02:00 SGT next day
+    changed_again, _ = migrate_tab2_rows_to_utc_schema(migrated)
+    assert changed_again is False
+    rules, errors = parse_scheduled_rules_with_diagnostics(migrated)
+    assert not errors and rules[0].timezone == "Asia/Singapore" and rules[0].trigger_time == "13:30"
+
+
+def test_portal_links_parsing_defaults_and_paused_rows() -> None:
+    from cctv_audit.prompt_manager import PORTAL_LINK_HEADERS, parse_portal_links_from_rows
+
+    defaults = parse_portal_links_from_rows([])
+    assert [l.link_id for l in defaults][:2] == ["LINK_GE", "LINK_DRIVE_ROOT"]
+    rows = [
+        list(PORTAL_LINK_HEADERS),
+        ["LINK_GE", "GE", "GE", "https://example.com/ge", "d", "ENABLED"],
+        ["LINK_X", "X", "X", "https://example.com/x", "d", "PAUSED"],
+        ["", "", "", "", "", ""],
+    ]
+    links = parse_portal_links_from_rows(rows)
+    assert [(l.link_id, l.enabled) for l in links] == [("LINK_GE", True), ("LINK_X", False)]

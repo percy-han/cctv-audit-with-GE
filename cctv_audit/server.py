@@ -124,7 +124,9 @@ from .review_audit_log import ReviewAuditLogError
 from .portal import (
     apply_portal_reviews,
     build_portal_url,
+    load_portal_home_payload,
     load_portal_payload,
+    render_portal_home_html,
     render_supervisor_portal_html,
     set_detected_base_url,
 )
@@ -1130,6 +1132,26 @@ async def supervisor_portal_page(request: Request) -> HTMLResponse:
     except ValueError:
         exp = 0
 
+    if not job_id and not batch_id:
+        # Unified portal homepage: quick-access links + filterable task list.
+        # HMAC mode (no verified identity): only expose it when explicitly enabled, because
+        # the homepage lists every task's signed review link.
+        if not viewer_email and not _portal_home_public_allowed():
+            return HTMLResponse(
+                content=(
+                    "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><title>Access Restricted</title></head>"
+                    "<body style='font-family:sans-serif;padding:48px;background:#FBF8F3;color:#1C1613;'>"
+                    "<h2>🔒 Portal Home Requires Sign-in (403)</h2>"
+                    "<p>Please open the IAP-protected portal URL, or reopen a review link from Google Chat.</p>"
+                    "</body></html>"
+                ),
+                status_code=403,
+            )
+        home = await load_portal_home_payload(
+            audit_service=audit_service, gateway=_gw, viewer_email=viewer_email
+        )
+        return HTMLResponse(content=render_portal_home_html(home), status_code=200)
+
     try:
         payload = await load_portal_payload(
             audit_service=audit_service,
@@ -1162,6 +1184,31 @@ async def supervisor_portal_page(request: Request) -> HTMLResponse:
             ),
             status_code=404,
         )
+
+
+def _portal_home_public_allowed() -> bool:
+    """HMAC mode only: the homepage (which lists signed review links for every task) is served
+    without a verified identity only when `PORTAL_HOME_PUBLIC=true` (local dev / trusted network)."""
+    return os.environ.get("PORTAL_HOME_PUBLIC", "").strip().lower() in ("1", "true", "yes")
+
+
+@app.get("/api/portal/home")
+async def supervisor_portal_home_api(request: Request) -> Any:
+    """JSON for the unified portal homepage (Tab5 quick links + aggregated task list)."""
+    _capture_external_base_url(request)
+    if not is_iap_mode() and portal_service_url():
+        return JSONResponse(status_code=403, content={"ok": False, "error": _PORTAL_MOVED_ERROR})
+    viewer_email, auth_err = _portal_viewer(request)
+    if auth_err is not None:
+        return JSONResponse(status_code=401, content={"ok": False, "error": auth_err})
+    if not viewer_email and not _portal_home_public_allowed():
+        return JSONResponse(
+            status_code=403,
+            content={"ok": False, "error": "Portal home requires the IAP-protected portal service."},
+        )
+    return await load_portal_home_payload(
+        audit_service=audit_service, gateway=_gw, viewer_email=viewer_email
+    )
 
 
 @app.get("/api/portal/data")

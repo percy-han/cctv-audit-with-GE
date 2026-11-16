@@ -323,6 +323,67 @@ class ScheduledStateStore:
     def eval_task_key(eval_task_id: str) -> str:
         return f"eval_tasks/{eval_task_id}.json"
 
+    def list_keys(self, prefix: str, *, limit: int = 200) -> List[str]:
+        """Lists object keys starting with `prefix` in the state store (memory, local_dir, or GCS)."""
+        clean_pfx = (prefix or "").lstrip("/")
+        if self._use_memory:
+            found: set[str] = {k for k in self._memory if k.startswith(clean_pfx)}
+            if self._local_dir is not None and self._local_dir.exists():
+                for p in self._local_dir.rglob("*.json"):
+                    rel = str(p.relative_to(self._local_dir)).replace("\\", "/")
+                    if rel.startswith(clean_pfx):
+                        found.add(rel)
+            return sorted(found, reverse=True)[:limit]
+
+        bkt = urllib.parse.quote(self._bucket_name, safe="")
+        pfx_q = urllib.parse.quote(clean_pfx, safe="")
+        list_url = (
+            f"https://storage.googleapis.com/storage/v1/b/{bkt}/o"
+            f"?prefix={pfx_q}&maxResults={int(limit)}&fields=items(name)"
+        )
+        status, body = self._request_gcs("GET", list_url, timeout=10.0)
+        if status >= 400:
+            return []
+        try:
+            doc = json.loads(body.decode("utf-8") or "{}")
+            items = [
+                str(it.get("name") or "")
+                for it in (doc.get("items") or [])
+                if str(it.get("name") or "").endswith(".json")
+            ]
+            items.sort(reverse=True)
+            return items[:limit]
+        except Exception:
+            return []
+
+    def list_eval_tasks(self, *, limit: int = 50) -> List[ScheduledEvalTaskRecord]:
+        """Loads recent `ScheduledEvalTaskRecord` entries from `eval_tasks/*.json` sorted by `created_at` desc."""
+        keys = self.list_keys("eval_tasks/", limit=limit)
+        records: List[ScheduledEvalTaskRecord] = []
+        for k in keys:
+            try:
+                raw, _ = self.read_text_with_generation(k)
+                if raw:
+                    records.append(ScheduledEvalTaskRecord.model_validate_json(raw))
+            except Exception as exc:
+                logger.debug("Skipping unreadable eval task record %s: %s", k, exc)
+        records.sort(key=lambda r: (r.created_at, r.updated_at), reverse=True)
+        return records[:limit]
+
+    def list_batches(self, *, limit: int = 50) -> List[ScheduledBatchRecord]:
+        """Loads recent `ScheduledBatchRecord` entries from `batches/*.json` sorted by `created_at` desc."""
+        keys = self.list_keys("batches/", limit=limit)
+        records: List[ScheduledBatchRecord] = []
+        for k in keys:
+            try:
+                raw, _ = self.read_text_with_generation(k)
+                if raw:
+                    records.append(ScheduledBatchRecord.model_validate_json(raw))
+            except Exception as exc:
+                logger.debug("Skipping unreadable batch record %s: %s", k, exc)
+        records.sort(key=lambda r: (r.created_at, r.updated_at), reverse=True)
+        return records[:limit]
+
 
 def is_rule_due(
     rule: ScheduledAuditRule,
@@ -1854,7 +1915,7 @@ class ScheduledAuditEngine:
                     else str(days_val)
                 )
                 no_vid_msg = (
-                    f"✅ Completed ({local_date} {rule.trigger_time}): "
+                    f"✅ Completed ({local_date} {rule.trigger_time} SGT): "
                     f"No new videos found in the past {days_str} day(s) ({int(rule.lookback_hours)}h) (0 Tokens used)"
                 )
                 await self.service.prompt_manager.update_scheduled_rule_status(
@@ -2014,7 +2075,7 @@ class ScheduledAuditEngine:
 
             total_vids = sum(t.video_count for t in store_tasks.values())
             running_msg = (
-                f"🔄 Running (Batch {batch_id}, triggered {local_date} {rule.trigger_time}): "
+                f"🔄 Running (Batch {batch_id}, triggered {local_date} {rule.trigger_time} SGT): "
                 f"{len(store_tasks)} store(s) / {total_vids} new video(s) auditing in background..."
             )
             await self.service.prompt_manager.update_scheduled_rule_status(
