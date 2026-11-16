@@ -1105,7 +1105,7 @@ def _fallback_rows_from_job(job: AuditJob) -> Tuple[List[List[Any]], List[List[A
 # so the unified `/portal` homepage can display `UNREVIEWED` / `IN_PROGRESS` / `COMPLETED` without
 # hitting Google Sheets on every refresh; invalidated immediately when `apply_portal_reviews` writes.
 _JOB_REVIEW_PROGRESS_CACHE: Dict[str, Tuple[float, int, int]] = {}
-_JOB_REVIEW_PROGRESS_TTL_SEC: float = 120.0
+_JOB_REVIEW_PROGRESS_TTL_SEC: float = 300.0
 _JOB_REVIEW_PROGRESS_MAX_ENTRIES: int = 2000
 
 
@@ -4587,8 +4587,12 @@ REVIEW_PROGRESS_UNKNOWN = "UNKNOWN"
 
 HOME_MAX_JOBS = 200
 HOME_MAX_EVAL_TASKS = 50
-HOME_MAX_SHEET_PROBES = 40
-HOME_SHEET_PROBE_CONCURRENCY = 6
+HOME_MAX_SHEET_PROBES = 15
+HOME_SHEET_PROBE_CONCURRENCY = 4
+HOME_LINKS_CACHE_TTL_SEC = 300.0
+HOME_EVAL_CACHE_TTL_SEC = 60.0
+_HOME_LINKS_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+_HOME_EVAL_CACHE: Dict[str, Tuple[float, List[Any]]] = {}
 
 
 def _fmt_epoch_sgt(ts: float) -> str:
@@ -4662,6 +4666,31 @@ def _job_sop_scope(job: AuditJob) -> str:
     return scope or config.default_prompt_version
 
 
+def _link_dict(item: Any) -> Dict[str, Any]:
+    return {
+        "link_id": item.link_id,
+        "title_zh": item.title_zh,
+        "title_en": item.title_en,
+        "target_url": item.target_url,
+        "description": item.description,
+    }
+
+
+async def _load_home_links(prompt_manager: Any) -> Tuple[List[Dict[str, Any]], bool]:
+    """Enabled Tab5 quick links as dicts, plus whether they came from the Sheet (False = defaults)."""
+    from .prompt_manager import parse_portal_links_from_rows
+
+    try:
+        if prompt_manager is not None and callable(getattr(prompt_manager, "load_portal_links", None)):
+            raw_links = await prompt_manager.load_portal_links()
+        else:
+            raw_links = parse_portal_links_from_rows([])
+        return [_link_dict(i) for i in raw_links if i.enabled], True
+    except Exception as exc:  # noqa: BLE001 - links are optional decoration
+        logger.warning("Homepage quick links unavailable, showing defaults: %s", exc)
+        return [_link_dict(i) for i in parse_portal_links_from_rows([]) if i.enabled], False
+
+
 async def load_portal_home_payload(
     *,
     audit_service: Any = None,
@@ -4691,44 +4720,29 @@ async def load_portal_home_payload(
 
         state_store = ScheduledStateStore()
 
-    # 1. Quick-access links (Tab5_Portal_Links).
+    t_start = time.monotonic()
+    timings: Dict[str, float] = {}
+
+    def _lap(name: str, since: float) -> float:
+        now_t = time.monotonic()
+        timings[name] = round(now_t - since, 3)
+        return now_t
+
+    # 1. Quick-access links (Tab5_Portal_Links), cached per Master Sheet for 5 minutes.
     links: List[Dict[str, Any]] = []
-    try:
-        if prompt_manager is not None and callable(getattr(prompt_manager, "load_portal_links", None)):
-            raw_links = await prompt_manager.load_portal_links()
-        else:
-            from .prompt_manager import parse_portal_links_from_rows
+    links_key = config.master_prompt_sheet_id or "-"
+    links_hit = _HOME_LINKS_CACHE.get(links_key)
+    if links_hit is not None and time.monotonic() - links_hit[0] < HOME_LINKS_CACHE_TTL_SEC:
+        links = [dict(x) for x in links_hit[1]]
+    else:
+        links, ok = await _load_home_links(prompt_manager)
+        if ok:
+            _HOME_LINKS_CACHE[links_key] = (time.monotonic(), [dict(x) for x in links])
 
-            raw_links = parse_portal_links_from_rows([])
-        for item in raw_links:
-            if not item.enabled:
-                continue
-            links.append(
-                {
-                    "link_id": item.link_id,
-                    "title_zh": item.title_zh,
-                    "title_en": item.title_en,
-                    "target_url": item.target_url,
-                    "description": item.description,
-                }
-            )
-    except Exception as exc:  # noqa: BLE001 - links are optional decoration
-        logger.warning("Homepage quick links unavailable, showing defaults: %s", exc)
-        from .prompt_manager import parse_portal_links_from_rows
+    t_mark = _lap("links", t_start)
 
-        links = [
-            {
-                "link_id": item.link_id,
-                "title_zh": item.title_zh,
-                "title_en": item.title_en,
-                "target_url": item.target_url,
-                "description": item.description,
-            }
-            for item in parse_portal_links_from_rows([])
-            if item.enabled
-        ]
-
-    # 2. Audit jobs (GE + scheduled).
+    # 2. Audit jobs (GE + scheduled). The job store only re-downloads job files whose GCS
+    #    generation changed since the last call, so steady-state cost is one GCS list request.
     jobs: List[AuditJob] = []
     if job_store is not None and callable(getattr(job_store, "list_all_jobs", None)):
         try:
@@ -4736,12 +4750,27 @@ async def load_portal_home_payload(
         except Exception as exc:  # noqa: BLE001
             logger.warning("Homepage job listing failed: %s", exc)
 
-    # 3. Golden-set evaluations.
+    t_mark = _lap("jobs", t_mark)
+
+    # 3. Golden-set evaluations (cached 60s: one list + up to 50 small JSON reads otherwise).
     eval_tasks: List[Any] = []
-    try:
-        eval_tasks = await asyncio.to_thread(state_store.list_eval_tasks, limit=HOME_MAX_EVAL_TASKS)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Homepage eval task listing failed: %s", exc)
+    # Production builds a fresh ScheduledStateStore per request, so key by the backing bucket
+    # (stable); only in-memory test stores fall back to object identity.
+    eval_key = (
+        f"gcs:{getattr(state_store, '_bucket_name', '')}"
+        if not getattr(state_store, "_use_memory", True) and getattr(state_store, "_bucket_name", "")
+        else f"obj:{id(state_store)}"
+    )
+    eval_hit = _HOME_EVAL_CACHE.get(eval_key)
+    if eval_hit is not None and time.monotonic() - eval_hit[0] < HOME_EVAL_CACHE_TTL_SEC:
+        eval_tasks = list(eval_hit[1])
+    else:
+        try:
+            eval_tasks = await asyncio.to_thread(state_store.list_eval_tasks, limit=HOME_MAX_EVAL_TASKS)
+            _HOME_EVAL_CACHE[eval_key] = (time.monotonic(), list(eval_tasks))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Homepage eval task listing failed: %s", exc)
+    t_mark = _lap("eval_tasks", t_mark)
 
     # 4. Per-viewer Drive visibility (IAP mode only).
     if viewer_email:
@@ -4754,6 +4783,7 @@ async def load_portal_home_payload(
         visibility = await filter_visible_stores(viewer_email, candidates, checker=drive_checker) if candidates else {}
         jobs = [j for j in jobs if visibility.get(f"job:{j.job_id}", (False, ""))[0]]
         eval_tasks = [t for t in eval_tasks if visibility.get(f"eval:{t.eval_task_id}", (False, ""))[0]]
+    t_mark = _lap("drive_acl", t_mark)
 
     # 5. Supervisor review progress (cache first, then a bounded number of live Sheet probes).
     now_mono = time.monotonic()
@@ -4782,6 +4812,9 @@ async def load_portal_home_payload(
                 counts[jid] = res
                 _remember_review_progress(jid, res[0], res[1])
 
+    t_mark = _lap("review_probe", t_mark)
+    probed = min(len(to_probe), max_sheet_probes) if gateway is not None else 0
+
     # 6. Rows.
     tasks: List[Dict[str, Any]] = []
     for j in jobs:
@@ -4797,6 +4830,7 @@ async def load_portal_home_payload(
                 "batch_id": j.batch_id or "",
                 "task_type": _job_task_type(j),
                 "folder_name": j.folder_name or (j.folder_id[:12] if j.folder_id else ""),
+                "folder_title": j.folder_name or j.folder_id or "",
                 "folder_url": _folder_url_for(j.folder_id),
                 "video_count": (
                     j.preflight_report.planned_segments_count
@@ -4829,7 +4863,8 @@ async def load_portal_home_payload(
                 "task_id": t.eval_task_id,
                 "batch_id": "",
                 "task_type": HOME_TASK_TYPE_GOLDEN,
-                "folder_name": t.eval_name or t.eval_id,
+                "folder_name": t.eval_id or t.eval_name,
+                "folder_title": t.eval_name or t.eval_id,
                 "folder_url": t.golden_videos_folder_url or _folder_url_for(t.golden_videos_folder_id),
                 "video_count": None,
                 "sop_scope": t.prompt_tab_name,
@@ -4851,6 +4886,15 @@ async def load_portal_home_payload(
             }
         )
     tasks.sort(key=lambda r: r["created_at"], reverse=True)
+    timings["total"] = round(time.monotonic() - t_start, 3)
+    logger.info(
+        "Portal home built: %d tasks (%d jobs, %d evals), %d sheet probes, timings=%s",
+        len(tasks),
+        len(jobs),
+        len(eval_tasks),
+        probed,
+        timings,
+    )
 
     return {
         "viewer_email": viewer_email,
@@ -4935,6 +4979,7 @@ _PORTAL_HOME_HTML_TEMPLATE = r"""<!DOCTYPE html>
   .acts { display:flex; flex-direction:column; gap:6px; }
   .empty { padding:48px; text-align:center; color:var(--ink-500); }
   .err { color:var(--red); font-size:11.5px; margin-top:3px; }
+  .fname { display:inline-block; max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:bottom; }
 </style>
 </head>
 <body>
@@ -5137,7 +5182,9 @@ function render() {
     return '<tr>'
       + '<td><div class="mono"><b>' + esc(t.task_id) + '</b></div>' + (t.batch_id ? '<div class="muted mono">' + tr("Batch ", "批次 ") + esc(t.batch_id) + '</div>' : '') + '</td>'
       + '<td><span class="tag ' + (TYPE_CLS[t.task_type] || "t-sch") + '">' + esc((TYPE_LABEL[t.task_type] || (() => t.task_type))()) + '</span></td>'
-      + '<td>' + (folder ? '<a href="' + esc(folder) + '" target="_blank" rel="noopener">' + esc(t.folder_name || "—") + ' ↗</a>' : esc(t.folder_name || "—")) + '</td>'
+      + '<td>' + (folder
+          ? '<a href="' + esc(folder) + '" target="_blank" rel="noopener" title="' + esc(t.folder_title || t.folder_name || "") + '"><span class="fname">' + esc(t.folder_name || "—") + '</span> ↗</a>'
+          : '<span class="fname" title="' + esc(t.folder_title || t.folder_name || "") + '">' + esc(t.folder_name || "—") + '</span>') + '</td>'
       + '<td class="mono">' + (t.video_count === null || t.video_count === undefined ? "—" : esc(t.video_count) + tr(" clips", " 段")) + '</td>'
       + '<td><div>' + esc(t.sop_scope || "—") + '</div><div class="muted mono">' + esc(t.model_version || "") + '</div></td>'
       + '<td><span class="tag ' + stateCls(t.state) + '">' + esc(stateLabel(t.state)) + '</span></td>'
