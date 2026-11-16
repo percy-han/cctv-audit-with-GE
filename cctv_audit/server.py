@@ -125,6 +125,7 @@ from .portal import (
     apply_portal_reviews,
     build_portal_url,
     load_portal_home_payload,
+    load_portal_home_review_status,
     load_portal_payload,
     render_portal_home_html,
     render_supervisor_portal_html,
@@ -1194,7 +1195,7 @@ def _portal_home_public_allowed() -> bool:
 
 @app.get("/api/portal/home")
 async def supervisor_portal_home_api(request: Request) -> Any:
-    """JSON for the unified portal homepage (Tab5 quick links + aggregated task list)."""
+    """JSON for the unified portal homepage (quick links + aggregated task list)."""
     _capture_external_base_url(request)
     if not is_iap_mode() and portal_service_url():
         return JSONResponse(status_code=403, content={"ok": False, "error": _PORTAL_MOVED_ERROR})
@@ -1208,6 +1209,25 @@ async def supervisor_portal_home_api(request: Request) -> Any:
         )
     return await load_portal_home_payload(
         audit_service=audit_service, gateway=_gw, viewer_email=viewer_email
+    )
+
+
+@app.get("/api/portal/home/review-status")
+async def supervisor_portal_home_review_status_api(request: Request) -> Any:
+    """Live supervisor review progress for the homepage rows on the current page (max 20 ids)."""
+    if not is_iap_mode() and portal_service_url():
+        return JSONResponse(status_code=403, content={"ok": False, "error": _PORTAL_MOVED_ERROR})
+    viewer_email, auth_err = _portal_viewer(request)
+    if auth_err is not None:
+        return JSONResponse(status_code=401, content={"ok": False, "error": auth_err})
+    if not viewer_email and not _portal_home_public_allowed():
+        return JSONResponse(
+            status_code=403,
+            content={"ok": False, "error": "Portal home requires the IAP-protected portal service."},
+        )
+    ids = [x for x in (_query_param(request, "ids") or "").split(",") if x.strip()]
+    return await load_portal_home_review_status(
+        job_ids=ids, audit_service=audit_service, gateway=_gw, viewer_email=viewer_email
     )
 
 

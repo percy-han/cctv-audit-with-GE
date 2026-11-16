@@ -194,7 +194,6 @@ class _FakeSheetsService:
                 {"properties": {"title": TAB2, "sheetId": 20}},
                 {"properties": {"title": TAB3, "sheetId": 30}},
                 {"properties": {"title": TAB4, "sheetId": 40}},
-                {"properties": {"title": "Tab5_Portal_Links", "sheetId": 50}},
             ]
         }
 

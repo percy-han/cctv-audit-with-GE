@@ -1122,6 +1122,43 @@ def _remember_review_progress(job_id: str, reviewed: int, total: int) -> None:
                 _JOB_REVIEW_PROGRESS_CACHE.pop(key, None)
 
 
+async def _record_review_progress_after_write(
+    *,
+    job_store: Any,
+    job: AuditJob,
+    tab1_rows: Sequence[Sequence[Any]],
+    applied_updates: List[Dict[str, str]],
+) -> None:
+    """Best-effort: stores `(reviewed, total)` on the job so the homepage shows review progress without
+    reading the report Sheet. Never raises; a failure only means the homepage reads the Sheet later."""
+    try:
+        from .gcs_gateway import match_and_apply_tab1_reviews
+
+        updated_rows, _ = match_and_apply_tab1_reviews([list(r) for r in tab1_rows], applied_updates)
+        rows = [r for r in updated_rows if len(r) > 0 and str(r[0]).strip() == job.job_id] or list(updated_rows)
+        total = len(rows)
+        reviewed = sum(
+            1 for r in rows if map_sheet_status_to_portal_code(str(r[9]) if len(r) > 9 else "") != "PENDING"
+        )
+        _remember_review_progress(job.job_id, reviewed, total)
+        if job_store is None or not callable(getattr(job_store, "get", None)):
+            return
+        stored = await job_store.get(job.user_id, job.job_id)
+        if stored is None:
+            return
+        await job_store.save(
+            stored.model_copy(
+                update={
+                    "review_reviewed_count": reviewed,
+                    "review_total_count": total,
+                    "review_counts_updated_at": time.time(),
+                }
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - progress is a display hint only
+        logger.debug("Could not record review progress for %s: %s", job.job_id, exc)
+
+
 def _attach_review_history_to_findings(
     findings: List[Dict[str, Any]],
     audit_records: Sequence[Dict[str, Any]],
@@ -1705,6 +1742,12 @@ async def apply_portal_reviews(
                 logger.error("Could not write sheet_write_failed audit records: %s", follow_exc)
         raise
     _JOB_REVIEW_PROGRESS_CACHE.pop(target_job.job_id, None)
+    await _record_review_progress_after_write(
+        job_store=job_store,
+        job=target_job,
+        tab1_rows=current_tab1 or [],
+        applied_updates=changed_updates,
+    )
     return {
         "ok": True,
         "updated_count": updated_count,
@@ -4589,9 +4632,8 @@ HOME_MAX_JOBS = 200
 HOME_MAX_EVAL_TASKS = 50
 HOME_MAX_SHEET_PROBES = 15
 HOME_SHEET_PROBE_CONCURRENCY = 4
-HOME_LINKS_CACHE_TTL_SEC = 300.0
 HOME_EVAL_CACHE_TTL_SEC = 60.0
-_HOME_LINKS_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+HOME_REVIEW_STATUS_MAX_IDS = 20
 _HOME_EVAL_CACHE: Dict[str, Tuple[float, List[Any]]] = {}
 
 
@@ -4666,29 +4708,50 @@ def _job_sop_scope(job: AuditJob) -> str:
     return scope or config.default_prompt_version
 
 
-def _link_dict(item: Any) -> Dict[str, Any]:
-    return {
-        "link_id": item.link_id,
-        "title_zh": item.title_zh,
-        "title_en": item.title_en,
-        "target_url": item.target_url,
-        "description": item.description,
-    }
+def load_home_quick_links() -> List[Dict[str, Any]]:
+    """Quick-access launchpad links from Terraform `portal_quick_links` (env `PORTAL_QUICK_LINKS_JSON`).
 
-
-async def _load_home_links(prompt_manager: Any) -> Tuple[List[Dict[str, Any]], bool]:
-    """Enabled Tab5 quick links as dicts, plus whether they came from the Sheet (False = defaults)."""
-    from .prompt_manager import parse_portal_links_from_rows
-
-    try:
-        if prompt_manager is not None and callable(getattr(prompt_manager, "load_portal_links", None)):
-            raw_links = await prompt_manager.load_portal_links()
-        else:
-            raw_links = parse_portal_links_from_rows([])
-        return [_link_dict(i) for i in raw_links if i.enabled], True
-    except Exception as exc:  # noqa: BLE001 - links are optional decoration
-        logger.warning("Homepage quick links unavailable, showing defaults: %s", exc)
-        return [_link_dict(i) for i in parse_portal_links_from_rows([]) if i.enabled], False
+    Zero I/O: nothing is read from Google Sheets. A "Master SOP Control Sheet" button is appended
+    automatically from `MASTER_PROMPT_SHEET_ID` unless a configured link already points at it.
+    Malformed JSON or entries without an http(s) URL are skipped with a warning.
+    """
+    links: List[Dict[str, Any]] = []
+    raw = os.environ.get("PORTAL_QUICK_LINKS_JSON", "").strip()
+    if raw:
+        try:
+            items = json.loads(raw)
+        except ValueError as exc:
+            logger.warning("PORTAL_QUICK_LINKS_JSON is not valid JSON (%s); no configured quick links shown", exc)
+            items = []
+        for idx, item in enumerate(items if isinstance(items, list) else []):
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()
+            if not url.lower().startswith(("https://", "http://")):
+                logger.warning("Skipping portal quick link #%d without an http(s) url", idx + 1)
+                continue
+            title_en = str(item.get("title_en") or item.get("title_zh") or url).strip()
+            links.append(
+                {
+                    "link_id": str(item.get("id") or f"link_{idx + 1}").strip(),
+                    "title_zh": str(item.get("title_zh") or title_en).strip(),
+                    "title_en": title_en,
+                    "target_url": url,
+                    "description": str(item.get("description") or "").strip(),
+                }
+            )
+    sheet_id = (config.master_prompt_sheet_id or "").strip()
+    if sheet_id and not sheet_id.startswith("gs://") and not any(sheet_id in l["target_url"] for l in links):
+        links.append(
+            {
+                "link_id": "sop_sheet",
+                "title_zh": "⚙️ SOP 与定时任务总控表",
+                "title_en": "⚙️ Master SOP Control Sheet",
+                "target_url": f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit",
+                "description": "SOP rules, scheduled inspections (Tab2) and golden-set evaluations (Tab3)",
+            }
+        )
+    return links
 
 
 async def load_portal_home_payload(
@@ -4699,10 +4762,8 @@ async def load_portal_home_payload(
     gateway: Any = None,
     viewer_email: str = "",
     drive_checker: Optional[DriveAccessChecker] = None,
-    prompt_manager: Any = None,
-    max_sheet_probes: int = HOME_MAX_SHEET_PROBES,
 ) -> Dict[str, Any]:
-    """Builds the unified `/portal` homepage payload: Tab5 quick links + the aggregated task list.
+    """Builds the unified `/portal` homepage payload: quick links (Terraform) + the aggregated task list.
 
     Task list = interactive GE audits + scheduled-inspection store jobs (`AuditJob`) + golden-set
     evaluations (`ScheduledEvalTaskRecord`), newest `created_at` first. In `PORTAL_MODE=iap`
@@ -4713,8 +4774,6 @@ async def load_portal_home_payload(
             job_store = getattr(audit_service, "jobs", None)
         if state_store is None:
             state_store = getattr(audit_service, "state_store", None)
-        if prompt_manager is None:
-            prompt_manager = getattr(audit_service, "prompt_manager", None)
     if state_store is None:
         from .scheduled_auditor import ScheduledStateStore
 
@@ -4728,16 +4787,8 @@ async def load_portal_home_payload(
         timings[name] = round(now_t - since, 3)
         return now_t
 
-    # 1. Quick-access links (Tab5_Portal_Links), cached per Master Sheet for 5 minutes.
-    links: List[Dict[str, Any]] = []
-    links_key = config.master_prompt_sheet_id or "-"
-    links_hit = _HOME_LINKS_CACHE.get(links_key)
-    if links_hit is not None and time.monotonic() - links_hit[0] < HOME_LINKS_CACHE_TTL_SEC:
-        links = [dict(x) for x in links_hit[1]]
-    else:
-        links, ok = await _load_home_links(prompt_manager)
-        if ok:
-            _HOME_LINKS_CACHE[links_key] = (time.monotonic(), [dict(x) for x in links])
+    # 1. Quick-access links (Terraform `portal_quick_links`; no Sheet reads).
+    links = load_home_quick_links()
 
     t_mark = _lap("links", t_start)
 
@@ -4785,35 +4836,27 @@ async def load_portal_home_payload(
         eval_tasks = [t for t in eval_tasks if visibility.get(f"eval:{t.eval_task_id}", (False, ""))[0]]
     t_mark = _lap("drive_acl", t_mark)
 
-    # 5. Supervisor review progress (cache first, then a bounded number of live Sheet probes).
+    # 5. Supervisor review progress: in-process cache, else the counts the portal recorded on the
+    #    job at review time. No Sheet is read here; the page fetches the rest asynchronously
+    #    (`/api/portal/home/review-status`, current page only).
     now_mono = time.monotonic()
     counts: Dict[str, Tuple[int, int]] = {}
-    to_probe: List[AuditJob] = []
+    sources: Dict[str, str] = {}
     for j in jobs:
         if j.state.value.upper() != "DONE":
             continue
         if int(j.violations_found or 0) == 0 and not j.report_sheet_url:
             counts[j.job_id] = (0, 0)
+            sources[j.job_id] = "final"
             continue
         hit = _JOB_REVIEW_PROGRESS_CACHE.get(j.job_id)
         if hit is not None and now_mono - hit[0] < _JOB_REVIEW_PROGRESS_TTL_SEC:
             counts[j.job_id] = (hit[1], hit[2])
-        elif j.report_sheet_url:
-            to_probe.append(j)
-    if to_probe and gateway is not None and max_sheet_probes > 0:
-        sem = asyncio.Semaphore(HOME_SHEET_PROBE_CONCURRENCY)
-
-        async def _probe(job: AuditJob) -> Tuple[str, Optional[Tuple[int, int]]]:
-            async with sem:
-                return job.job_id, await _probe_review_counts(gateway, job)
-
-        for jid, res in await asyncio.gather(*(_probe(j) for j in to_probe[:max_sheet_probes])):
-            if res is not None:
-                counts[jid] = res
-                _remember_review_progress(jid, res[0], res[1])
-
-    t_mark = _lap("review_probe", t_mark)
-    probed = min(len(to_probe), max_sheet_probes) if gateway is not None else 0
+            sources[j.job_id] = "live"
+        elif int(getattr(j, "review_total_count", -1)) >= 0:
+            counts[j.job_id] = (int(j.review_reviewed_count), int(j.review_total_count))
+            sources[j.job_id] = "recorded"
+    t_mark = _lap("review_status", t_mark)
 
     # 6. Rows.
     tasks: List[Dict[str, Any]] = []
@@ -4843,6 +4886,7 @@ async def load_portal_home_payload(
                 "violations_found": int(j.violations_found or 0),
                 "result_text": "",
                 "review_progress_status": compute_review_progress_status(state, reviewed, total),
+                "review_source": sources.get(j.job_id, "none"),
                 "reviewed_count": reviewed,
                 "findings_total": total,
                 "initiator": j.user_id or "",
@@ -4873,6 +4917,7 @@ async def load_portal_home_payload(
                 "violations_found": None,
                 "result_text": (t.summary_text or t.error_message or "")[:300],
                 "review_progress_status": REVIEW_PROGRESS_NA,
+                "review_source": "final",
                 "reviewed_count": None,
                 "findings_total": None,
                 "initiator": t.supervisor_email or "",
@@ -4888,11 +4933,10 @@ async def load_portal_home_payload(
     tasks.sort(key=lambda r: r["created_at"], reverse=True)
     timings["total"] = round(time.monotonic() - t_start, 3)
     logger.info(
-        "Portal home built: %d tasks (%d jobs, %d evals), %d sheet probes, timings=%s",
+        "Portal home built: %d tasks (%d jobs, %d evals), timings=%s",
         len(tasks),
         len(jobs),
         len(eval_tasks),
-        probed,
         timings,
     )
 
@@ -4903,6 +4947,86 @@ async def load_portal_home_payload(
         "links": links,
         "tasks": tasks,
     }
+
+
+async def load_portal_home_review_status(
+    *,
+    job_ids: Sequence[str],
+    audit_service: Any = None,
+    job_store: Any = None,
+    gateway: Any = None,
+    viewer_email: str = "",
+    drive_checker: Optional[DriveAccessChecker] = None,
+) -> Dict[str, Any]:
+    """Live supervisor review progress for up to `HOME_REVIEW_STATUS_MAX_IDS` homepage rows.
+
+    Called by the homepage for the rows on the current page only. Each job not in the 5-minute
+    cache costs one report-Sheet read (bounded concurrency). In IAP mode, jobs the viewer cannot
+    open in Drive are silently omitted.
+    """
+    if audit_service is not None and job_store is None:
+        job_store = getattr(audit_service, "jobs", None)
+    wanted = list(dict.fromkeys(str(j).strip() for j in job_ids if str(j).strip()))[:HOME_REVIEW_STATUS_MAX_IDS]
+    if not wanted or job_store is None:
+        return {"statuses": {}}
+    jobs: Dict[str, AuditJob] = {}
+    for jid in wanted:
+        try:
+            job = await job_store.get_by_job_id(jid)
+        except Exception:  # noqa: BLE001
+            job = None
+        if job is not None:
+            jobs[jid] = job
+    if viewer_email and jobs:
+        visibility = await filter_visible_stores(
+            viewer_email,
+            [(jid, j.report_sheet_url or "", j.folder_id) for jid, j in jobs.items()],
+            checker=drive_checker,
+        )
+        jobs = {jid: j for jid, j in jobs.items() if visibility.get(jid, (False, ""))[0]}
+
+    now_mono = time.monotonic()
+    results: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
+    to_probe: List[AuditJob] = []
+    for jid, j in jobs.items():
+        if j.state.value.upper() != "DONE":
+            results[jid] = (None, None)
+            continue
+        if int(j.violations_found or 0) == 0 and not j.report_sheet_url:
+            results[jid] = (0, 0)
+            continue
+        hit = _JOB_REVIEW_PROGRESS_CACHE.get(jid)
+        if hit is not None and now_mono - hit[0] < _JOB_REVIEW_PROGRESS_TTL_SEC:
+            results[jid] = (hit[1], hit[2])
+        else:
+            to_probe.append(j)
+    if to_probe and gateway is not None:
+        sem = asyncio.Semaphore(HOME_SHEET_PROBE_CONCURRENCY)
+
+        async def _probe(job: AuditJob) -> Tuple[str, Optional[Tuple[int, int]]]:
+            async with sem:
+                return job.job_id, await _probe_review_counts(gateway, job)
+
+        for jid, res in await asyncio.gather(*(_probe(j) for j in to_probe)):
+            if res is not None:
+                _remember_review_progress(jid, res[0], res[1])
+                results[jid] = res
+            else:
+                j = jobs[jid]
+                if int(getattr(j, "review_total_count", -1)) >= 0:
+                    results[jid] = (int(j.review_reviewed_count), int(j.review_total_count))
+                else:
+                    results[jid] = (None, None)
+    statuses: Dict[str, Dict[str, Any]] = {}
+    for jid, (reviewed, total) in results.items():
+        statuses[jid] = {
+            "review_progress_status": compute_review_progress_status(
+                jobs[jid].state.value.upper(), reviewed, total
+            ),
+            "reviewed_count": reviewed,
+            "findings_total": total,
+        }
+    return {"statuses": statuses}
 
 
 _PORTAL_HOME_HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -4979,6 +5103,8 @@ _PORTAL_HOME_HTML_TEMPLATE = r"""<!DOCTYPE html>
   .acts { display:flex; flex-direction:column; gap:6px; }
   .empty { padding:48px; text-align:center; color:var(--ink-500); }
   .err { color:var(--red); font-size:11.5px; margin-top:3px; }
+  .pager { display:flex; align-items:center; justify-content:flex-end; gap:10px; padding:12px 16px; }
+  .pager .btn[disabled] { opacity:.4; cursor:default; }
   .fname { display:inline-block; max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:bottom; }
 </style>
 </head>
@@ -5001,7 +5127,7 @@ _PORTAL_HOME_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <main class="wrap" style="padding-bottom:48px">
   <section>
-    <h2><span id="sec-links">Quick-Access Launchpad</span><span class="hint" id="sec-links-hint">Configured in Master SOP Sheet · Tab5_Portal_Links</span></h2>
+    <h2><span id="sec-links">Quick-Access Launchpad</span><span class="hint" id="sec-links-hint">Configured at deployment (Terraform portal_quick_links)</span></h2>
     <div class="links" id="links"></div>
   </section>
 
@@ -5009,16 +5135,16 @@ _PORTAL_HOME_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <h2><span id="sec-tasks">Store Audit &amp; Review Task List</span><span class="hint" id="sec-tasks-hint">Newest first · times in Singapore Time (SGT, UTC+8)</span></h2>
     <div class="panel">
       <div class="filters">
-        <select id="f-type" onchange="render()"></select>
-        <select id="f-store" onchange="render()"></select>
-        <select id="f-sop" onchange="render()"></select>
-        <select id="f-state" onchange="render()"></select>
-        <select id="f-review" onchange="render()"></select>
-        <select id="f-init" onchange="render()"></select>
-        <label class="chk"><input type="checkbox" id="f-mine" onchange="render()" /> <span id="lbl-mine">Only Mine</span></label>
-        <input type="date" id="f-from" onchange="render()" />
-        <input type="date" id="f-to" onchange="render()" />
-        <input type="search" id="f-q" oninput="render()" />
+        <select id="f-type" onchange="onFilter()"></select>
+        <select id="f-store" onchange="onFilter()"></select>
+        <select id="f-sop" onchange="onFilter()"></select>
+        <select id="f-state" onchange="onFilter()"></select>
+        <select id="f-review" onchange="onFilter()"></select>
+        <select id="f-init" onchange="onFilter()"></select>
+        <label class="chk"><input type="checkbox" id="f-mine" onchange="onFilter()" /> <span id="lbl-mine">Only Mine</span></label>
+        <input type="date" id="f-from" onchange="onFilter()" />
+        <input type="date" id="f-to" onchange="onFilter()" />
+        <input type="search" id="f-q" oninput="onFilter()" />
         <button class="btn" id="btn-reset" onclick="resetFilters()">Reset</button>
         <span class="count" id="count"></span>
       </div>
@@ -5026,6 +5152,11 @@ _PORTAL_HOME_HTML_TEMPLATE = r"""<!DOCTYPE html>
         <thead><tr id="thead"></tr></thead>
         <tbody id="tbody"></tbody>
       </table></div>
+      <div class="pager">
+        <button class="btn" id="pg-prev" onclick="gotoPage(page - 1)">‹</button>
+        <span id="pg-info" class="muted"></span>
+        <button class="btn" id="pg-next" onclick="gotoPage(page + 1)">›</button>
+      </div>
     </div>
   </section>
 </main>
@@ -5070,7 +5201,7 @@ const REVIEW_LABEL = {
   UNREVIEWED: () => tr("🔴 Unreviewed", "🔴 未复核"),
   IN_PROGRESS: () => tr("🟡 In Review", "🟡 复核中"),
   COMPLETED: () => tr("🟢 Review Done", "🟢 复核完成"),
-  UNKNOWN: () => tr("… Open to load", "… 进入后统计"),
+  UNKNOWN: () => tr("⏳ Loading…", "⏳ 加载中…"),
   NA: () => "—"
 };
 const REVIEW_CLS = { UNREVIEWED: "r-un", IN_PROGRESS: "r-ip", COMPLETED: "r-ok", UNKNOWN: "r-na", NA: "r-na" };
@@ -5102,7 +5233,7 @@ function applyLang() {
   set("btn-lang", isZh() ? "🌐 中文 | EN" : "🌐 EN | 中文", isZh() ? "🌐 中文 | EN" : "🌐 EN | 中文");
   set("btn-refresh", "🔄 Refresh", "🔄 刷新");
   set("sec-links", "Quick-Access Launchpad", "快捷入口工作台");
-  set("sec-links-hint", "Configured in Master SOP Sheet · Tab5_Portal_Links", "在 SOP 总控表 Tab5_Portal_Links 中配置");
+  set("sec-links-hint", "Configured at deployment (Terraform portal_quick_links)", "部署时在配置文件 portal_quick_links 中设置");
   set("sec-tasks", "Store Audit & Review Task List", "门店稽核与复核任务列表");
   set("sec-tasks-hint", "Newest first · times in Singapore Time (SGT, UTC+8)", "按发起时间倒序 · 时间为新加坡时间（SGT, UTC+8）");
   set("lbl-mine", "Only Mine", "只看我的");
@@ -5127,7 +5258,6 @@ function renderLinks() {
     return '<a class="lcard' + (url ? '' : ' disabled') + '" href="' + esc(url || "#") + '" target="_blank" rel="noopener">'
       + '<span class="lt">' + esc(title) + '</span>'
       + '<span class="ld">' + esc(l.description || "") + '</span>'
-      + (url ? '' : '<span class="lmiss">' + tr("Link not configured yet — fill Target_URL in Tab5_Portal_Links", "尚未配置链接，请在 Tab5_Portal_Links 填写 Target_URL") + '</span>')
       + '</a>';
   }).join("") : '<div class="muted">' + tr("No quick links configured.", "暂未配置快捷入口。") + '</div>';
 }
@@ -5173,11 +5303,18 @@ function render() {
   const rows = (DATA.tasks || []).filter(matches);
   document.getElementById("count").textContent = tr(rows.length + " task(s)", "共 " + rows.length + " 个任务");
   const tb = document.getElementById("tbody");
+  const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+  if (page > pages) page = pages;
+  if (page < 1) page = 1;
+  document.getElementById("pg-info").textContent = tr("Page " + page + " / " + pages, "第 " + page + " / " + pages + " 页");
+  document.getElementById("pg-prev").disabled = page <= 1;
+  document.getElementById("pg-next").disabled = page >= pages;
   if (!rows.length) {
     tb.innerHTML = '<tr><td colspan="11"><div class="empty">' + tr("No tasks match the current filters.", "当前筛选条件下没有任务。") + '</div></td></tr>';
     return;
   }
-  tb.innerHTML = rows.map(t => {
+  const pageRows = rows.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  tb.innerHTML = pageRows.map(t => {
     const portal = safeUrl(t.portal_url), sheet = safeUrl(t.sheet_url), folder = safeUrl(t.folder_url);
     return '<tr>'
       + '<td><div class="mono"><b>' + esc(t.task_id) + '</b></div>' + (t.batch_id ? '<div class="muted mono">' + tr("Batch ", "批次 ") + esc(t.batch_id) + '</div>' : '') + '</td>'
@@ -5189,7 +5326,7 @@ function render() {
       + '<td><div>' + esc(t.sop_scope || "—") + '</div><div class="muted mono">' + esc(t.model_version || "") + '</div></td>'
       + '<td><span class="tag ' + stateCls(t.state) + '">' + esc(stateLabel(t.state)) + '</span></td>'
       + '<td>' + resultCell(t) + '</td>'
-      + '<td>' + reviewCell(t) + '</td>'
+      + '<td id="rv-' + esc(t.task_id) + '">' + reviewCell(t) + '</td>'
       + '<td class="mono">' + esc(t.initiator || "—") + '</td>'
       + '<td class="mono"><div>' + esc(t.created_at_sgt || "—") + '</div><div class="muted">' + esc(t.completed_at_sgt || "—") + '</div></td>'
       + '<td><div class="acts">'
@@ -5198,11 +5335,48 @@ function render() {
       + '</div></td>'
       + '</tr>';
   }).join("");
+  loadReviewStatus(pageRows);
 }
+
+/* Supervisor review status is filled in asynchronously for the rows on the current page only:
+   the table renders immediately, then each cell updates in place when the server answers. */
+const PAGE_SIZE = 20;
+let page = 1;
+const reviewLoaded = new Set();
+function gotoPage(p) { page = p; render(); window.scrollTo({ top: document.getElementById("thead").offsetTop - 80, behavior: "smooth" }); }
+async function loadReviewStatus(pageRows) {
+  const ids = pageRows
+    .filter(t => t.task_type !== "GOLDEN_EVAL" && t.state === "DONE" && t.review_source !== "final"
+                 && t.review_source !== "live" && !reviewLoaded.has(t.task_id))
+    .map(t => t.task_id);
+  if (!ids.length) return;
+  ids.forEach(id => reviewLoaded.add(id));
+  try {
+    const resp = await fetch("/api/portal/home/review-status?ids=" + encodeURIComponent(ids.join(",")), { cache: "no-store" });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const res = await resp.json();
+    const st = (res && res.statuses) || {};
+    (DATA.tasks || []).forEach(t => {
+      const v = st[t.task_id];
+      if (!v) return;
+      t.review_progress_status = v.review_progress_status;
+      t.reviewed_count = v.reviewed_count;
+      t.findings_total = v.findings_total;
+      t.review_source = "live";
+      const cell = document.getElementById("rv-" + t.task_id);
+      if (cell) cell.innerHTML = reviewCell(t);
+    });
+  } catch (e) {
+    ids.forEach(id => reviewLoaded.delete(id));
+  }
+}
+
+function onFilter() { page = 1; render(); }
 
 function resetFilters() {
   ["f-type", "f-store", "f-sop", "f-state", "f-review", "f-init", "f-from", "f-to", "f-q"].forEach(id => document.getElementById(id).value = "");
   document.getElementById("f-mine").checked = false;
+  page = 1;
   render();
 }
 
@@ -5217,6 +5391,7 @@ async function refreshData() {
     const resp = await fetch("/api/portal/home", { cache: "no-store" });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     DATA = await resp.json();
+    reviewLoaded.clear();
     applyLang(); buildFilters(); renderLinks(); render();
   } catch (e) { location.reload(); }
 }

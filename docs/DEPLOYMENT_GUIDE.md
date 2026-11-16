@@ -406,7 +406,7 @@ terraform output gemini_enterprise_console_url
 
 | 输出名 | 用途 |
 | :--- | :--- |
-| `portal_url` | Dashboard 地址 `https://<p>-portal-<项目号>.<region>.run.app` |
+| `portal_url` | Dashboard 地址 `https://<p>-portal-<项目号>.<region>.run.app`；**统一入口首页 = `<portal_url>/portal`**（快捷入口按钮 + 全部稽核任务列表，按钮在 `<env>.tfvars` 的 `portal_quick_links` 里配置，见 `example.tfvars`，不配只显示「SOP 总控表」按钮） |
 | `cloud_run_worker_pool_url` | worker 地址 |
 | `workspace_dwd_client_id` | DWD 授权要填的 Client ID |
 | `workspace_dwd_scopes` | DWD 授权要填的 OAuth 范围（逗号分隔，原样粘贴） |

@@ -879,19 +879,47 @@ def test_portal_home_payload_lists_tasks_newest_first_with_review_status(tmp_pat
     )
     state._memory[state.eval_task_key("ev-1")] = rec.model_dump_json()  # type: ignore[attr-defined]
 
-    payload = asyncio.run(load_portal_home_payload(job_store=store, state_store=state, gateway=_Gw()))
+    from cctv_audit import portal as portal_mod
+    from cctv_audit.portal import REVIEW_PROGRESS_UNKNOWN, load_portal_home_review_status
+
+    portal_mod._JOB_REVIEW_PROGRESS_CACHE.clear()
+
+    class _CountingGw(_Gw):
+        calls = 0
+
+        async def read_report_sheet_data(self, folder_id: str, sheet: str):
+            _CountingGw.calls += 1
+            return await super().read_report_sheet_data(folder_id, sheet)
+
+    gw = _CountingGw()
+    payload = asyncio.run(load_portal_home_payload(job_store=store, state_store=state, gateway=gw))
+    assert _CountingGw.calls == 0  # the homepage itself never reads report Sheets
     ids = [t["task_id"] for t in payload["tasks"]]
     assert ids == ["ev-1", "ru0003", "sc0002", "ge0001", "cl0004"]
     by_id = {t["task_id"]: t for t in payload["tasks"]}
-    assert by_id["ge0001"]["review_progress_status"] == REVIEW_PROGRESS_UNREVIEWED
-    assert by_id["sc0002"]["review_progress_status"] == REVIEW_PROGRESS_IN_PROGRESS
+    assert by_id["ge0001"]["review_progress_status"] == REVIEW_PROGRESS_UNKNOWN
     assert by_id["cl0004"]["review_progress_status"] == REVIEW_PROGRESS_COMPLETED
+
+    live = asyncio.run(
+        load_portal_home_review_status(job_ids=["ge0001", "sc0002", "ru0003", "nope"], job_store=store, gateway=gw)
+    )["statuses"]
+    assert live["ge0001"]["review_progress_status"] == REVIEW_PROGRESS_UNREVIEWED
+    assert live["sc0002"]["review_progress_status"] == REVIEW_PROGRESS_IN_PROGRESS
+    assert live["sc0002"]["reviewed_count"] == 1 and live["sc0002"]["findings_total"] == 2
+    assert live["ru0003"]["review_progress_status"] == REVIEW_PROGRESS_NA
+    assert "nope" not in live
+    assert _CountingGw.calls == 2
+    # Second call is served from the 5-minute cache, and the homepage now shows it directly.
+    asyncio.run(load_portal_home_review_status(job_ids=["ge0001", "sc0002"], job_store=store, gateway=gw))
+    assert _CountingGw.calls == 2
+    payload2 = asyncio.run(load_portal_home_payload(job_store=store, state_store=state, gateway=gw))
+    assert {t["task_id"]: t["review_progress_status"] for t in payload2["tasks"]}["sc0002"] == REVIEW_PROGRESS_IN_PROGRESS
     assert by_id["ru0003"]["review_progress_status"] == REVIEW_PROGRESS_NA
     assert by_id["ev-1"]["task_type"] == "GOLDEN_EVAL" and by_id["ev-1"]["result_text"] == "Recall 90%"
     assert by_id["sc0002"]["task_type"] == "SCHEDULED" and "batch=batch-1" in by_id["sc0002"]["portal_url"]
     assert by_id["ge0001"]["task_type"] == "GE" and by_id["ge0001"]["portal_url"].startswith("/portal?job=ge0001")
     assert by_id["ge0001"]["created_at_sgt"].endswith("SGT")
-    assert payload["links"] and payload["links"][0]["link_id"] == "LINK_GE"
+    assert all(l["target_url"].startswith("https://") for l in payload["links"])
 
 
 def test_portal_home_payload_filters_by_drive_access_in_iap_mode(tmp_path: Path) -> None:
@@ -920,3 +948,53 @@ def test_portal_home_routes(monkeypatch: pytest.MonkeyPatch, client) -> None:
     monkeypatch.setenv("PORTAL_MODE", "iap")
     assert client.get("/portal").status_code == 401
     assert client.get("/api/portal/home").status_code == 401
+
+
+def test_portal_quick_links_come_from_terraform_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from cctv_audit import portal as portal_mod
+
+    monkeypatch.setattr(portal_mod.config, "master_prompt_sheet_id", "1ExampleMasterSheetId0000000000")
+    monkeypatch.setenv(
+        "PORTAL_QUICK_LINKS_JSON",
+        json.dumps(
+            [
+                {"id": "ge", "title_zh": "GE", "title_en": "GE", "url": "https://example.com/ge", "description": "d"},
+                {"id": "bad", "title_zh": "x", "title_en": "x", "url": "javascript:alert(1)"},
+            ]
+        ),
+    )
+    links = portal_mod.load_home_quick_links()
+    assert [l["link_id"] for l in links] == ["ge", "sop_sheet"]
+    assert links[1]["target_url"] == "https://docs.google.com/spreadsheets/d/1ExampleMasterSheetId0000000000/edit"
+    monkeypatch.setenv("PORTAL_QUICK_LINKS_JSON", "{not json")
+    assert [l["link_id"] for l in portal_mod.load_home_quick_links()] == ["sop_sheet"]
+    monkeypatch.delenv("PORTAL_QUICK_LINKS_JSON")
+    assert [l["link_id"] for l in portal_mod.load_home_quick_links()] == ["sop_sheet"]
+
+
+def test_review_write_records_progress_on_job(tmp_path: Path) -> None:
+    from cctv_audit import portal as portal_mod
+
+    store = UserScopedJobStore(state_dir=tmp_path / "jobs")
+    job = AuditJob(job_id="rv0001", user_id="a@x.com", folder_id="1FolderRVRVRVRVRV", state=JobState.DONE,
+                   report_sheet_url="https://docs.google.com/spreadsheets/d/1SheetRVRVRVRVRVRV/edit", violations_found=2)
+    asyncio.run(store.save(job))
+    rows = [["rv0001", "v.mp4", "00:01", "A1", "", "", "", "", "", "PENDING", ""],
+            ["rv0001", "v.mp4", "00:02", "A2", "", "", "", "", "", "PENDING", ""]]
+    from cctv_audit.gcs_gateway import build_incident_composite_key
+
+    key = build_incident_composite_key("rv0001", "v.mp4", "00:01", "A1", 0)
+    asyncio.run(
+        portal_mod._record_review_progress_after_write(
+            job_store=store, job=job, tab1_rows=rows,
+            applied_updates=[{"incident_id": key, "human_review_status": "✅ CONFIRMED"}],
+        )
+    )
+    stored = asyncio.run(store.get("a@x.com", "rv0001"))
+    assert (stored.review_reviewed_count, stored.review_total_count) == (1, 2)
+    portal_mod._JOB_REVIEW_PROGRESS_CACHE.clear()
+    payload = asyncio.run(
+        portal_mod.load_portal_home_payload(job_store=store, state_store=ScheduledStateStore(memory_store={}))
+    )
+    row = payload["tasks"][0]
+    assert row["review_source"] == "recorded" and row["review_progress_status"] == "IN_PROGRESS"

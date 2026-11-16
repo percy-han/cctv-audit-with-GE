@@ -40,4 +40,12 @@ workspace_impersonate_user = "<bot-user@customer-domain>" # "" = the worker SA i
 # Store visibility is additionally each viewer's own Google Drive access to the store's report.
 # enable_portal_iap      = true
 # portal_allowed_members = ["domain:<customer-domain>"] # or "group:<group@customer-domain>", "user:<email>"
+# Optional quick-access buttons on the unified portal homepage (<portal_url>/portal). Leave unset to
+# show only the auto-generated "Master SOP Control Sheet" button. Changing it redeploys only the portal.
+# portal_quick_links = [
+#   { id = "ge", title_zh = "💬 打开 GE 发起稽核", title_en = "💬 Launch Audit in GE", url = "https://<your GE web app URL>" },
+#   { id = "drive", title_zh = "📁 门店监控视频总目录", title_en = "📁 Store CCTV Drive Root", url = "https://drive.google.com/drive/folders/<root-folder-id>" },
+#   { id = "chat", title_zh = "🔔 稽核通知群", title_en = "🔔 Audit Alert Space", url = "https://chat.google.com/room/<space-id>" },
+#   { id = "golden", title_zh = "📊 黄金集评测报告", title_en = "📊 Golden Set Eval Reports", url = "https://drive.google.com/drive/folders/<results-folder-id>" },
+# ]
 # google_chat_webhook_url         = "gs://<project-id>-<prefix>-staging/config/google_chat_webhook.txt" # or direct https://chat.googleapis.com/v1/spaces/... URL

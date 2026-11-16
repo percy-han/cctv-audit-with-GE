@@ -154,6 +154,15 @@ class AuditJob(BaseModel):
             "used for Rule-Scoped Same-Sheet Smart Append so other SOP rules' rows on the same video are preserved."
         ),
     )
+    review_reviewed_count: int = Field(
+        default=-1,
+        description="Supervisor-reviewed findings count recorded by the portal after a review write (-1 = unknown)",
+    )
+    review_total_count: int = Field(
+        default=-1,
+        description="Total findings count in the report Sheet when review progress was last recorded (-1 = unknown)",
+    )
+    review_counts_updated_at: float = Field(default=0.0)
 
     @property
     def is_terminal(self) -> bool:

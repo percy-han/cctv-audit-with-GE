@@ -420,59 +420,6 @@
      "Towel not taken from the dedicated sanitizing bucket (reused from counter/sink rim) or red/blue/yellow towels cross-used across zones"
     ]
    ]
-  },
-  {
-   "title": "Tab5_Portal_Links",
-   "values": [
-    [
-     "Link_ID",
-     "Title_ZH",
-     "Title_EN",
-     "Target_URL",
-     "Description",
-     "Enabled"
-    ],
-    [
-     "LINK_GE",
-     "💬 打开 GE 发起稽核",
-     "💬 Launch Audit in GE",
-     "",
-     "Open Gemini Enterprise chat to start a store audit or Tab4 spot-check (paste your GE web app URL here)",
-     "ENABLED"
-    ],
-    [
-     "LINK_DRIVE_ROOT",
-     "📁 门店监控视频总目录",
-     "📁 Store CCTV Drive Root",
-     "",
-     "Open Google Drive root folder for store CCTV footage (if blank, auto-resolves from Tab2 Root_Folder_URL)",
-     "ENABLED"
-    ],
-    [
-     "LINK_CHAT_SPACE",
-     "🔔 Google Chat 稽核通知群",
-     "🔔 Google Chat Alert Space",
-     "",
-     "Open Google Chat space receiving start/completion/eval notifications (paste your Google Chat space URL here)",
-     "ENABLED"
-    ],
-    [
-     "LINK_SOP_SHEET",
-     "⚙️ SOP 与定时任务总控台",
-     "⚙️ Master SOP Control Sheet",
-     "",
-     "Open this Master SOP & Model Control Sheet (if blank, auto-resolves from MASTER_PROMPT_SHEET_ID)",
-     "ENABLED"
-    ],
-    [
-     "LINK_GOLDEN_RESULTS",
-     "📊 黄金集历史评测报告库",
-     "📊 Golden Set Eval Reports",
-     "",
-     "Open Google Drive folder storing 5-Tab Golden Set evaluation reports (if blank, auto-resolves from Tab3 Results_Folder_URL)",
-     "ENABLED"
-    ]
-   ]
   }
  ]
 }

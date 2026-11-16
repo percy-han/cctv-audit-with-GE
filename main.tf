@@ -298,6 +298,27 @@ variable "enable_portal_iap" {
   default     = true
 }
 
+variable "portal_quick_links" {
+  description = <<-EOT
+    Optional quick-access buttons on the unified portal homepage (<portal_url>/portal), e.g.
+    [{ id = "ge", title_zh = "打开 GE 发起稽核", title_en = "Launch Audit in GE", url = "https://vertexaisearch.cloud.google.com/...", description = "" }].
+    Empty (default) = only the auto-generated "Master SOP Control Sheet" button; existing
+    deployments are unaffected until this is set.
+  EOT
+  type = list(object({
+    id          = string
+    title_zh    = string
+    title_en    = string
+    url         = string
+    description = optional(string, "")
+  }))
+  default = []
+  validation {
+    condition     = alltrue([for l in var.portal_quick_links : can(regex("^https?://", l.url))])
+    error_message = "Every portal_quick_links[*].url must start with https:// or http://."
+  }
+}
+
 variable "portal_allowed_members" {
   description = <<-EOT
     Principals allowed through IAP to the portal (roles/iap.httpsResourceAccessor on <p>-portal),
@@ -369,6 +390,8 @@ locals {
       PORTAL_BASE_URL               = local.portal_url
     },
     var.workspace_impersonate_user == "" ? {} : { WORKSPACE_IMPERSONATE_USER = var.workspace_impersonate_user },
+    # Only set when configured, so existing deployments keep an identical portal env (no redeploy).
+    length(var.portal_quick_links) == 0 ? {} : { PORTAL_QUICK_LINKS_JSON = jsonencode(var.portal_quick_links) },
   )
   # Passed to deploy/deploy_portal_service.py as one JSON object (jsonencode sorts the keys).
   portal_env_json = jsonencode(local.portal_env)
