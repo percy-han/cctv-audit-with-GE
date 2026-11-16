@@ -664,7 +664,7 @@ portal_quick_links = [
 
 1. **预览**：再跑一次 A6 的命令（带 `,_APPLY=false`）。正常只会看到 `terraform_data.portal_service[0]` **must be replaced**（重新部署 Dashboard），不应有任何 destroy。
 2. **部署**：再跑一次 A7 的命令（去掉 `,_APPLY=false`）。只改 tfvars 时不重建镜像，一般 2–3 分钟完成。
-3. **打开首页验收**：首页地址 = `portal_url` + `/portal`。`portal_url` 就是 A8 里看到的那个 Dashboard 地址，**重新部署不会变**；忘了的话在仓库根目录执行：
+3. **打开首页验收**：首页地址 = `portal_url` + `/portal`。**Dashboard 地址在 A8 的输出里就能看到**（`terraform output` 列表中的 `portal_url` 一项，形如 `https://<p>-portal-<项目号>.<region>.run.app`），重新部署不会变。忘了的话在仓库根目录执行：
    ```bash
    terraform init -backend-config=<env>.gcs.tfbackend   # 只在新开的终端里需要
    echo "$(terraform output -raw portal_url)/portal"
