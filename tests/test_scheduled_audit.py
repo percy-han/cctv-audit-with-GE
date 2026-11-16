@@ -2416,3 +2416,31 @@ def test_portal_links_parsing_defaults_and_paused_rows() -> None:
     ]
     links = parse_portal_links_from_rows(rows)
     assert [(l.link_id, l.enabled) for l in links] == [("LINK_GE", True), ("LINK_X", False)]
+
+
+def test_load_portal_links_autofills_blank_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: `PromptManager.load_portal_links` must not touch nonexistent config attributes."""
+    from cctv_audit.prompt_manager import PORTAL_LINK_HEADERS, PromptManager, parse_portal_links_from_rows
+
+    monkeypatch.setenv("EVAL_RESULTS_FOLDER_ID", "1ExampleEvalResultsFolder000")
+
+    class _Client:
+        async def read_portal_links(self, sheet_id: str):
+            return parse_portal_links_from_rows(
+                [
+                    list(PORTAL_LINK_HEADERS),
+                    ["LINK_SOP_SHEET", "SOP", "SOP", "", "", "ENABLED"],
+                    ["LINK_GOLDEN_RESULTS", "G", "G", "", "", "ENABLED"],
+                    ["LINK_GE", "GE", "GE", "https://example.com/ge", "", "ENABLED"],
+                ]
+            )
+
+        async def read_scheduled_rules_with_diagnostics(self, sheet_id: str):
+            return [], []
+
+    pm = PromptManager(sheet_client=_Client())
+    links = asyncio.run(pm.load_portal_links("1ExampleMasterSheetId0000000000"))
+    by_id = {l.link_id: l.target_url for l in links}
+    assert by_id["LINK_SOP_SHEET"] == "https://docs.google.com/spreadsheets/d/1ExampleMasterSheetId0000000000/edit"
+    assert by_id["LINK_GOLDEN_RESULTS"] == "https://drive.google.com/drive/folders/1ExampleEvalResultsFolder000"
+    assert by_id["LINK_GE"] == "https://example.com/ge"

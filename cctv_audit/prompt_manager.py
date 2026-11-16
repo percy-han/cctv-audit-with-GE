@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -3332,11 +3333,12 @@ class PromptManager:
         # Auto-resolve blank Target_URL for standard link IDs when possible
         drive_root_fallback = ""
         eval_results_fallback = ""
-        if config.eval_results_folder_id:
-            if config.eval_results_folder_id.startswith("http") or config.eval_results_folder_id.startswith("gs://"):
-                eval_results_fallback = config.eval_results_folder_id
+        env_eval_folder = os.environ.get("EVAL_RESULTS_FOLDER_ID", "").strip()
+        if env_eval_folder:
+            if env_eval_folder.startswith("http") or env_eval_folder.startswith("gs://"):
+                eval_results_fallback = env_eval_folder
             else:
-                eval_results_fallback = f"https://drive.google.com/drive/folders/{config.eval_results_folder_id}"
+                eval_results_fallback = f"https://drive.google.com/drive/folders/{env_eval_folder}"
 
         need_drive_root = any(l.link_id == "LINK_DRIVE_ROOT" and not l.target_url for l in links)
         need_eval_results = any(l.link_id == "LINK_GOLDEN_RESULTS" and not l.target_url for l in links)

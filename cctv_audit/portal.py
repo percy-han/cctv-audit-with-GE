@@ -4713,7 +4713,20 @@ async def load_portal_home_payload(
                 }
             )
     except Exception as exc:  # noqa: BLE001 - links are optional decoration
-        logger.warning("Homepage quick links unavailable: %s", exc)
+        logger.warning("Homepage quick links unavailable, showing defaults: %s", exc)
+        from .prompt_manager import parse_portal_links_from_rows
+
+        links = [
+            {
+                "link_id": item.link_id,
+                "title_zh": item.title_zh,
+                "title_en": item.title_en,
+                "target_url": item.target_url,
+                "description": item.description,
+            }
+            for item in parse_portal_links_from_rows([])
+            if item.enabled
+        ]
 
     # 2. Audit jobs (GE + scheduled).
     jobs: List[AuditJob] = []
