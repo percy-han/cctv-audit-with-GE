@@ -189,6 +189,7 @@ python3 -m venv .venv-deploy && .venv-deploy/bin/pip install --require-hashes -r
 
 - **阶段 A：GCP 基础设施**（不依赖 Workspace）：状态桶 → bootstrap → 填配置 → 预览 → 部署 → 验证。做完后系统已经可以用纯 GCS 目录跑通一遍。
 - **阶段 B：Google Workspace 集成**：机器人账号 → DWD 授权 → SOP 总控表 → 共享目录 → 把总控表 ID 填回配置并重新部署 → GE / Dashboard 验收。
+- **阶段 C：统一入口首页的快捷按钮（可选，最后做）**：A、B 全部完成后，才拿得到 GE 网页地址、Chat 群链接等，把它们填进配置再部署一次即可。不做也不影响系统使用，首页只显示「SOP 总控表」一个按钮。
 
 下文 `<env>` 表示这套环境的配置文件名（任意，例如 `prod`，**不能叫 `example`**），`<p>` 表示 `name_prefix`。所有命令都在**仓库根目录**（`main.tf` 所在目录）执行，除非写明 `cd bootstrap`。
 
@@ -406,7 +407,7 @@ terraform output gemini_enterprise_console_url
 
 | 输出名 | 用途 |
 | :--- | :--- |
-| `portal_url` | Dashboard 地址 `https://<p>-portal-<项目号>.<region>.run.app`；**统一入口首页 = `<portal_url>/portal`**（快捷入口按钮 + 全部稽核任务列表，按钮在 `<env>.tfvars` 的 `portal_quick_links` 里配置，见 `example.tfvars`，不配只显示「SOP 总控表」按钮） |
+| `portal_url` | Dashboard 地址 `https://<p>-portal-<项目号>.<region>.run.app`；**统一入口首页 = `<portal_url>/portal`**（快捷按钮在阶段 C 配置） |
 | `cloud_run_worker_pool_url` | worker 地址 |
 | `workspace_dwd_client_id` | DWD 授权要填的 Client ID |
 | `workspace_dwd_scopes` | DWD 授权要填的 OAuth 范围（逗号分隔，原样粘贴） |
@@ -624,6 +625,49 @@ terraform output gemini_enterprise_console_url
 
 ---
 
+### 阶段 C：统一入口首页的快捷按钮（可选，A、B 验收通过后再做）
+
+统一入口首页 = `<portal_url>/portal`（`portal_url` 见 A8 的 `terraform output portal_url`）。打开后上半部分是快捷按钮，下半部分是全部稽核任务列表。快捷按钮里要填的 GE 网页地址、Chat 群链接，只有 A、B 都做完才拿得到，所以放在最后。
+
+**这一步不做也可以**：首页照常能用，快捷区只显示系统自动生成的「⚙️ SOP 总控表」按钮。
+
+#### C1. 收集链接
+
+| 按钮 | 去哪找 |
+| :--- | :--- |
+| 打开 GE 发起稽核 | 督导用的 GE 网页地址：在 GE 网页端打开 `<p>-ge` 应用后，复制浏览器地址栏（形如 `https://vertexaisearch.cloud.google.com/home/cid/<...>`） |
+| 稽核通知群 | B5 配 Webhook 的那个 Google Chat 群：在群里随便一条消息上「复制链接」，或复制浏览器地址栏 |
+| 门店监控视频总目录 | 2.5 / B4 共享给机器人的门店视频根目录（Drive 文件夹链接） |
+| 黄金集评测目录 | 黄金集视频或评测报告所在的 Drive 文件夹（没有可以不放） |
+
+按钮数量和名称都可以自己定，不限于上表。链接必须以 `https://` 开头。
+
+#### C2. 写进 `<env>.tfvars`
+
+在 `<env>.tfvars` 末尾加（`example.tfvars` 里有同样的样例）：
+
+```hcl
+portal_quick_links = [
+  { id = "ge",     title_zh = "💬 打开 GE 发起稽核",  title_en = "💬 Launch Audit in GE",     url = "https://vertexaisearch.cloud.google.com/home/cid/<...>" },
+  { id = "chat",   title_zh = "🔔 稽核通知群",        title_en = "🔔 Audit Alert Space",      url = "https://chat.google.com/room/<space-id>" },
+  { id = "drive",  title_zh = "📁 门店监控视频总目录", title_en = "📁 Store CCTV Drive Root",  url = "https://drive.google.com/drive/folders/<root-folder-id>" },
+  { id = "golden", title_zh = "📊 黄金集评测目录",     title_en = "📊 Golden Set Folder",      url = "https://drive.google.com/drive/folders/<folder-id>" },
+]
+```
+
+- `id`：随便起，不重复即可；`description`（可选）显示在按钮下方的小字。
+- 按钮按这里的顺序显示；「SOP 总控表」按钮自动排在最后，不用写。
+
+#### C3. 部署并验收
+
+1. 执行 A6 预览：正常只会看到 `terraform_data.portal_service[0]` **must be replaced**（重新部署 Dashboard），不应有任何 destroy。
+2. 执行 A7。只改 tfvars 时不重建镜像，一般 2–3 分钟完成。
+3. 打开 `<portal_url>/portal`，用 `@<customer-domain>` 账号登录，确认快捷区出现配置的按钮，点开都能跳到对应页面。
+
+以后要增删、改按钮：改 `portal_quick_links` 后重复 C3。
+
+---
+
 ### 3.x 如果用纯 GCS 模式（无 Workspace）
 
 代码支持不接 Workspace 的用法，适合临时验证：
@@ -705,6 +749,8 @@ GE 新会话首页的两组 Prompt chips：
 6. 不需要改 `Tab0`，不影响线上正式规则。
 
 ### 4.4 复核 Dashboard
+
+**统一入口首页**：`<portal_url>/portal`（不带任何参数）。上半部分是快捷按钮（阶段 C 配置）；下半部分是全部稽核任务（GE 发起 / 自动巡检 / 黄金测评集），按发起时间倒序、每页 20 条，可按任务类型、门店、SOP 范围、AI 任务状态、人工复核状态（未复核 / 复核中 / 复核完成）、发起人、日期筛选。「人工复核状态」一列先显示「加载中…」，几秒内自动填好，不用刷新。每人只看得到自己在 Drive 上有权限的门店。点「进入复核台」进入单店复核，复核台右上角「🏠 统一门户首页」可随时回来。
 
 **打开**：Chat 完成卡片上的 `🖥️ Open HTML Supervisor Review Workbench`（单店）或 `🌐 Open Multi-Store HTML Review Workbench`（定时巡检批次），或 GE 完成回复里的 `Open Supervisor Workbench`。链接默认 30 天有效。
 
@@ -821,6 +867,7 @@ git pull                       # 你们自己的 <env>.tfvars / <env>.gcs.tfback
 2. 没问题再执行 A7。
 3. 流水线日志出现 `CONVERGED: post-apply plan is empty.` 即完成。
 4. 镜像 tag 是源码内容的哈希：只改了 tfvars 不改代码时不会重建镜像，Cloud Run / Agent Engine 也不会因此重新部署。
+5. 新版本加了新的可选配置项时（例如统一入口首页的 `portal_quick_links`），**不填就和升级前的行为一致**，升级本身不用改 `<env>.tfvars`；需要时再按对应章节（如阶段 C）补配。
 
 ### 5.2 SOP / 提示词修改
 
@@ -1005,6 +1052,7 @@ gcloud storage rm -r gs://<PROJECT_ID>-tfstate/<p>/
 | `ge_example_folder_url` | | `""` | 当前版本未在 Prompt chips 中使用 |
 | `enable_portal_iap` | | `true` | 独立 Dashboard 服务 + IAP + Drive 权限 + 审计日志 |
 | `portal_allowed_members` | `enable_portal_iap = true` 时必填 | `[]` | `domain:` / `group:` / `user:` 开头 |
+| `portal_quick_links` | | `[]` | 统一入口首页的快捷按钮，每项 `{ id, title_zh, title_en, url, description(可选) }`，`url` 必须 `http(s)://` 开头；空 = 只显示自动生成的「SOP 总控表」按钮。见阶段 C |
 | `enable_google_chat_notification` | | `false` | Chat 通知开关 |
 | `google_chat_webhook_url` | | `""` | `https://chat.googleapis.com/...` 或存放 URL 的 `gs://` 对象（敏感值） |
 | `eval_results_folder_id` | | `""` | 命令行测评的报告目录（Drive 文件夹裸 ID）；`Tab3` 每行自带目录时不需要 |
